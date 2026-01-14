@@ -1,7 +1,7 @@
-ccflags-y += -O3
-ccflags-y += $(call cc-option, -g0)
-ccflags-y += $(call cc-option, -Os)
+ccflags-y += -O3 \
+    -DLZ4_FREESTANDING=1 \
+    -DLZ4_FAST_DEC_LOOP=1
 
-obj-$(CONFIG_LZ4_COMPRESS) += lz4_compress.o
-obj-$(CONFIG_LZ4HC_COMPRESS) += lz4hc_compress.o
-obj-$(CONFIG_LZ4_DECOMPRESS) += lz4_decompress.o
+obj-$(CONFIG_LZ4_COMPRESS) += lz4.o
+obj-$(CONFIG_LZ4_DECOMPRESS) += lz4.o
+obj-$(CONFIG_LZ4HC_COMPRESS) += lz4hc.o
