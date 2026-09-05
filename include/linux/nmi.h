@@ -88,7 +88,7 @@ extern void update_hardlockup_type(unsigned int cpu);
 unsigned long long get_hardlockup_thresh(void);
 #endif
 unsigned long long get_ess_softlockup_thresh(void);
-#if 0
+#if defined(CONFIG_SEC_DEBUG) && defined(CONFIG_LOCKUP_DETECTOR)
 extern void sl_softirq_entry(const char *, void *);
 extern void sl_softirq_exit(void);
 #else
