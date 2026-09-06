@@ -18,6 +18,17 @@ config SEC_MODEM_SS310AP
 	select MODEM_IF_QOS
 	default y
 
+config MODEM_BASEBAND_GUARD
+	bool "Baseband guard: CP auto-recovery policy"
+	depends on UMTS_MODEM_SS310AP
+	default n
+	---help---
+	  Adds an in-kernel recovery policy for the Shannon CP: if the modem
+	  crashes (watchdog/exit) and does not reach ONLINE within a
+	  configurable window, the guard replays the RIL recovery sequence
+	  (modem_off -> modem_on -> modem_on). Rate-limited; sysfs knobs at
+	  /sys/class/baseband_guard/.
+
 config CP_ZEROCOPY
 	bool "Support zero memory copy"
 	default y

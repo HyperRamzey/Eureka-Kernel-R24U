@@ -30,3 +30,4 @@ ifeq ($(CONFIG_ARGOS), y)
 obj-y += modem_argos_notifier.o
 endif
 endif
+obj-$(CONFIG_MODEM_BASEBAND_GUARD) += baseband_guard.o

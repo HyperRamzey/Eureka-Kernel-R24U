@@ -597,6 +597,12 @@ int ss310ap_send_panic_noti_ext(void)
 }
 EXPORT_SYMBOL(ss310ap_send_panic_noti_ext);
 
+struct modem_ctl *ss310ap_get_modem_ctl_ext(void)
+{
+	return g_mc;
+}
+EXPORT_SYMBOL(ss310ap_get_modem_ctl_ext);
+
 #ifdef CONFIG_CP_UART_NOTI
 void send_uart_noti_to_modem(int val)
 {
