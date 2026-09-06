@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build ONE Eureka device with the PROVEN recipe (H3, user-verified booting+KSU+modules):
-#   OUR tree (CIP114 + rsuntk KSU 32473) + full/<dev>_defconfig + Neutron Clang 24
+#   R24U tree (rsuntk KSU 32473) + full/<dev>_defconfig + Neutron Clang 24
 #   with VENDOR FLAG STYLE (no LLVM=1, gold-plugin ThinLTO like vendor build.sh).
 # USAGE: ./build_device.sh <codename> [out_suffix]
 #   e.g. ./build_device.sh a30s          -> out_a30s/
@@ -18,7 +18,7 @@ case "$CODENAME" in
   a10|a20|a20e|a30|a30s|a40|m20|jackpotlte) ;;
   *) echo "usage: $0 <a10|a20|a20e|a30|a30s|a40|m20|jackpotlte> [out_suffix]"; exit 1 ;;
 esac
-DEFCONFIG=full/exynos7885-$CODENAME-defconfig
+DEFCONFIG=full/exynos7885-${CODENAME}_defconfig
 
 TC=/root/toolchains
 export PATH="$TC/bin:$PATH"
@@ -30,7 +30,7 @@ export CLANG_TRIPLE=aarch64-linux-gnu-
 export ANDROID_MAJOR_VERSION=r
 export KBUILD_BUILD_USER=HyperRamzey
 export KBUILD_BUILD_HOST=Eureka-R24U
-export LOCALVERSION=-R24U-CIP114-KSU
+export LOCALVERSION=-R24U-KSU
 export PLATFORM_VERSION=11
 echo >.scmversion
 CORES=8
