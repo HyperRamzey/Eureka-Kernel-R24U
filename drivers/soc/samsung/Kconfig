@@ -145,6 +145,16 @@ config ACPM_DVFS
 	help
 	  Support ACPM DVFS for Exynos SoC.
 
+config EXYNOS_ASV_MARGIN
+	bool "Runtime ASV voltage margin sysfs interface"
+	depends on CAL_IF && ACPM_DVFS
+	default n
+	help
+	  Exposes the cal_dfs_set_volt_margin() ACPM margin control at runtime
+	  via /sys/class/asv_margin/<domain>/margin (uV). Domains: cpucl0
+	  (BIG), cpucl1 (LITTLE), g3d, mif, int. 0 = stock ECT voltages;
+	  positive = stability margin; negative = undervolt at user risk.
+
 config USI
 	bool "Enable Universal Serial Interface"
 	default n

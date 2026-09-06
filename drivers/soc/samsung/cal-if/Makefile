@@ -23,3 +23,5 @@ obj-$(CONFIG_SOC_EXYNOS7885)		+= exynos7885/cal_data.o
 subdir-ccflags-y += \
 	-fno-builtin-fwrite \
 	-Wno-sizeof-pointer-div
+
+obj-$(CONFIG_EXYNOS_ASV_MARGIN) += asv_margin.o
