@@ -28,6 +28,7 @@
 #include <linux/hdreg.h>
 #include <linux/kdev_t.h>
 #include <linux/blkdev.h>
+#include <linux/elevator.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/bitops.h>
@@ -4399,6 +4400,16 @@ static struct mmc_blk_data *mmc_blk_alloc_req(struct mmc_card *card,
 
 	snprintf(md->disk->disk_name, sizeof(md->disk->disk_name),
 		 "mmcblk%u%s", md->name_idx, subname ? subname : "");
+
+	/* EUREKA: sio elevator for removable SD storage (external card).
+	 * Internal eMMC (mmcblk0) keeps the global default (zen);
+	 * removable SD cards get sio, which suits slower flash media. */
+	if (mmc_card_sd(card) && !(area_type & (MMC_BLK_DATA_AREA_RPMB |
+			MMC_BLK_DATA_AREA_BOOT))) {
+		if (elevator_change(md->queue.queue, "sio"))
+			pr_err("mmc: failed to set sio elevator for %s\n",
+					md->disk->disk_name);
+	}
 
 	if (mmc_card_mmc(card))
 		blk_queue_logical_block_size(md->queue.queue,

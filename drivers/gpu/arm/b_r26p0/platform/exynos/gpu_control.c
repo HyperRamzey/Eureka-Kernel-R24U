@@ -595,9 +595,28 @@ int gpu_asv_calibration_start(void)
 
 #endif /* CONFIG_REGULATOR */
 
+/* EUREKA: gpu_get_cur_voltage - report real ASV voltage for the current GPU clock.
+ * Upstream stub returned 0, so userspace (/sys .../mali/vol, kernel manager apps)
+ * always read 0 mV. Look up the DVFS table entry for the current clock and
+ * apply the same voltage_margin the DVFS core adds when programming voltages. */
 int gpu_get_cur_voltage(struct exynos_context *platform)
 {
-	return 0;
+	int level;
+
+	if (!platform)
+		return 0;
+
+	if (!gpu_is_power_on())
+		return 0;
+
+	platform->cur_clock = gpu_get_cur_clock(platform);
+	level = gpu_dvfs_get_level(platform->cur_clock);
+	if (level < 0)
+		return 0;
+
+	platform->cur_voltage = platform->table[level].voltage;
+
+	return platform->cur_voltage + platform->voltage_margin;
 }
 int *get_mif_table(int *size)
 {

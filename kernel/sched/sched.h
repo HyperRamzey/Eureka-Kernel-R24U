@@ -1918,7 +1918,8 @@ static inline u64 irq_time_read(int cpu)
 /**
  * Default limit transition rate.
  */
-#define	DEFAULT_LATENCY_MULTIPLIER	50
+/* EUREKA: faster schedutil response for OC Exynos7885 tables */
+#define	DEFAULT_LATENCY_MULTIPLIER	20
 
 DECLARE_PER_CPU(struct update_util_data *, cpufreq_update_util_data);
 
