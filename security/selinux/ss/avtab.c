@@ -552,9 +552,14 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
 			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
 			return rc;
 		}
-		if (avtab_android_m_compat ||
-			    ((xperms.specified != AVTAB_XPERMS_IOCTLFUNCTION) &&
+		/* Android 16 policy fix: entries whose own 'specified' byte is a modern
+		 * xperms marker (IOCTLFUNCTION/IOCTLDRIVER) always carry a separate
+		 * driver byte. The global M-compat flag must not cause us to skip it,
+		 * or the byte stream desyncs and later entries fail with
+		 * 'invalid type or class'. Only remap true M-era optype entries. */
+		if ((xperms.specified != AVTAB_XPERMS_IOCTLFUNCTION) &&
 			    (xperms.specified != AVTAB_XPERMS_IOCTLDRIVER) &&
+			    (avtab_android_m_compat ||
 			    (vers == POLICYDB_VERSION_XPERMS_IOCTL))) {
 			xperms.driver = xperms.specified;
 			if (android_m_compat_optype)
