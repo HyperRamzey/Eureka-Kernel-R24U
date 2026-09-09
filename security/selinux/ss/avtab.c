@@ -552,21 +552,53 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
 			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
 			return rc;
 		}
-		/* Android 16 policy fix: entries whose own 'specified' byte is a modern
-		 * xperms marker (IOCTLFUNCTION/IOCTLDRIVER) always carry a separate
-		 * driver byte. The global M-compat flag must not cause us to skip it,
-		 * or the byte stream desyncs and later entries fail with
-		 * 'invalid type or class'. Only remap true M-era optype entries. */
-		if ((xperms.specified != AVTAB_XPERMS_IOCTLFUNCTION) &&
-			    (xperms.specified != AVTAB_XPERMS_IOCTLDRIVER) &&
-			    (avtab_android_m_compat ||
-			    (vers == POLICYDB_VERSION_XPERMS_IOCTL))) {
+		/*
+		 * Android M compat vs modern (Android 15/16) xperms payloads.
+		 *
+		 * Discriminate by THIS entry's key, never by payload byte values
+		 * or the global compat flag: Android-M policies mark every xperms
+		 * entry with OPTYPE bits in key.specified (remapped above, which
+		 * also sets android_m_compat_optype) and carry NO 'specified'
+		 * payload byte - their first payload byte IS the driver. Modern
+		 * libsepol never emits OPTYPE key bits and always writes the
+		 * payload as [u8 specified][u8 driver][2x u32 perms].
+		 *
+		 * Payload values are ambiguous: an M driver byte may be any value
+		 * (including 1/2/3), and modern markers include
+		 * AVTAB_XPERMS_NLMSG (3), which Android 16 policies use for
+		 * netlink xperms rules. Value-based heuristics desync the stream
+		 * on NLMSG entries and misparse late M entries whose driver byte
+		 * happens to be 1 or 2.
+		 */
+		if (android_m_compat_optype) {
+			/* Android M layout: byte read above is the driver. */
 			xperms.driver = xperms.specified;
-			if (android_m_compat_optype)
-				xperms.specified = AVTAB_XPERMS_IOCTLDRIVER;
-			else
-				xperms.specified = AVTAB_XPERMS_IOCTLFUNCTION;
-			avtab_android_m_compat_set();
+			xperms.specified = AVTAB_XPERMS_IOCTLDRIVER;
+		} else if ((xperms.specified != AVTAB_XPERMS_IOCTLFUNCTION) &&
+			    (xperms.specified != AVTAB_XPERMS_IOCTLDRIVER)) {
+			/*
+			 * Modern marker this kernel cannot enforce (e.g. NLMSG).
+			 * Consume the well-defined modern layout to keep the byte
+			 * stream in sync, but skip inserting the node: this kernel
+			 * consults xperms nodes only for ioctl() drivers, and
+			 * services_compute_xperms_decision() would BUG() on
+			 * unknown specified values. Netlink messages stay enforced
+			 * through the classic nlmsg permission path.
+			 */
+			rc = next_entry(&xperms.driver, fp, sizeof(u8));
+			if (rc) {
+				printk(KERN_ERR "SELinux: avtab: truncated entry\n");
+				return rc;
+			}
+			rc = next_entry(buf32, fp,
+					 sizeof(u32)*ARRAY_SIZE(xperms.perms.p));
+			if (rc) {
+				printk(KERN_ERR "SELinux: avtab: truncated entry\n");
+				return rc;
+			}
+			for (i = 0; i < ARRAY_SIZE(xperms.perms.p); i++)
+				xperms.perms.p[i] = le32_to_cpu(buf32[i]);
+			return 0;	/* entry consumed; node deliberately skipped */
 		} else {
 			rc = next_entry(&xperms.driver, fp, sizeof(u8));
 			if (rc) {
