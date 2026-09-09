@@ -1740,6 +1740,16 @@ static int parse_cgroupfs_options(char *data, struct cgroup_sb_opts *opts)
 			opts->flags |= CGRP_ROOT_NOPREFIX;
 			continue;
 		}
+		/*
+		 * cpuset_v2_mode (kernel 5.4+, commit 4fb7a8930ed7):
+		 * restore the original cpu mask when a cpu is offlined and
+		 * then onlined under cgroup v1. Android init mounts cpuset with
+		 * this option unconditionally; accept it as a no-op so the mount
+		 * succeeds on this kernel (matches EurekaV2-cip105 behavior).
+		 */
+		if (!strcmp(token, "cpuset_v2_mode")) {
+			continue;
+		}
 		if (!strcmp(token, "clone_children")) {
 			opts->cpuset_clone_children = true;
 			continue;
