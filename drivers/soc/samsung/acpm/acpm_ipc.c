@@ -608,17 +608,31 @@ int acpm_ipc_send_data(unsigned int channel_id, struct ipc_config *cfg)
 		timeout = sched_clock() + IPC_TIMEOUT;
 		timeout_flag = false;
 
-		while (!(__raw_readl(acpm_ipc->intr + INTSR1) & (1 << channel->id)) ||
-				check_response(channel, cfg)) {
-			now = sched_clock();
-			if (timeout < now) {
-				timeout_flag = true;
-				break;
-			} else {
-				if (acpm_ipc->w_mode)
-					usleep_range(50, 100);
-				else
-					cpu_relax();
+		/*
+		 * Safety net: if the timer source stalls during early boot
+		 * (before it is fully initialized), 'timeout < now' may never
+		 * become true and this loop would spin forever, wedging the
+		 * boot CPU with a silent hang (rescued only by the PMIC
+		 * watchdog ~9 minutes later). Bound the loop by iteration
+		 * count as well; the bound is far above what any legitimate
+		 * 150ms response window can produce.
+		 */
+		{
+			int iter_bound = 100000000;
+			while (!(__raw_readl(acpm_ipc->intr + INTSR1) & (1 << channel->id)) ||
+					check_response(channel, cfg)) {
+				now = sched_clock();
+				if (timeout < now || --iter_bound <= 0) {
+					if (!timeout_flag && now < timeout)
+						pr_err("[ACPM] ipc poll loop hit iteration bound (clock stall?)\n");
+					timeout_flag = true;
+					break;
+				} else {
+					if (acpm_ipc->w_mode)
+						usleep_range(50, 100);
+					else
+						cpu_relax();
+				}
 			}
 		}
 
