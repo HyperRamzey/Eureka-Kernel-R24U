@@ -1772,6 +1772,7 @@ struct file_operations {
 #ifdef CONFIG_EXT4CRYPT_SDP
 	int (*check_sdp_info) (struct file *file);
 #endif
+	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t, size_t, unsigned int);
 };
 
 struct inode_operations {
