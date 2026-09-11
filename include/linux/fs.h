@@ -146,6 +146,12 @@ typedef void (dax_iodone_t)(struct buffer_head *bh_map, int uptodate);
 /* File is stream-like */
 #define FMODE_STREAM		((__force fmode_t)0x200000)
 
+/* File hasn't page cache and can't be mmaped, for stackable filesystem */
+#define FMODE_NONMAPPABLE        ((__force fmode_t)0x400000)
+ 
+/* File page don't need to be cached, for stackable filesystem's lower file */
+#define FMODE_NONCACHEABLE     ((__force fmode_t)0x800000)
+
 /* File was opened by fanotify and shouldn't generate fanotify events */
 #define FMODE_NONOTIFY		((__force fmode_t)0x4000000)
 
@@ -475,6 +481,12 @@ struct address_space {
 	int 			private_algo_mode;	/* Encryption algorithm */
 	pgoff_t			sensitive_data_index;	/* data starts here */
 	struct crypto_hash	*hash_tfm;	/* hash transform */
+#ifdef CONFIG_CRYPTO_FIPS
+	bool			cc_enable;	/* cc flag */
+#endif
+#ifdef CONFIG_SDP
+	int userid;
+#endif
 } __attribute__((aligned(sizeof(long))));
 	/*
 	 * On most architectures that alignment is already the case; but
@@ -943,7 +955,11 @@ struct file {
 	struct list_head	f_tfile_llink;
 #endif /* #ifdef CONFIG_EPOLL */
 	struct address_space	*f_mapping;
-} __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+
+#if defined(CONFIG_FIVE_PA_FEATURE) || defined(CONFIG_PROCA)
+	void *f_signature;
+#endif
+} __attribute__((aligned(8)));
 
 struct file_handle {
 	__u32 handle_bytes;
@@ -1468,16 +1484,27 @@ struct super_block {
 };
 
 extern struct timespec current_fs_time(struct super_block *sb);
-
-/*
- * current_time - Return FS time for an inode (helper kept for binderfs;
- * derived from the current_fs_time interface).
+/**
+ * current_time - Return FS time
+ * @inode: inode.
+ *
+ * Return the current time truncated to the time granularity supported by
+ * the fs.
+ *
+ * Note that inode and inode->sb cannot be NULL.
+ * Otherwise, the function warns and returns time without truncation.
  */
 static inline struct timespec current_time(struct inode *inode)
 {
-	return current_fs_time(inode->i_sb);
-}
+	struct timespec now = current_kernel_time();
 
+	if (unlikely(!inode->i_sb)) {
+		WARN(1, "current_time() called with uninitialized super_block in the inode");
+		return now;
+	}
+
+	return timespec_trunc(now, inode->i_sb->s_time_gran);
+}
 
 /*
  * Snapshotting support.
@@ -1632,6 +1659,8 @@ extern void dentry_unhash(struct dentry *dentry);
  */
 extern void inode_init_owner(struct inode *inode, const struct inode *dir,
 			umode_t mode);
+extern bool may_open_dev(const struct path *path);
+
 /*
  * VFS FS_IOC_FIEMAP helper definitions.
  */
@@ -1739,7 +1768,10 @@ struct file_operations {
 #ifndef CONFIG_MMU
 	unsigned (*mmap_capabilities)(struct file *);
 #endif
-	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t, size_t, unsigned int);
+	struct file* (*get_lower_file)(struct file *f);
+#ifdef CONFIG_EXT4CRYPT_SDP
+	int (*check_sdp_info) (struct file *file);
+#endif
 };
 
 struct inode_operations {
@@ -1788,11 +1820,9 @@ extern ssize_t __vfs_write(struct file *, const char __user *, size_t, loff_t *)
 extern ssize_t vfs_read(struct file *, char __user *, size_t, loff_t *);
 extern ssize_t vfs_write(struct file *, const char __user *, size_t, loff_t *);
 extern ssize_t vfs_readv(struct file *, const struct iovec __user *,
-		unsigned long, loff_t *, int);
+		unsigned long, loff_t *);
 extern ssize_t vfs_writev(struct file *, const struct iovec __user *,
-		unsigned long, loff_t *, int);
-extern ssize_t vfs_copy_file_range(struct file *, loff_t , struct file *,
-				   loff_t, size_t, unsigned int);
+		unsigned long, loff_t *);
 
 struct super_operations {
    	struct inode *(*alloc_inode)(struct super_block *sb);
@@ -1830,6 +1860,7 @@ struct super_operations {
 				  struct shrink_control *);
 	long (*free_cached_objects)(struct super_block *,
 				    struct shrink_control *);
+	long (*unlink_callback)(struct super_block *, char *);
 };
 
 /*
@@ -1974,7 +2005,6 @@ struct super_operations {
 #define I_DIO_WAKEUP		(1 << __I_DIO_WAKEUP)
 #define I_LINKABLE		(1 << 10)
 #define I_DIRTY_TIME		(1 << 11)
-#define I_DIRTY_TIME_EXPIRED	(1 << 12)
 #define I_WB_SWITCH		(1 << 13)
 #define I_SYNC_QUEUED		(1 << 17)
 
@@ -2564,6 +2594,8 @@ static inline int generic_write_sync(struct file *file, loff_t pos, loff_t count
 }
 extern void emergency_sync(void);
 extern void emergency_remount(void);
+extern int intr_sync(int *);
+
 #ifdef CONFIG_BLOCK
 extern sector_t bmap(struct inode *, sector_t);
 #endif
@@ -3191,4 +3223,15 @@ static inline bool dir_relax(struct inode *inode)
 extern bool path_noexec(const struct path *path);
 extern void inode_nohighmem(struct inode *inode);
 
+/* for Android O */
+#define AID_USE_SEC_RESERVED	KGIDT_INIT(4444)
+#if ANDROID_VERSION < 90000
+#define AID_USE_ROOT_RESERVED	KGIDT_INIT(5555)
+#else
+/* for Android P */
+#define AID_USE_ROOT_RESERVED	KGIDT_INIT(5678)
+#endif
+
+int vfs_ioc_setflags_prepare(struct inode *inode, unsigned int oldflags,
+			     unsigned int flags);
 #endif /* _LINUX_FS_H */
