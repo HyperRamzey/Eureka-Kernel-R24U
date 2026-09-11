@@ -1335,6 +1335,7 @@ struct mm_struct;
 /* sb->s_iflags */
 #define SB_I_CGROUPWB	0x00000001	/* cgroup-aware writeback enabled */
 #define SB_I_NOEXEC	0x00000002	/* Ignore executables on this fs */
+#define SB_I_NODEV	0x00000004	/* Ignore devices on this fs */
 #define SB_I_MULTIROOT	0x00000008	/* Multiple roots to the dentry tree */
 
 /* Possible states of 'frozen' field */
@@ -1467,6 +1468,16 @@ struct super_block {
 };
 
 extern struct timespec current_fs_time(struct super_block *sb);
+
+/*
+ * current_time - Return FS time for an inode (helper kept for binderfs;
+ * derived from the current_fs_time interface).
+ */
+static inline struct timespec current_time(struct inode *inode)
+{
+	return current_fs_time(inode->i_sb);
+}
+
 
 /*
  * Snapshotting support.
