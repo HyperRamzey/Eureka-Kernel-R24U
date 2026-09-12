@@ -426,6 +426,12 @@ struct mem_link_device {
 	struct delayed_work udl_rx_dwork;
 	struct std_dload_info img_info;	/* Information of each binary image */
 	atomic_t cp_boot_done;
+	/*
+	 * SS310/A16 race fix: re-check rild_ready() until rild opens the
+	 * FMT/RFS channels, then send the INIT_END the CP is waiting for.
+	 */
+	struct delayed_work phone_start_dwork;
+	atomic_t phone_start_retries;
 
 	/**
 	 * Mandatory methods for the common memory-type interface framework

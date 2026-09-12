@@ -299,6 +299,14 @@ static void shmem_handle_cp_crash(struct mem_link_device *mld,
 		mld->stop_pm(mld);
 #endif
 
+	/* Kill any pending INIT_END retry: the CP state it targets is
+	 * gone, and a new boot cycle will re-arm it via CP_START.
+	 * NOTE: must be the non-sleeping variant - this path can run
+	 * from the rx tasklet (atomic context). A retry already
+	 * executing will no-op: it revalidates cp_boot_done and
+	 * LINK_STATE_IPC under state_lock before doing anything. */
+	cancel_delayed_work(&mld->phone_start_dwork);
+
 	/* Disable normal IPC */
 	set_magic(mld, MEM_CRASH_MAGIC);
 	set_access(mld, 0);
@@ -583,6 +591,58 @@ static void write_clk_table_to_shmem(struct mem_link_device *mld)
 	}
 }
 
+/*
+ * SS310/A16 race fix: AOSP rild opens umts_ipc0/umts_rfs0 ~1-2s after
+ * the CP has finished booting, but the SS310 CP only sends CP_START
+ * twice (100ms apart). Without this retry, INIT_END is never sent,
+ * the CP times out after ~31s and exits -> rild silent-reset loop.
+ *
+ * Locking: takes mld->state_lock (irqsave) exactly like
+ * cmd_phone_start_handler; only sends INIT_END while the link is
+ * in LINK_STATE_IPC and cp_boot_done is 0 (set under lock BEFORE
+ * sending, so handler and retry can never both fire).
+ *
+ * Lifecycle: cancelled in shmem_handle_cp_crash(), so an
+ * old retry can never fire against a new/failed boot cycle.
+ */
+static void mem_phone_start_retry_work(struct work_struct *work)
+{
+	struct mem_link_device *mld =
+		container_of(to_delayed_work(work), struct mem_link_device,
+			phone_start_dwork);
+	struct link_device *ld = &mld->link_dev;
+	struct modem_ctl *mc = ld->mc;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mld->state_lock, flags);
+
+	if (atomic_read(&mld->cp_boot_done) ||
+		mld->state != LINK_STATE_IPC) {
+		/* completed already, or stale retry after crash/reset */
+		spin_unlock_irqrestore(&mld->state_lock, flags);
+		return;
+	}
+
+	if (atomic_inc_return(&mld->phone_start_retries) > 60) {
+		mif_err("%s: giving up INIT_END retry (%s)\n",
+			ld->name, mc->name);
+		spin_unlock_irqrestore(&mld->state_lock, flags);
+		return;
+	}
+
+	if (rild_ready(ld)) {
+		mif_err("%s: INIT_END(retry %d) -> %s\n", ld->name,
+			atomic_read(&mld->phone_start_retries), mc->name);
+		atomic_set(&mld->cp_boot_done, 1);
+		spin_unlock_irqrestore(&mld->state_lock, flags);
+		send_ipc_irq(mld, cmd2int(CMD_INIT_END));
+	} else {
+		spin_unlock_irqrestore(&mld->state_lock, flags);
+		queue_delayed_work(ld->rx_wq, &mld->phone_start_dwork,
+			msecs_to_jiffies(500));
+	}
+}
+
 static void cmd_phone_start_handler(struct mem_link_device *mld)
 {
 	struct link_device *ld = &mld->link_dev;
@@ -610,6 +670,11 @@ static void cmd_phone_start_handler(struct mem_link_device *mld)
 		if (rild_ready(ld)) {
 			mif_err("%s: INIT_END(ONLINE) -> %s\n", ld->name, mc->name);
 			send_ipc_irq(mld, cmd2int(CMD_INIT_END));
+		} else if (!atomic_read(&mld->cp_boot_done)) {
+			/* SS310 only sends 2x CP_START; re-check rild later */
+			atomic_set(&mld->phone_start_retries, 0);
+			queue_delayed_work(ld->rx_wq, &mld->phone_start_dwork,
+				msecs_to_jiffies(500));
 		}
 		goto exit;
 	}
@@ -624,6 +689,11 @@ static void cmd_phone_start_handler(struct mem_link_device *mld)
 		mif_err("%s: INIT_END -> %s\n", ld->name, mc->name);
 		send_ipc_irq(mld, cmd2int(CMD_INIT_END));
 		atomic_set(&mld->cp_boot_done, 1);
+	} else {
+		/* rild not up yet; retry the handshake until it is */
+		atomic_set(&mld->phone_start_retries, 0);
+		queue_delayed_work(ld->rx_wq, &mld->phone_start_dwork,
+			msecs_to_jiffies(500));
 	}
 
 	mld->state = LINK_STATE_IPC;
@@ -3665,6 +3735,8 @@ struct link_device *shmem_create_link_device(struct platform_device *pdev)
 	** Initialize variables for CP booting and crash dump
 	*/
 	INIT_DELAYED_WORK(&mld->udl_rx_dwork, udl_rx_work);
+	atomic_set(&mld->phone_start_retries, 0);
+	INIT_DELAYED_WORK(&mld->phone_start_dwork, mem_phone_start_retry_work);
 
 	/**
 	 * Link local functions to the corresponding function pointers that are
