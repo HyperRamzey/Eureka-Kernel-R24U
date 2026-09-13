@@ -45,6 +45,9 @@
 #include <linux/mempolicy.h>
 
 #include <linux/compat.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
 #include <linux/syscalls.h>
 #include <linux/kprobes.h>
 #include <linux/user_namespace.h>
@@ -2382,6 +2385,59 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	error = security_task_prctl(option, arg2, arg3, arg4, arg5);
 	if (error != -ENOSYS)
 		return error;
+
+#ifdef CONFIG_KSU_SUSFS
+	/* SUSFS user ABI: prctl(0xDEADBEEF, CMD_SUSFS_*, &info, NULL, &error) */
+	if (unlikely(option == 0xDEADBEEF)) {
+		void __user *info = (void __user *)arg3;
+		switch (arg2) {
+		case 0x55550: /* CMD_SUSFS_ADD_SUS_PATH */
+			susfs_add_sus_path(&info);
+			return 0;
+		case 0x55553: /* CMD_SUSFS_ADD_SUS_PATH_LOOP */
+			susfs_add_sus_path_loop(&info);
+			return 0;
+		case 0x55561: /* CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS */
+			susfs_set_hide_sus_mnts_for_non_su_procs(&info);
+			return 0;
+		case 0x55570: /* CMD_SUSFS_ADD_SUS_KSTAT */
+			susfs_add_sus_kstat(&info);
+			return 0;
+		case 0x55571: /* CMD_SUSFS_UPDATE_SUS_KSTAT */
+			susfs_update_sus_kstat(&info);
+			return 0;
+		case 0x55590: /* CMD_SUSFS_SET_UNAME */
+			susfs_set_uname(&info);
+			return 0;
+		case 0x555a0: /* CMD_SUSFS_ENABLE_LOG */
+			susfs_enable_log(&info);
+			return 0;
+		case 0x555b0: /* CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG */
+			susfs_set_cmdline_or_bootconfig(&info);
+			return 0;
+		case 0x555c0: /* CMD_SUSFS_ADD_OPEN_REDIRECT */
+			susfs_add_open_redirect(&info);
+			return 0;
+		case 0x555e1: /* CMD_SUSFS_SHOW_VERSION */
+			susfs_show_version(&info);
+			return 0;
+		case 0x555e2: /* CMD_SUSFS_SHOW_ENABLED_FEATURES */
+			susfs_get_enabled_features(&info);
+			return 0;
+		case 0x555e3: /* CMD_SUSFS_SHOW_VARIANT */
+			susfs_show_variant(&info);
+			return 0;
+		case 0x60010: /* CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING */
+			susfs_set_avc_log_spoofing(&info);
+			return 0;
+		case 0x60020: /* CMD_SUSFS_ADD_SUS_MAP */
+			susfs_add_sus_map(&info);
+			return 0;
+		default:
+			return -EINVAL;
+		}
+	}
+#endif /* CONFIG_KSU_SUSFS */
 
 	error = 0;
 	switch (option) {
