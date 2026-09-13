@@ -1,0 +1,12 @@
+--- fs/proc/base.c
++++ fs/proc/base.c
+@@ -88,6 +88,9 @@
+ #include <linux/flex_array.h>
+ #include <linux/posix-timers.h>
+ #include <linux/cpufreq_times.h>
++#if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
++#include <linux/susfs_def.h>
++#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+ #ifdef CONFIG_HARDWALL
+ #include <asm/hardwall.h>
+ #endif
