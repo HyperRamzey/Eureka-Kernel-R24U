@@ -26,7 +26,20 @@
 #include "fuse/fuse_i.h"
 #include "mount.h"
 
-extern bool susfs_is_current_ksu_domain(void);
+/* rsuntk KernelSU compat: official KSU ships this; rsuntk doesn't.
+ * Manager-aware exemption so sus_path/sus_mount hide from apps but not
+ * from the KSU manager itself (see UID_ROOT_PROC_EXCEPT_SU_PROC users). */
+bool susfs_is_current_ksu_domain(void)
+{
+	/* mirrors rsuntk's is_manager(): ksu_manager_appid is an exported
+	 * global (KSU_INVALID_APPID = -1 when no manager bound yet). */
+	extern uid_t ksu_manager_appid;
+	const uid_t KSU_PER_USER_RANGE_ = 100000;
+
+	if ((uid_t)-1 == ksu_manager_appid)
+		return false;
+	return ksu_manager_appid == (current_uid().val % KSU_PER_USER_RANGE_);
+}
 extern void setup_selinux(const char *domain, struct cred *cred);
 extern struct cred *ksu_cred;
 extern int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt);
