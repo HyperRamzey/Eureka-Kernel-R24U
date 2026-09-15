@@ -26,6 +26,15 @@
 #include "fuse/fuse_i.h"
 #include "mount.h"
 
+/* KernelSU mount_list (try_umount bridge) */
+#include "../KernelSU/kernel/feature/kernel_umount.h"
+
+#ifndef MNT_DETACH
+#define MNT_DETACH 0x00000002
+#endif
+
+extern bool susfs_is_current_ksu_domain(void);
+
 /* rsuntk KernelSU compat: official KSU ships this; rsuntk doesn't.
  * Manager-aware exemption so sus_path/sus_mount hide from apps but not
  * from the KSU manager itself (see UID_ROOT_PROC_EXCEPT_SU_PROC users). */
@@ -50,8 +59,8 @@ DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled);
 #define SUSFS_LOGI(fmt, ...) if (static_branch_likely(&susfs_is_log_enabled)) pr_info("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__)
 #define SUSFS_LOGE(fmt, ...) if (static_branch_likely(&susfs_is_log_enabled)) pr_err("susfs:[%u][%d][%s]" fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__)
 #else
-#define SUSFS_LOGI(fmt, ...) 
-#define SUSFS_LOGE(fmt, ...) 
+#define SUSFS_LOGI(fmt, ...)
+#define SUSFS_LOGE(fmt, ...)
 #endif
 
 /* sus_path */
@@ -61,27 +70,33 @@ static DEFINE_MUTEX(susfs_mutex_lock_sus_path);
 static LIST_HEAD(LH_SUS_PATH_LOOP);
 const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-test the dcache lookup, make sure you don't have file named like this!!
 
-void susfs_add_sus_path(void __user **user_info) {
+/* prctl-era tool ABI: { u64 target_ino @0; char target_pathname[256] @8 } (264B).
+ * The pathname is at offset 8 — the old backport read it at offset 0 which
+ * fed the ino bytes to kern_path() as the path ("failed opening file 'E'").
+ * We never use the tool-provided ino: kern_path() gives us the authoritative
+ * inode. Errors go to prctl arg5 only (int return), never copied back into
+ * the user struct (the v1 wire struct has no err field — writing one would
+ * smash the caller's exact-sized buffer). */
+int susfs_add_sus_path(struct st_susfs_sus_path __user *user_info) {
 	struct st_susfs_sus_path info = {0};
 	struct path path;
 	struct inode *inode = NULL;
 	struct fuse_inode *fi = NULL;
+	int err;
 
-	if (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
 
-	info.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
-	if (info.err) {
+	err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
+	if (err) {
 		SUSFS_LOGE("failed opening file '%s'\n", info.target_pathname);
-		goto out_copy_to_user;
+		return err;
 	}
 
 	inode = d_backing_inode(path.dentry);
 	if (!inode || !inode->i_mapping) {
 		SUSFS_LOGE("inode || inode->i_mapping is NULL\n");
-		info.err = -ENOENT;
+		err = -ENOENT;
 		goto out_path_put_path;
 	}
 
@@ -89,50 +104,41 @@ void susfs_add_sus_path(void __user **user_info) {
 		fi = get_fuse_inode(inode);
 		if (!fi || !fi->inode.i_mapping) {
 			SUSFS_LOGE("fi || fi->inode.i_mapping is NULL\n");
-			info.err = -ENOENT;
+			err = -ENOENT;
 			goto out_path_put_path;
 		}
 		set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_state);
 		set_bit(AS_FLAGS_SUS_PATH, &inode->i_state);
 		SUSFS_LOGI("flagged AS_FLAGS_SUS_PATH on pathname: '%s', fi->nodeid: %llu, fi->inode.i_ino: %lu, fi->inode.i_state: 0x%lx\n",
 					info.target_pathname, fi->nodeid, fi->inode.i_ino, fi->inode.i_state);
-		info.err = 0;
+		err = 0;
 		goto out_path_put_path;
 	}
 
 	set_bit(AS_FLAGS_SUS_PATH, &inode->i_state);
 	SUSFS_LOGI("flagged AS_FLAGS_SUS_PATH on pathname: '%s', ino: '%lu', inode->i_state: 0x%lx\n",
 				info.target_pathname, inode->i_ino, inode->i_state);
-	info.err = 0;
+	err = 0;
 out_path_put_path:
 	path_put(&path);
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_sus_path __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_ADD_SUS_PATH -> ret: %d\n", info.err);
+	return err;
 }
 
-void susfs_add_sus_path_loop(void __user **user_info) {
+int susfs_add_sus_path_loop(struct st_susfs_sus_path __user *user_info) {
 	struct st_susfs_sus_path_list *new_list = NULL;
 	struct st_susfs_sus_path info = {0};
 
-	if (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
 
 	if (*info.target_pathname == '\0') {
 		SUSFS_LOGE("target_pathname cannot be empty\n");
-		info.err = -EINVAL;
-		goto out_copy_to_user;
+		return -EINVAL;
 	}
 
 	new_list = kzalloc(sizeof(struct st_susfs_sus_path_list), GFP_KERNEL);
-	if (!new_list) {
-		info.err = -ENOMEM;
-		goto out_copy_to_user;
-	}
+	if (!new_list)
+		return -ENOMEM;
 	strscpy(new_list->info.target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME - 1);
 	strscpy(new_list->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME - 1);
 	INIT_LIST_HEAD(&new_list->list);
@@ -140,12 +146,7 @@ void susfs_add_sus_path_loop(void __user **user_info) {
 	list_add_tail_rcu(&new_list->list, &LH_SUS_PATH_LOOP);
 	mutex_unlock(&susfs_mutex_lock_sus_path);
 	SUSFS_LOGI("target_pathname: '%s', is successfully added to LH_SUS_PATH_LOOP\n", new_list->target_pathname);
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_sus_path __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_ADD_SUS_PATH_LOOP -> ret: %d\n", info.err);
+	return 0;
 }
 
 static void susfs_run_sus_path_loop(void) {
@@ -259,27 +260,186 @@ int susfs_get_data_path(struct path *path) {
 //   otherwise user needs to turn it on in post-fs-data stage and turn it off in boot-completed stage
 DEFINE_STATIC_KEY_FALSE(susfs_is_hide_sus_mnts_for_non_su_procs_enabled);
 
-void susfs_set_hide_sus_mnts_for_non_su_procs(void __user **user_info) {
-	struct st_susfs_hide_sus_mnts_for_non_su_procs info = {0};
+static DEFINE_MUTEX(susfs_mutex_lock_sus_mount);
+static LIST_HEAD(LH_SUS_MOUNT);
 
-	if (copy_from_user(&info, (struct st_susfs_hide_sus_mnts_for_non_su_procs __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
+/* Wire ABI: { char target_pathname[256] @0; u64 target_dev @256 } (264B).
+ * target_dev is resolved by the kernel itself (kern_path) — the tools value
+ * is advisory only. The path lands in LH_SUS_MOUNT and is consulted by the
+ * proc_namespace show hooks (susfs_show_vfsmnt/mountinfo/vfsstat) so the
+ * mount is hidden from /proc/self/mounts listing for umounted-app procs. */
+int susfs_add_sus_mount(struct st_susfs_sus_mount __user *user_info) {
+	struct st_susfs_sus_mount info = {0};
+	struct st_susfs_sus_mount_list *new_list = NULL, *cursor = NULL;
+	struct path path;
+	int err;
+
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
+
+	if (*info.target_pathname == '\0') {
+		SUSFS_LOGE("target_pathname cannot be empty\n");
+		return -EINVAL;
 	}
-	
-	if (info.enabled) {
-		static_branch_enable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);
+
+	/* Resolve the authoritative device (and validate the path exists) */
+	err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
+	if (err) {
+		SUSFS_LOGE("failed opening file '%s'\n", info.target_pathname);
+		return err;
+	}
+	info.target_dev = path.mnt->mnt_sb->s_dev;
+	path_put(&path);
+
+	/* dup check */
+	mutex_lock(&susfs_mutex_lock_sus_mount);
+	list_for_each_entry(cursor, &LH_SUS_MOUNT, list) {
+		if (!strcmp(cursor->info.target_pathname, info.target_pathname)) {
+			mutex_unlock(&susfs_mutex_lock_sus_mount);
+			SUSFS_LOGI("target_pathname: '%s' is already in LH_SUS_MOUNT\n", info.target_pathname);
+			return -EEXIST;
+		}
+	}
+	mutex_unlock(&susfs_mutex_lock_sus_mount);
+
+	new_list = kzalloc(sizeof(struct st_susfs_sus_mount_list), GFP_KERNEL);
+	if (!new_list)
+		return -ENOMEM;
+	memcpy(&new_list->info, &info, sizeof(info));
+	strscpy(new_list->target_pathname, info.target_pathname, SUSFS_MAX_LEN_PATHNAME - 1);
+	INIT_LIST_HEAD(&new_list->list);
+	mutex_lock(&susfs_mutex_lock_sus_mount);
+	list_add_tail_rcu(&new_list->list, &LH_SUS_MOUNT);
+	mutex_unlock(&susfs_mutex_lock_sus_mount);
+	SUSFS_LOGI("target_pathname: '%s', target_dev: '%lu', is successfully added to LH_SUS_MOUNT\n",
+			new_list->target_pathname, (unsigned long)new_list->info.target_dev);
+	return 0;
+}
+
+/* Consulted by the susfs_show_* hooks in fs/proc_namespace.c to decide
+ * whether a candidate mount line should be hidden (official susfs_sus_mount
+ * semantics: chroot-relative __d_path of the mounts root, exact strcmp
+ * against LH_SUS_MOUNT entries). Returns 1 to hide. */
+int susfs_is_sus_mount(const struct path *mnt_path, const struct path *root) {
+	struct st_susfs_sus_mount_list *cursor = NULL;
+	char *path_buf = NULL;
+	char *ptr = NULL;
+	char *end = NULL;
+	int res = 0;
+	int status = 0;
+
+	if (list_empty(&LH_SUS_MOUNT))
+		return 0;
+
+	path_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!path_buf) {
+		SUSFS_LOGE("no enough memory\n");
+		return 0;
+	}
+	ptr = __d_path((struct path *)mnt_path, (struct path *)root, path_buf, PAGE_SIZE);
+	if (IS_ERR(ptr)) {
+		SUSFS_LOGE("__d_path() failed\n");
+		goto out_free_path;
+	}
+	end = mangle_path(path_buf, ptr, " \t\n\\");
+	if (!end)
+		goto out_free_path;
+	res = end - path_buf;
+	path_buf[(size_t)res] = '\0';
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(cursor, &LH_SUS_MOUNT, list) {
+		if (unlikely(!strcmp(path_buf, cursor->info.target_pathname))) {
+			SUSFS_LOGI("hide target_pathname '%s' from mounts\n",
+					cursor->info.target_pathname);
+			status = 1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+out_free_path:
+	kfree(path_buf);
+	return status;
+}
+
+/* Scalar ABI: hide_sus_mnts_for_all_procs / hide_sus_mnts_for_non_su_procs
+ * both map to this CMD. The deployed R28 binary sends a struct {bool enabled;
+ * int err} (8B) — that is how the static key engaged in the earlier incident —
+ * while the current universal tool sends the raw 0|1 value (prctl_cmd_scalar).
+ * Discriminate by pointer plausibility: a user pointer is always > 4096,
+ * so arg3 <= 1 is the scalar form. */
+int susfs_set_hide_sus_mnts_for_non_su_procs(unsigned long arg3) {
+	bool enabled;
+
+	if (arg3 <= 1) {
+		enabled = (arg3 == 1);
 	} else {
-		static_branch_disable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);
+		struct {
+			bool enabled;
+			int err;
+		} __attribute__((packed)) info;
+
+		if (copy_from_user(&info, (void __user *)arg3, sizeof(info)))
+			return -EFAULT;
+		enabled = info.enabled;
 	}
 
-	SUSFS_LOGI("susfs_is_hide_sus_mnts_for_non_su_procs_enabled: %d\n", static_key_enabled(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled));
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_hide_sus_mnts_for_non_su_procs __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
+	if (enabled)
+		static_branch_enable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);
+	else
+		static_branch_disable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);
+
+	SUSFS_LOGI("susfs_is_hide_sus_mnts_for_non_su_procs_enabled: %d\n",
+			static_key_enabled(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled));
+	return 0;
+}
+
+/* Wire ABI: { char target_pathname[256] @0; int mnt_mode @256 } (260B).
+ * mnt_mode: 0 = plain umount, 1 = MNT_DETACH (2). Bridged into the
+ * KernelSU mount_list — the exact same list the KSU supercall
+ * add_try_umount populates and ksu_handle_umount consumes for zygote
+ * children (Hybrid Mount already proves that path works end-to-end). */
+int susfs_add_try_umount(struct st_susfs_try_umount __user *user_info) {
+	struct st_susfs_try_umount info = {0};
+	struct mount_entry *new_entry, *entry;
+	char *dup;
+
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
+
+	if (*info.target_pathname == '\0') {
+		SUSFS_LOGE("target_pathname cannot be empty\n");
+		return -EINVAL;
 	}
-	SUSFS_LOGI("CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS -> ret: %d\n", info.err);
+
+	dup = kstrdup(info.target_pathname, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+	if (!new_entry) {
+		kfree(dup);
+		return -ENOMEM;
+	}
+	new_entry->umountable = dup;
+	new_entry->flags = (info.mnt_mode == TRY_UMOUNT_DETACH) ? MNT_DETACH : 0;
+
+	down_write(&mount_list_lock);
+	list_for_each_entry(entry, &mount_list, list) {
+		if (!strcmp(entry->umountable, info.target_pathname)) {
+			up_write(&mount_list_lock);
+			kfree(new_entry->umountable);
+			kfree(new_entry);
+			SUSFS_LOGI("'%s' is already in the umount list\n", info.target_pathname);
+			return -EEXIST;
+		}
+	}
+	list_add(&new_entry->list, &mount_list);
+	up_write(&mount_list_lock);
+	SUSFS_LOGI("'%s' is successfully added to the KernelSU umount list (mnt_mode: %d)\n",
+			info.target_pathname, info.mnt_mode);
+	return 0;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
@@ -373,25 +533,33 @@ out_path_put_path:
 	return err;
 }
 
-void susfs_add_sus_kstat(void __user **user_info) {
+/* CMD_SUSFS_ADD_SUS_KSTAT (0x55570) and CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY
+ * (0x55572) share one reader: the v1 wire bool is_statically at offset 0 is
+ * the only discriminator between the two commands (true only for the
+ * statically command) and it selects the kernel log line, matching the old
+ * handler's behaviour. The v1 wire struct carries no flags field, so per
+ * official v1 semantics every provided field is spoofed: the internal
+ * flags mask is set to KSTAT_SPOOF_ALL. */
+int susfs_add_sus_kstat(struct st_susfs_sus_kstat __user *user_info) {
 	struct st_susfs_sus_kstat info = {0};
 	struct st_susfs_sus_kstat_hlist *new_entry, *tmp_entry;
 	struct hlist_node *tmp_hlist_node;
+	int err;
 
-	if (copy_from_user(&info, (struct st_susfs_sus_kstat __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
+	if (copy_from_user(&info, user_info, sizeof(info))) {
+		err = -EFAULT;
+		goto out;
 	}
 
 	if (*info.target_pathname == '\0') {
-		info.err = -EINVAL;
-		goto out_copy_to_user;
+		err = -EINVAL;
+		goto out;
 	}
 
 	new_entry = kzalloc(sizeof(struct st_susfs_sus_kstat_hlist), GFP_KERNEL);
 	if (!new_entry) {
-		info.err = -ENOMEM;
-		goto out_copy_to_user;
+		err = -ENOMEM;
+		goto out;
 	}
 
 #if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
@@ -402,18 +570,19 @@ void susfs_add_sus_kstat(void __user **user_info) {
 
 	new_entry->target_ino = info.target_ino;
 	memcpy(&new_entry->info, &info, sizeof(info));
+	/* v1 wire struct has no flags: spoof everything the tool sent */
+	new_entry->flags = KSTAT_SPOOF_ALL;
 
 	// statically or not, check for duplicated entry, and remove it first if so
 	mutex_lock(&susfs_mutex_lock_sus_kstat);
 	hash_for_each_possible_safe(SUS_KSTAT_HLIST, tmp_entry, tmp_hlist_node, node, info.target_ino) {
 		if (!strcmp(tmp_entry->info.target_pathname, info.target_pathname)) {
-			info.err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, false);
-			if (info.err) {
+			err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, false);
+			if (err) {
 				mutex_unlock(&susfs_mutex_lock_sus_kstat);
 				kfree(new_entry);
-				goto out_copy_to_user;
+				goto out;
 			}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 			SUSFS_LOGI("is_fuse: %d, is_statically: '%d', target_ino: '%lu', target_dev: '%lu', target_pathname: '%s', spoofed_ino: '%lu', spoofed_dev: '%lu', spoofed_nlink: '%u', spoofed_size: '%llu', spoofed_atime_tv_sec: '%ld', spoofed_mtime_tv_sec: '%ld', spoofed_ctime_tv_sec: '%ld', spoofed_atime_tv_nsec: '%ld', spoofed_mtime_tv_nsec: '%ld', spoofed_ctime_tv_nsec: '%ld', spoofed_blksize: '%lu', spoofed_blocks: '%llu', spoofed_mnt_id: '%d', is successfully added to SUS_KSTAT_HLIST\n",
 					new_entry->is_fuse,
 					new_entry->info.is_statically, new_entry->info.target_ino,
@@ -423,36 +592,24 @@ void susfs_add_sus_kstat(void __user **user_info) {
 					new_entry->info.spoofed_atime_tv_sec, new_entry->info.spoofed_mtime_tv_sec, new_entry->info.spoofed_ctime_tv_sec,
 					new_entry->info.spoofed_atime_tv_nsec, new_entry->info.spoofed_mtime_tv_nsec, new_entry->info.spoofed_ctime_tv_nsec,
 					new_entry->info.spoofed_blksize, new_entry->info.spoofed_blocks, new_entry->spoofed_mnt_id);
-#else
-			SUSFS_LOGI("is_fuse: %d, is_statically: '%d', target_ino: '%lu', target_dev: '%lu', target_pathname: '%s', spoofed_ino: '%lu', spoofed_dev: '%lu', spoofed_nlink: '%u', spoofed_size: '%u', spoofed_atime_tv_sec: '%ld', spoofed_mtime_tv_sec: '%ld', spoofed_ctime_tv_sec: '%ld', spoofed_atime_tv_nsec: '%ld', spoofed_mtime_tv_nsec: '%ld', spoofed_ctime_tv_nsec: '%ld', spoofed_blksize: '%lu', spoofed_blocks: '%llu', spoofed_mnt_id: '%d', is successfully added to SUS_KSTAT_HLIST\n",
-					new_entry->is_fuse,
-					new_entry->info.is_statically, new_entry->info.target_ino,
-					new_entry->target_dev, new_entry->info.target_pathname,
-					new_entry->info.spoofed_ino, new_entry->info.spoofed_dev,
-					new_entry->info.spoofed_nlink, new_entry->info.spoofed_size,
-					new_entry->info.spoofed_atime_tv_sec, new_entry->info.spoofed_mtime_tv_sec, new_entry->info.spoofed_ctime_tv_sec,
-					new_entry->info.spoofed_atime_tv_nsec, new_entry->info.spoofed_mtime_tv_nsec, new_entry->info.spoofed_ctime_tv_nsec,
-					new_entry->info.spoofed_blksize, new_entry->info.spoofed_blocks, new_entry->spoofed_mnt_id);
-#endif
 			hash_del_rcu(&tmp_entry->node);
 			hash_add_rcu(SUS_KSTAT_HLIST, &new_entry->node, info.target_ino);
 			mutex_unlock(&susfs_mutex_lock_sus_kstat);
 			synchronize_rcu();
 			kfree(tmp_entry);
-			info.err = 0;
-			goto out_copy_to_user;
+			err = 0;
+			goto out;
 		}
 	}
 
 	// if no duplicated, add it to list
-	info.err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, false);
-	if (info.err) {
+	err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, false);
+	if (err) {
 		mutex_unlock(&susfs_mutex_lock_sus_kstat);
 		kfree(new_entry);
-		goto out_copy_to_user;
+		goto out;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	SUSFS_LOGI("is_fuse: %d, is_statically: '%d', target_ino: '%lu', target_dev: '%lu', target_pathname: '%s', spoofed_ino: '%lu', spoofed_dev: '%lu', spoofed_nlink: '%u', spoofed_size: '%llu', spoofed_atime_tv_sec: '%ld', spoofed_mtime_tv_sec: '%ld', spoofed_ctime_tv_sec: '%ld', spoofed_atime_tv_nsec: '%ld', spoofed_mtime_tv_nsec: '%ld', spoofed_ctime_tv_nsec: '%ld', spoofed_blksize: '%lu', spoofed_blocks: '%llu', spoofed_mnt_id: '%d', is successfully added to SUS_KSTAT_HLIST\n",
 			new_entry->is_fuse,
 			new_entry->info.is_statically, new_entry->info.target_ino,
@@ -462,47 +619,30 @@ void susfs_add_sus_kstat(void __user **user_info) {
 			new_entry->info.spoofed_atime_tv_sec, new_entry->info.spoofed_mtime_tv_sec, new_entry->info.spoofed_ctime_tv_sec,
 			new_entry->info.spoofed_atime_tv_nsec, new_entry->info.spoofed_mtime_tv_nsec, new_entry->info.spoofed_ctime_tv_nsec,
 			new_entry->info.spoofed_blksize, new_entry->info.spoofed_blocks, new_entry->spoofed_mnt_id);
-#else
-	SUSFS_LOGI("is_fuse: %d, is_statically: '%d', target_ino: '%lu', target_dev: '%lu', target_pathname: '%s', spoofed_ino: '%lu', spoofed_dev: '%lu', spoofed_nlink: '%u', spoofed_size: '%u', spoofed_atime_tv_sec: '%ld', spoofed_mtime_tv_sec: '%ld', spoofed_ctime_tv_sec: '%ld', spoofed_atime_tv_nsec: '%ld', spoofed_mtime_tv_nsec: '%ld', spoofed_ctime_tv_nsec: '%ld', spoofed_blksize: '%lu', spoofed_blocks: '%llu', spoofed_mnt_id: '%d', is successfully added to SUS_KSTAT_HLIST\n",
-			new_entry->is_fuse,
-			new_entry->info.is_statically, new_entry->info.target_ino,
-			new_entry->target_dev, new_entry->info.target_pathname,
-			new_entry->info.spoofed_ino, new_entry->info.spoofed_dev,
-			new_entry->info.spoofed_nlink, new_entry->info.spoofed_size,
-			new_entry->info.spoofed_atime_tv_sec, new_entry->info.spoofed_mtime_tv_sec, new_entry->info.spoofed_ctime_tv_sec,
-			new_entry->info.spoofed_atime_tv_nsec, new_entry->info.spoofed_mtime_tv_nsec, new_entry->info.spoofed_ctime_tv_nsec,
-			new_entry->info.spoofed_blksize, new_entry->info.spoofed_blocks, new_entry->spoofed_mnt_id);
-#endif
 	hash_add_rcu(SUS_KSTAT_HLIST, &new_entry->node, info.target_ino);
 	mutex_unlock(&susfs_mutex_lock_sus_kstat);
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_sus_kstat __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	if (!info.is_statically) {
-		SUSFS_LOGI("CMD_SUSFS_ADD_SUS_KSTAT -> ret: %d\n", info.err);
-	} else {
-		SUSFS_LOGI("CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY -> ret: %d\n", info.err);
-	}
+	err = 0;
+out:
+	if (info.is_statically)
+		SUSFS_LOGI("CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY -> ret: %d\n", err);
+	else
+		SUSFS_LOGI("CMD_SUSFS_ADD_SUS_KSTAT -> ret: %d\n", err);
+	return err;
 }
 
-void susfs_update_sus_kstat(void __user **user_info) {
+int susfs_update_sus_kstat(struct st_susfs_sus_kstat __user *user_info) {
 	struct st_susfs_sus_kstat info = {0};
 	struct st_susfs_sus_kstat_hlist *new_entry, *tmp_entry;
 	struct hlist_node *tmp_hlist_node;
 	int bkt;
+	int err;
 
-	if (copy_from_user(&info, (struct st_susfs_sus_kstat __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
 
 	new_entry = kzalloc(sizeof(struct st_susfs_sus_kstat_hlist), GFP_KERNEL);
-	if (!new_entry) {
-		info.err = -ENOMEM;
-		goto out_copy_to_user;
-	}
+	if (!new_entry)
+		return -ENOMEM;
 
 	// check for added entry, do the update only if entry is found.
 	mutex_lock(&susfs_mutex_lock_sus_kstat);
@@ -514,11 +654,12 @@ void susfs_update_sus_kstat(void __user **user_info) {
 			new_entry->target_ino = info.target_ino;
 			new_entry->target_dev = tmp_entry->target_dev;
 			new_entry->is_fuse = tmp_entry->is_fuse;
-			info.err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, true);
-			if (info.err) {
+			new_entry->flags = tmp_entry->flags;
+			err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, true);
+			if (err) {
 				mutex_unlock(&susfs_mutex_lock_sus_kstat);
 				kfree(new_entry);
-				goto out_copy_to_user;
+				return err;
 			}
 			SUSFS_LOGI("updating target_ino from '%lu' to '%lu' for pathname: '%s' in SUS_KSTAT_HLIST\n",
 					tmp_entry->target_ino, new_entry->target_ino, new_entry->info.target_pathname);
@@ -527,18 +668,13 @@ void susfs_update_sus_kstat(void __user **user_info) {
 			mutex_unlock(&susfs_mutex_lock_sus_kstat);
 			synchronize_rcu();
 			kfree(tmp_entry);
-			info.err = 0;
-			goto out_copy_to_user;
+			return 0;
 		}
 	}
 	mutex_unlock(&susfs_mutex_lock_sus_kstat);
-	info.err = -ENOENT;
-
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_sus_kstat __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_UPDATE_SUS_KSTAT -> ret: %d\n", info.err);
+	kfree(new_entry);
+	SUSFS_LOGI("CMD_SUSFS_UPDATE_SUS_KSTAT -> ret: -ENOENT\n");
+	return -ENOENT;
 }
 
 __attribute__((hot)) bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse) {
@@ -598,29 +734,29 @@ out_spoof_kstat:
 		{
 			SUSFS_LOGI("spoofing kstat for vfs_getattr_nosec, target_ino: %lu, target_dev: %u\n",
 					target_ino, target_dev);
-			if (entry->info.flags & KSTAT_SPOOF_INO)
+			if (entry->flags & KSTAT_SPOOF_INO)
 				stat->ino = entry->info.spoofed_ino;
-			if (entry->info.flags & KSTAT_SPOOF_DEV)
+			if (entry->flags & KSTAT_SPOOF_DEV)
 				stat->dev = entry->info.spoofed_dev;
-			if (entry->info.flags & KSTAT_SPOOF_NLINK)
+			if (entry->flags & KSTAT_SPOOF_NLINK)
 				stat->nlink = entry->info.spoofed_nlink;
-			if (entry->info.flags & KSTAT_SPOOF_SIZE)
+			if (entry->flags & KSTAT_SPOOF_SIZE)
 				stat->size = entry->info.spoofed_size;
-			if (entry->info.flags & KSTAT_SPOOF_ATIME_TV_SEC)
+			if (entry->flags & KSTAT_SPOOF_ATIME_TV_SEC)
 				stat->atime.tv_sec = entry->info.spoofed_atime_tv_sec;
-			if (entry->info.flags & KSTAT_SPOOF_ATIME_TV_NSEC)
+			if (entry->flags & KSTAT_SPOOF_ATIME_TV_NSEC)
 				stat->atime.tv_nsec = entry->info.spoofed_atime_tv_nsec;
-			if (entry->info.flags & KSTAT_SPOOF_MTIME_TV_SEC)
+			if (entry->flags & KSTAT_SPOOF_MTIME_TV_SEC)
 				stat->mtime.tv_sec = entry->info.spoofed_mtime_tv_sec;
-			if (entry->info.flags & KSTAT_SPOOF_MTIME_TV_NSEC)
+			if (entry->flags & KSTAT_SPOOF_MTIME_TV_NSEC)
 				stat->mtime.tv_nsec = entry->info.spoofed_mtime_tv_nsec;
-			if (entry->info.flags & KSTAT_SPOOF_CTIME_TV_SEC)
+			if (entry->flags & KSTAT_SPOOF_CTIME_TV_SEC)
 				stat->ctime.tv_sec = entry->info.spoofed_ctime_tv_sec;
-			if (entry->info.flags & KSTAT_SPOOF_CTIME_TV_NSEC)
+			if (entry->flags & KSTAT_SPOOF_CTIME_TV_NSEC)
 				stat->ctime.tv_nsec = entry->info.spoofed_ctime_tv_nsec;
-			if (entry->info.flags & KSTAT_SPOOF_BLKSIZE)
+			if (entry->flags & KSTAT_SPOOF_BLKSIZE)
 				stat->blksize = entry->info.spoofed_blksize;
-			if (entry->info.flags & KSTAT_SPOOF_BLOCKS)
+			if (entry->flags & KSTAT_SPOOF_BLOCKS)
 				stat->blocks = entry->info.spoofed_blocks;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 			stat->mnt_id = entry->spoofed_mnt_id;
@@ -650,7 +786,7 @@ void susfs_sus_kstat_spoof_show_map_vma(struct inode *inode, dev_t *out_dev, uns
 		is_fuse = true;
 		goto out_spoof_kstat;
 	}
-	
+
 	if (!inode->i_mapping) {
 		SUSFS_LOGE("inode->i_mapping is NULL\n");
 		return;
@@ -686,7 +822,7 @@ int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, b
 	hash_for_each_possible_rcu(SUS_KSTAT_HLIST, entry, node, target_inode->i_ino) {
 		if (entry->target_dev == inode->i_sb->s_dev)
 		{
-			SUSFS_LOGI("spoofing kstat for vfs_statfs, target_ino: %lu, target_dev: %u\n", target_inode->i_ino, target_inode->i_sb->s_dev);
+			SUSFS_LOGI("spoofing kstat for vfs_statfs, target_ino: %lu, target_dev: %u\n", target_inode->i_ino, inode->i_sb->s_dev);
 			memcpy(buf, &entry->spoofed_kstatfs, sizeof(struct kstatfs));
 			rcu_read_unlock();
 			return 0;
@@ -733,22 +869,24 @@ void susfs_sus_kstat_spoof_proc_fd_seq_show(int *out_target_mnt_id, unsigned lon
 
 /* spoof_uname */
 #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-static struct st_susfs_uname my_uname = {0};
+static struct utsname_spoofer {
+	char release[__NEW_UTS_LEN + 1];
+	char version[__NEW_UTS_LEN + 1];
+} my_uname = {{0}, {0}};
 DEFINE_STATIC_KEY_FALSE(susfs_is_uname_spoof_buffer_set);
 static DEFINE_SEQLOCK(susfs_uname_seqlock);
 
-void susfs_set_uname(void __user **user_info) {
-	struct st_susfs_uname info = {0};
+/* Wire ABI: { char release[65] @0; char version[65] @65 } (130B, no err).
+ * This layout matches the old struct minus the err tail, so set_uname was
+ * the one command that already worked — it stays byte-identical. */
+int susfs_set_uname(struct st_susfs_uname __user *user_info) {
+	struct st_susfs_uname info = {{0}, {0}};
 
-	if (copy_from_user(&info, (struct st_susfs_uname __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
 
-	if (*info.release == '\0' || *info.version == '\0') {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (*info.release == '\0' || *info.version == '\0')
+		return -EFAULT;
 
 	write_seqlock(&susfs_uname_seqlock);
 	if (!strcmp(info.release, "default")) {
@@ -769,12 +907,7 @@ void susfs_set_uname(void __user **user_info) {
 	SUSFS_LOGI("set spoofed release: '%s', version: '%s'\n",
 				my_uname.release, my_uname.version);
 
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_uname __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_SET_UNAME -> ret: %d\n", info.err);
+	return 0;
 }
 
 void susfs_spoof_uname(struct new_utsname* tmp) {
@@ -790,28 +923,17 @@ void susfs_spoof_uname(struct new_utsname* tmp) {
 
 /* enable_log */
 #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-void susfs_enable_log(void __user **user_info) {
-	struct st_susfs_log info = {0};
-
-	if (copy_from_user(&info, (struct st_susfs_log __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
-
-	if (info.enabled) {
+/* Scalar ABI: arg3 = 0|1 as a plain value (prctl_cmd_scalar), not a pointer.
+ * The old struct-reading handler EFAULTed on every call (dmesg ret: -14). */
+int susfs_enable_log(unsigned long enabled) {
+	if (enabled) {
 		static_branch_enable(&susfs_is_log_enabled);
-		pr_info("susfs: enable logging to kernel");
+		pr_info("susfs: enable logging to kernel\n");
 	} else {
 		static_branch_disable(&susfs_is_log_enabled);
-		pr_info("susfs: disable logging to kernel");
+		pr_info("susfs: disable logging to kernel\n");
 	}
-
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_log __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_ENABLE_LOG -> ret: %d\n", info.err);
+	return 0;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 
@@ -821,57 +943,50 @@ static char *fake_cmdline_or_bootconfig = NULL;
 DEFINE_STATIC_KEY_FALSE(susfs_is_fake_cmdline_or_bootconfig_buffer_set);
 static DEFINE_SEQLOCK(susfs_fake_cmdline_or_bootconfig_seqlock);
 
-void susfs_set_cmdline_or_bootconfig(void __user **user_info) {
-	struct st_susfs_spoof_cmdline_or_bootconfig *info = (struct st_susfs_spoof_cmdline_or_bootconfig *)kzalloc(sizeof(struct st_susfs_spoof_cmdline_or_bootconfig), GFP_KERNEL);
-	int err = 0;
+/* Wire ABI: arg3 points at a raw NUL-terminated buffer holding the fake
+ * cmdline/bootconfig text (up to SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE).
+ * The old handler copy_from_user'd a full 8196-byte struct from the tool's
+ * mallocd (file-size+1) buffer — an overread — and wrote an err int 4 bytes
+ * past its end. Bounded copy via strnlen_user instead. */
+int susfs_set_cmdline_or_bootconfig(const char __user *user_buf) {
+	size_t len;
+	char *kbuf;
 
-	if (!info) {
-		err = -ENOMEM;
-		if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user*)*user_info)->err, &err, sizeof(err)))
-			err = -EFAULT;
-		SUSFS_LOGI("CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG -> ret: %d\n", err);
-		return;
-	}
+	if (!user_buf)
+		return -EINVAL;
 
-	if (copy_from_user(info, (struct st_susfs_spoof_cmdline_or_bootconfig __user*)*user_info, sizeof(struct st_susfs_spoof_cmdline_or_bootconfig))) {
-		info->err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	len = strnlen_user(user_buf, SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE);
+	if (len <= 1) /* 1 means only NUL */
+		return -EINVAL;
 
-	if (*info->fake_cmdline_or_bootconfig == '\0') {
-		info->err = -EINVAL;
-		goto out_copy_to_user;
+	kbuf = kmalloc(len, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	if (copy_from_user(kbuf, user_buf, len)) {
+		kfree(kbuf);
+		return -EFAULT;
 	}
 
 	if (!fake_cmdline_or_bootconfig) {
 		fake_cmdline_or_bootconfig = (char *)kzalloc(SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE, GFP_KERNEL);
 		if (!fake_cmdline_or_bootconfig) {
-			info->err = -ENOMEM;
-			goto out_copy_to_user;
+			kfree(kbuf);
+			return -ENOMEM;
 		}
 	}
 
 	write_seqlock(&susfs_fake_cmdline_or_bootconfig_seqlock);
-	strscpy(fake_cmdline_or_bootconfig,
-			info->fake_cmdline_or_bootconfig,
-			SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE - 1);
+	strscpy(fake_cmdline_or_bootconfig, kbuf,
+		SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE - 1);
 	write_sequnlock(&susfs_fake_cmdline_or_bootconfig_seqlock);
+	kfree(kbuf);
 
 	if (!static_key_enabled(&susfs_is_fake_cmdline_or_bootconfig_buffer_set))
 		static_branch_enable(&susfs_is_fake_cmdline_or_bootconfig_buffer_set);
 	SUSFS_LOGI("fake_cmdline_or_bootconfig is set\n");
 
-	info->err = 0;
-
-out_copy_to_user:
-
-	if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user*)*user_info)->err, &info->err, sizeof(info->err))) {
-		info->err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG -> ret: %d\n", info->err);
-	if (info) {
-		kfree(info);
-	}
+	return 0;
 }
 
 void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m) {
@@ -890,7 +1005,11 @@ static DEFINE_MUTEX(susfs_mutex_lock_open_redirect);
 static DEFINE_HASHTABLE(OPEN_REDIRECT_HLIST, 14);
 DEFINE_SRCU(susfs_srcu_open_redirect);
 
-void susfs_add_open_redirect(void __user **user_info) {
+/* Wire ABI: { u64 target_ino @0; char target_pathname[256] @8;
+ * char redirected_pathname[256] @264 } (520B). The v1 wire struct carries no
+ * uid_scheme — the dispatch supplies it (default 2, UID_NON_SU_PROC, matching
+ * the module's default_uid_scheme). */
+int susfs_add_open_redirect(struct st_susfs_open_redirect __user *user_info, unsigned long uid_scheme_arg) {
 	struct st_susfs_open_redirect info = {0};
 	struct st_susfs_open_redirect_hlist *new_entry_target, *new_entry_redirected, *tmp_entry_target, *tmp_entry_redirected;
 	struct hlist_node *tmp_hlist_node;
@@ -898,32 +1017,31 @@ void susfs_add_open_redirect(void __user **user_info) {
 	struct inode *target_inode, *redirected_inode;
 	bool is_first_dup_found = false;
 	bool is_second_dup_found = false;
+	int uid_scheme;
+	int err;
 
-	if (copy_from_user(&info, (struct st_susfs_open_redirect __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
 
-        if (*info.target_pathname == '\0') {
-                info.err = -EINVAL;
+	if (*info.target_pathname == '\0') {
 		SUSFS_LOGE("empty target_pathname\n");
-                goto out_copy_to_user;
-        }
-
-	if (info.uid_scheme < UID_NON_APP_PROC || info.uid_scheme > UID_UMOUNTED_PROC) {
-		info.err = -EINVAL;
-		SUSFS_LOGE("invalid uid scheme: %d\n", info.uid_scheme);
-                goto out_copy_to_user;
+		return -EINVAL;
 	}
 
-	info.err = kern_path(info.redirected_pathname, 0, &redirected_path);
-	if (info.err) {
+	uid_scheme = (int)uid_scheme_arg;
+	if (uid_scheme < UID_NON_APP_PROC || uid_scheme > UID_UMOUNTED_PROC) {
+		SUSFS_LOGE("invalid uid scheme: %d\n", uid_scheme);
+		return -EINVAL;
+	}
+
+	err = kern_path(info.redirected_pathname, 0, &redirected_path);
+	if (err) {
 		SUSFS_LOGE("failed opening redirected file '%s'\n", info.redirected_pathname);
-		goto out_copy_to_user;
+		return err;
 	}
 
-	info.err = kern_path(info.target_pathname, 0, &target_path);
-	if (info.err) {
+	err = kern_path(info.target_pathname, 0, &target_path);
+	if (err) {
 		SUSFS_LOGE("failed opening target file '%s'\n", info.target_pathname);
 		goto out_path_put_redirected_path;
 	}
@@ -931,33 +1049,33 @@ void susfs_add_open_redirect(void __user **user_info) {
 	redirected_inode = d_backing_inode(redirected_path.dentry);
 	if (!redirected_inode || !redirected_inode->i_mapping) {
 		SUSFS_LOGE("redirected_inode || redirected_inode->i_mapping is NULL\n");
-		info.err = -ENOENT;
+		err = -ENOENT;
 		goto out_path_put_target_path;
 	}
 
 	target_inode = d_backing_inode(target_path.dentry);
 	if (!target_inode || !target_inode->i_mapping) {
 		SUSFS_LOGE("target_inode || target_inode->i_mapping is NULL\n");
-		info.err = -ENOENT;
+		err = -ENOENT;
 		goto out_path_put_target_path;
 	}
 
 	if (redirected_inode->i_sb->s_magic == FUSE_SUPER_MAGIC ||
 	    target_inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
 		SUSFS_LOGE("FUSE fs is not supported for open_redirect feature\n");
-		info.err = -EINVAL;
+		err = -EINVAL;
 		goto out_path_put_target_path;
 	}
 
 	new_entry_target = kzalloc(sizeof(struct st_susfs_open_redirect_hlist), GFP_KERNEL);
 	if (!new_entry_target) {
-		info.err = -ENOMEM;
+		err = -ENOMEM;
 		goto out_path_put_target_path;
 	}
 
 	new_entry_redirected = kzalloc(sizeof(struct st_susfs_open_redirect_hlist), GFP_KERNEL);
 	if (!new_entry_redirected) {
-		info.err = -ENOMEM;
+		err = -ENOMEM;
 		kfree(new_entry_target);
 		goto out_path_put_target_path;
 	}
@@ -966,7 +1084,7 @@ void susfs_add_open_redirect(void __user **user_info) {
 	new_entry_target->target_dev = target_inode->i_sb->s_dev;
 	new_entry_target->redirected_ino = redirected_inode->i_ino;
 	new_entry_target->redirected_dev = redirected_inode->i_sb->s_dev;
-	new_entry_target->info.uid_scheme = info.uid_scheme;
+	new_entry_target->uid_scheme = uid_scheme;
 	new_entry_target->reversed_lookup_only = false;
 	new_entry_target->spoofed_mnt_id = real_mount(target_path.mnt)->mnt_id;
 	(void)vfs_statfs(&target_path, &new_entry_target->spoofed_kstatfs);
@@ -976,7 +1094,7 @@ void susfs_add_open_redirect(void __user **user_info) {
 	new_entry_redirected->target_dev = redirected_inode->i_sb->s_dev;
 	new_entry_redirected->redirected_ino = target_inode->i_ino;
 	new_entry_redirected->redirected_dev = target_inode->i_sb->s_dev;
-	new_entry_redirected->info.uid_scheme = info.uid_scheme;
+	new_entry_redirected->uid_scheme = uid_scheme;
 	new_entry_redirected->reversed_lookup_only = true;
 	new_entry_redirected->spoofed_mnt_id = new_entry_target->spoofed_mnt_id;
 	memcpy(&new_entry_redirected->spoofed_kstatfs, &new_entry_target->spoofed_kstatfs, sizeof(struct kstatfs));
@@ -990,7 +1108,7 @@ void susfs_add_open_redirect(void __user **user_info) {
 			if (tmp_entry_target->reversed_lookup_only) {
 				SUSFS_LOGE("duplicated '%s' cannot be removed/added because it is used for reversed lookup only\n", info.target_pathname);
 				mutex_unlock(&susfs_mutex_lock_open_redirect);
-				info.err = -EINVAL;
+				err = -EINVAL;
 				kfree(new_entry_redirected);
 				kfree(new_entry_target);
 				goto out_path_put_target_path;
@@ -1010,9 +1128,9 @@ void susfs_add_open_redirect(void __user **user_info) {
 			}
 		}
 		SUSFS_LOGI("target_pathname: '%s', redirected_pathname: '%s', target_i_ino: '%lu', redirected_i_ino: '%lu', target_s_dev: '%lu', redirected_s_dev: '%lu', uid_scheme: '%d', reversed_lookup_only: %d, spoofed_mnt_id: %d, is successfully added to OPEN_REDIRECT_HLIST\n",
-			new_entry_target->info.target_pathname, new_entry_target->info.redirected_pathname, new_entry_target->target_ino, new_entry_target->redirected_ino, new_entry_target->target_dev, new_entry_target->redirected_dev, new_entry_target->info.uid_scheme, new_entry_target->reversed_lookup_only, new_entry_target->spoofed_mnt_id);
+			new_entry_target->info.target_pathname, new_entry_target->info.redirected_pathname, new_entry_target->target_ino, new_entry_target->redirected_ino, new_entry_target->target_dev, new_entry_target->redirected_dev, new_entry_target->uid_scheme, new_entry_target->reversed_lookup_only, new_entry_target->spoofed_mnt_id);
 		SUSFS_LOGI("target_pathname: '%s', redirected_pathname: '%s', target_i_ino: '%lu', redirected_i_ino: '%lu', target_s_dev: '%lu', redirected_s_dev: '%lu', uid_scheme: '%d', reversed_lookup_only: %d, spoofed_mnt_id: %d, is successfully added to OPEN_REDIRECT_HLIST\n",
-			new_entry_redirected->info.target_pathname, new_entry_redirected->info.redirected_pathname, new_entry_redirected->target_ino, new_entry_redirected->redirected_ino, new_entry_redirected->target_dev, new_entry_redirected->redirected_dev, new_entry_redirected->info.uid_scheme, new_entry_redirected->reversed_lookup_only, new_entry_redirected->spoofed_mnt_id);
+			new_entry_redirected->info.target_pathname, new_entry_redirected->info.redirected_pathname, new_entry_redirected->target_ino, new_entry_redirected->redirected_ino, new_entry_redirected->target_dev, new_entry_redirected->redirected_dev, new_entry_redirected->uid_scheme, new_entry_redirected->reversed_lookup_only, new_entry_redirected->spoofed_mnt_id);
 		hash_add_rcu(OPEN_REDIRECT_HLIST, &new_entry_target->node, new_entry_target->target_ino);
 		hash_add_rcu(OPEN_REDIRECT_HLIST, &new_entry_redirected->node, new_entry_redirected->target_ino);
 		// we need to mark both target and redirected path inode just for spoofing readlink as well
@@ -1023,31 +1141,27 @@ void susfs_add_open_redirect(void __user **user_info) {
 		if (is_second_dup_found)
 			kfree(tmp_entry_redirected);
 		kfree(tmp_entry_target);
-		info.err = 0;
+		err = 0;
 		goto out_path_put_target_path;
 	}
 
 	SUSFS_LOGI("target_pathname: '%s', redirected_pathname: '%s', target_i_ino: '%lu', redirected_i_ino: '%lu', target_s_dev: '%lu', redirected_s_dev: '%lu', uid_scheme: '%d', reversed_lookup_only: %d, spoofed_mnt_id: %d, is successfully added to OPEN_REDIRECT_HLIST\n",
-			new_entry_target->info.target_pathname, new_entry_target->info.redirected_pathname, new_entry_target->target_ino, new_entry_target->redirected_ino, new_entry_target->target_dev, new_entry_target->redirected_dev, new_entry_target->info.uid_scheme, new_entry_target->reversed_lookup_only, new_entry_target->spoofed_mnt_id);
+			new_entry_target->info.target_pathname, new_entry_target->info.redirected_pathname, new_entry_target->target_ino, new_entry_target->redirected_ino, new_entry_target->target_dev, new_entry_target->redirected_dev, new_entry_target->uid_scheme, new_entry_target->reversed_lookup_only, new_entry_target->spoofed_mnt_id);
 	SUSFS_LOGI("target_pathname: '%s', redirected_pathname: '%s', target_i_ino: '%lu', redirected_i_ino: '%lu', target_s_dev: '%lu', redirected_s_dev: '%lu', uid_scheme: '%d', reversed_lookup_only: %d, spoofed_mnt_id: %d, is successfully added to OPEN_REDIRECT_HLIST\n",
-			new_entry_redirected->info.target_pathname, new_entry_redirected->info.redirected_pathname, new_entry_redirected->target_ino, new_entry_redirected->redirected_ino, new_entry_redirected->target_dev, new_entry_redirected->redirected_dev, new_entry_redirected->info.uid_scheme, new_entry_redirected->reversed_lookup_only, new_entry_redirected->spoofed_mnt_id);
+			new_entry_redirected->info.target_pathname, new_entry_redirected->info.redirected_pathname, new_entry_redirected->target_ino, new_entry_redirected->redirected_ino, new_entry_redirected->target_dev, new_entry_redirected->redirected_dev, new_entry_redirected->uid_scheme, new_entry_redirected->reversed_lookup_only, new_entry_redirected->spoofed_mnt_id);
 	hash_add_rcu(OPEN_REDIRECT_HLIST, &new_entry_target->node, new_entry_target->target_ino);
 	hash_add_rcu(OPEN_REDIRECT_HLIST, &new_entry_redirected->node, new_entry_redirected->target_ino);
 	// we need to mark both target and redirected path inode just for spoofing readlink as well
 	set_bit(AS_FLAGS_OPEN_REDIRECT, &redirected_inode->i_state);
 	set_bit(AS_FLAGS_OPEN_REDIRECT, &target_inode->i_state);
 	mutex_unlock(&susfs_mutex_lock_open_redirect);
-	info.err = 0;
+	err = 0;
 
 out_path_put_target_path:
 	path_put(&target_path);
 out_path_put_redirected_path:
 	path_put(&redirected_path);
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_open_redirect __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_ADD_OPEN_REDIRECT -> ret: %d\n", info.err);
+	return err;
 }
 
 struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode) {
@@ -1059,7 +1173,7 @@ struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode) {
 		if (!entry->reversed_lookup_only &&
 			entry->target_dev == inode->i_sb->s_dev)
 		{
-			switch(entry->info.uid_scheme) {
+			switch(entry->uid_scheme) {
 				case UID_NON_APP_PROC:
 					if (current_uid().val % 100000 < 10000)
 						break;
@@ -1084,7 +1198,54 @@ struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode) {
 					goto out_srcu_read_unlock;
 			}
 			SUSFS_LOGI("redirect path '%s' to '%s', uid_scheme: %d\n",
-					entry->info.target_pathname, entry->info.redirected_pathname, entry->info.uid_scheme);
+					entry->info.target_pathname, entry->info.redirected_pathname, entry->uid_scheme);
+			new_filename = getname_kernel(entry->info.redirected_pathname);
+			srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);
+			return new_filename;
+		}
+	}
+out_srcu_read_unlock:
+	srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);
+	return new_filename;
+}
+
+/* Official 4.9-style helper for do_filp_open: look up the redirected
+ * pathname for a flagged inode, applying the uid_scheme gate. Returns
+ * ERR_PTR(-ENOENT) when this reader should NOT be redirected (root/ksu
+ * domain under scheme 2, etc), so do_filp_open keeps the original filp. */
+struct filename* susfs_get_redirected_path(unsigned long ino) {
+	struct st_susfs_open_redirect_hlist *entry = NULL;
+	struct filename *new_filename = ERR_PTR(-ENOENT);
+	int srcu_idx = srcu_read_lock(&susfs_srcu_open_redirect);
+
+	hash_for_each_possible_rcu(OPEN_REDIRECT_HLIST, entry, node, ino) {
+		if (!entry->reversed_lookup_only) {
+			switch(entry->uid_scheme) {
+				case UID_NON_APP_PROC:
+					if (current_uid().val % 100000 < 10000)
+						break;
+					goto out_srcu_read_unlock;
+				case UID_ROOT_PROC_EXCEPT_SU_PROC:
+					if (current_uid().val == 0 && !susfs_is_current_ksu_domain())
+						break;
+					goto out_srcu_read_unlock;
+				case UID_NON_SU_PROC:
+					if (!susfs_is_current_ksu_domain())
+						break;
+					goto out_srcu_read_unlock;
+				case UID_UMOUNTED_APP_PROC:
+					if (susfs_is_current_proc_umounted_app())
+						break;
+					goto out_srcu_read_unlock;
+				case UID_UMOUNTED_PROC:
+					if (susfs_is_current_proc_umounted())
+						break;
+					goto out_srcu_read_unlock;
+				default:
+					goto out_srcu_read_unlock;
+			}
+			SUSFS_LOGI("redirect path '%s' to '%s', uid_scheme: %d\n",
+					entry->info.target_pathname, entry->info.redirected_pathname, entry->uid_scheme);
 			new_filename = getname_kernel(entry->info.redirected_pathname);
 			srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);
 			return new_filename;
@@ -1174,66 +1335,50 @@ int susfs_open_redirect_spoof_show_map_vma_srcu(struct inode *inode, unsigned lo
 
 /* sus_map */
 #ifdef CONFIG_KSU_SUSFS_SUS_MAP
-void susfs_add_sus_map(void __user **user_info) {
+/* Wire ABI: { char target_pathname[256] } (256B, no err). */
+int susfs_add_sus_map(struct st_susfs_sus_map __user *user_info) {
 	struct st_susfs_sus_map info = {0};
 	struct path path;
 	struct inode *inode = NULL;
+	int err;
 
-	if (copy_from_user(&info, (struct st_susfs_sus_map __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (copy_from_user(&info, user_info, sizeof(info)))
+		return -EFAULT;
 
-	info.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
-	if (info.err) {
+	err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
+	if (err) {
 		SUSFS_LOGE("failed opening file '%s'\n", info.target_pathname);
-		goto out_copy_to_user;
+		return err;
 	}
 
 	inode = d_backing_inode(path.dentry);
 	if (!inode || !inode->i_mapping) {
 		SUSFS_LOGE("inode || inode->i_mapping is NULL\n");
-		info.err = -ENOENT;
+		err = -ENOENT;
 		goto out_path_put_path;
 	}
 	set_bit(AS_FLAGS_SUS_MAP, &inode->i_state);
 	SUSFS_LOGI("pathname: '%s', is flagged as AS_FLAGS_SUS_MAP\n", info.target_pathname);
-	info.err = 0;
+	err = 0;
 out_path_put_path:
 	path_put(&path);
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_sus_map __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_ADD_SUS_MAP -> ret: %d\n", info.err);
+	return err;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
 
 /* susfs avc log spoofing */
 DEFINE_STATIC_KEY_FALSE(susfs_is_avc_log_spoofing_enabled);
 
-void susfs_set_avc_log_spoofing(void __user **user_info) {
-	struct st_susfs_avc_log_spoofing info = {0};
-
-	if (copy_from_user(&info, (struct st_susfs_avc_log_spoofing __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
-
-	if (info.enabled) {
+/* Scalar ABI: arg3 = 0|1 as a plain value (prctl_cmd_scalar), not a pointer. */
+int susfs_set_avc_log_spoofing(unsigned long enabled) {
+	if (enabled) {
 		static_branch_enable(&susfs_is_avc_log_spoofing_enabled);
 		SUSFS_LOGI("enabling susfs_avc_log_spoofing\n");
 	} else {
 		static_branch_disable(&susfs_is_avc_log_spoofing_enabled);
 		SUSFS_LOGI("disabling susfs_avc_log_spoofing\n");
 	}
-
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user(&((struct st_susfs_avc_log_spoofing __user*)*user_info)->err, &info.err, sizeof(info.err))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING -> ret: %d\n", info.err);
+	return 0;
 }
 
 /* get susfs enabled features */
@@ -1249,114 +1394,143 @@ static int copy_config_to_buf(const char *config_string, char *buf_ptr, size_t *
 	return 0;
 }
 
-void susfs_get_enabled_features(void __user **user_info) {
-	struct st_susfs_enabled_features *info = (struct st_susfs_enabled_features *)kzalloc(sizeof(struct st_susfs_enabled_features), GFP_KERNEL);
-	char *buf_ptr = NULL;
+/* Truthful feature set for both reply styles. Only features that are
+ * actually implemented in THIS kernel are reported. TRY_UMOUNT is reported
+ * because the susfs prctl path (0x55580) bridges into the proven KernelSU
+ * mount_list machinery. */
+static int susfs_build_enabled_features_string(char *buf, size_t bufsize) {
+	char *buf_ptr = buf;
 	size_t copied_size = 0;
+	int err = 0;
 
-	if (!info) {
-		info->err = -ENOMEM;
-		goto out_copy_to_user;
-	}
-
-	if (copy_from_user(info, (struct st_susfs_enabled_features __user*)*user_info, sizeof(struct st_susfs_enabled_features))) {
-		info->err = -EFAULT;
-		goto out_copy_to_user;
-	}
-
-	buf_ptr = info->enabled_features;
+#define APPEND_FEATURE(str) do { \
+	err = copy_config_to_buf(str, buf_ptr, &copied_size, bufsize); \
+	if (err) return err; \
+	buf_ptr = buf + copied_size; \
+} while (0)
 
 #ifdef CONFIG_KSU_SUSFS_SUS_PATH
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_SUS_PATH\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_SUS_PATH\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_SUS_MOUNT\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
-#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_SUS_MOUNT\n");
+	/* add_sus_mount is implemented on this fork (LH_SUS_MOUNT + show hooks) */
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_TRY_UMOUNT\n");
+#endif
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_SUS_KSTAT\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_SUS_KSTAT\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_SPOOF_UNAME\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_SPOOF_UNAME\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_ENABLE_LOG\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_ENABLE_LOG\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_OPEN_REDIRECT\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_OPEN_REDIRECT\n");
 #endif
 #ifdef CONFIG_KSU_SUSFS_SUS_MAP
-	info->err = copy_config_to_buf("CONFIG_KSU_SUSFS_SUS_MAP\n", buf_ptr, &copied_size, SUSFS_ENABLED_FEATURES_SIZE);
-	if (info->err) goto out_copy_to_user;
-	buf_ptr = info->enabled_features + copied_size;
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_SUS_MAP\n");
 #endif
+	/* KernelSU does magic mounting of modules natively */
+	APPEND_FEATURE("CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT\n");
 
-	info->err = 0;
-out_copy_to_user:
-	if (copy_to_user((struct st_susfs_enabled_features __user*)*user_info, info, sizeof(struct st_susfs_enabled_features))) {
-		info->err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_SHOW_ENABLED_FEATURES -> ret: %d\n", info->err);
-	if (info) {
-		kfree(info);
-	}
+#undef APPEND_FEATURE
+	return 0;
 }
 
-/* show_variant */
-void susfs_show_variant(void __user **user_info) {
-	struct st_susfs_variant info = {0};
+/* Dual-mode reply:
+ *  - arg4 == 0 (v1.5.3-1.5.8 tools, incl. the deployed R28): arg3 points to
+ *    an unsigned long; write the u64 bitmask (bit order = the tools
+ *    g_feature_names_154 table).
+ *  - arg4 != 0 (v1.5.9+ tools): arg3 points to a buffer of size arg4; write
+ *    the NUL-terminated feature string list bounded by min(arg4, 8192).
+ * The old handler copy_from_user'd 8196 bytes from the tools 8-byte mask
+ * and wrote the whole struct back — an 8KB stack smash. Never read from
+ * arg3 in either mode. */
+int susfs_get_enabled_features(void __user *user_buf, unsigned long bufsz) {
+	int err;
 
-	if (copy_from_user(&info, (struct st_susfs_variant __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
+	if (!bufsz) {
+		/* bitmask mode — the deployed R28 path */
+		u64 mask = 0;
 
-	strscpy(info.susfs_variant, SUSFS_VARIANT, SUSFS_MAX_VARIANT_BUFSIZE-1);
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user((struct st_susfs_variant __user*)*user_info, &info, sizeof(info))) {
-		info.err = -EFAULT;
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+		mask |= BIT(0);  /* SUS_PATH */
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		mask |= BIT(1);  /* SUS_MOUNT */
+#endif
+		/* bits 2,3 (AUTO_ADD_*) — not implemented in this fork */
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+		mask |= BIT(4);  /* SUS_KSTAT */
+#endif
+		/* bit 5 (SUS_OVERLAYFS) — not compiled */
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		mask |= BIT(6);  /* TRY_UMOUNT (bridged to KSU mount_list) */
+#endif
+		/* bit 7 (AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT) — not implemented */
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+		mask |= BIT(8);  /* SPOOF_UNAME */
+#endif
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+		mask |= BIT(9);  /* ENABLE_LOG */
+#endif
+#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+		mask |= BIT(10); /* HIDE_KSU_SUSFS_SYMBOLS */
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+		mask |= BIT(11); /* SPOOF_CMDLINE_OR_BOOTCONFIG */
+#endif
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+		mask |= BIT(12); /* OPEN_REDIRECT */
+#endif
+		/* bit 13 (SUS_SU) — not available in this fork */
+		mask |= BIT(14); /* HAS_MAGIC_MOUNT (KernelSU native) */
+
+		if (copy_to_user(user_buf, &mask, sizeof(mask)))
+			return -EFAULT;
+		err = 0;
+	} else {
+		/* string mode — v1.5.9+ / current universal tool */
+		char *kbuf;
+		size_t limit = min_t(size_t, bufsz, SUSFS_ENABLED_FEATURES_SIZE);
+
+		kbuf = kzalloc(limit, GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		err = susfs_build_enabled_features_string(kbuf, limit);
+		if (!err) {
+			size_t len = strlen(kbuf) + 1; /* include NUL */
+			if (copy_to_user(user_buf, kbuf, min(len, limit)))
+				err = -EFAULT;
+		}
+		kfree(kbuf);
 	}
-	SUSFS_LOGI("CMD_SUSFS_SHOW_VARIANT -> ret: %d\n", info.err);
+	SUSFS_LOGI("CMD_SUSFS_SHOW_ENABLED_FEATURES -> ret: %d\n", err);
+	return err;
 }
 
-/* show version */
-void susfs_show_version(void __user **user_info) {
-	struct st_susfs_version info = {0};
+/* show_variant — wire ABI: arg3 = char buf[16]; write variant + NUL only. */
+int susfs_show_variant(char __user *user_buf) {
+	if (copy_to_user(user_buf, SUSFS_VARIANT, min(strlen(SUSFS_VARIANT) + 1, (size_t)SUSFS_MAX_VARIANT_BUFSIZE)))
+		return -EFAULT;
+	SUSFS_LOGI("CMD_SUSFS_SHOW_VARIANT -> ret: 0\n");
+	return 0;
+}
 
-	if (copy_from_user(&info, (struct st_susfs_version __user*)*user_info, sizeof(info))) {
-		info.err = -EFAULT;
-		goto out_copy_to_user;
-	}
-
-	strscpy(info.susfs_version, SUSFS_VERSION, SUSFS_MAX_VERSION_BUFSIZE-1);
-	info.err = 0;
-out_copy_to_user:
-	if (copy_to_user((struct st_susfs_version __user*)*user_info, &info, sizeof(info))) {
-		info.err = -EFAULT;
-	}
-	SUSFS_LOGI("CMD_SUSFS_SHOW_VERSION -> ret: %d\n", info.err);
+/* show_version — wire ABI: arg3 = char buf[16]; write version + NUL only. */
+int susfs_show_version(char __user *user_buf) {
+	if (copy_to_user(user_buf, SUSFS_VERSION, min(strlen(SUSFS_VERSION) + 1, (size_t)SUSFS_MAX_VERSION_BUFSIZE)))
+		return -EFAULT;
+	SUSFS_LOGI("CMD_SUSFS_SHOW_VERSION -> ret: 0\n");
+	return 0;
 }
 
 /* kthread for checking if /sdcard/Android is accessible via fsnoitfy */
@@ -1562,13 +1736,17 @@ static void susfs_run_extra_works(struct work_struct *work) {
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 }
 
-/* susfs_init */
-void susfs_init(void) {\
+/* susfs_init — no caller exists in this backport tree (the official
+ * KernelSU patch calls it from ksu core init; this fork never did), so the
+ * work struct must be initialized here. late_initcall runs long before any
+ * userspace prctl can schedule susfs_extra_works via the setuid hook. */
+int susfs_init(void) {
 	SUSFS_LOGI("Initializing susfs_extra_works\n");
 	INIT_WORK(&susfs_extra_works, susfs_run_extra_works);
 	SUSFS_LOGI("susfs is initialized! version: " SUSFS_VERSION " \n");
+	return 0;
 }
+late_initcall(susfs_init);
 
 /* No module exit is needed becuase it should never be a loadable kernel module */
 //void __init susfs_exit(void)
-
