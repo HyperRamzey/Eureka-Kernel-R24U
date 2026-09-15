@@ -47,6 +47,7 @@
 #include <linux/compat.h>
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
+#include <linux/susfs.h>
 #endif
 #include <linux/syscalls.h>
 #include <linux/kprobes.h>
@@ -2387,55 +2388,114 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		return error;
 
 #ifdef CONFIG_KSU_SUSFS
-	/* SUSFS user ABI: prctl(0xDEADBEEF, CMD_SUSFS_*, &info, NULL, &error) */
+	/* SUSFS user ABI (prctl era, ksu_susfs universal binary):
+	 * prctl(0xDEADBEEF, CMD_SUSFS_*, arg3, arg4, &error) — result code is
+	 * the int written to arg5 ONLY. The tool wire structs carry no err
+	 * field, so handlers never copy errors back into arg3 (doing so smashed
+	 * the tools exact-sized buffers). Struct commands take a user pointer
+	 * in arg3; scalar commands (enable_log, hide_sus_mnts,
+	 * umount_for_zygote_iso_service, avc_log_spoofing) take the raw 0|1
+	 * VALUE in arg3 (prctl_cmd_scalar). Root-only, like the official patch. */
 	if (unlikely(option == 0xDEADBEEF)) {
-		void __user *info = (void __user *)arg3;
-		switch (arg2) {
-		case 0x55550: /* CMD_SUSFS_ADD_SUS_PATH */
-			susfs_add_sus_path(&info);
-			return 0;
-		case 0x55553: /* CMD_SUSFS_ADD_SUS_PATH_LOOP */
-			susfs_add_sus_path_loop(&info);
-			return 0;
-		case 0x55561: /* CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS */
-			susfs_set_hide_sus_mnts_for_non_su_procs(&info);
-			return 0;
-		case 0x55570: /* CMD_SUSFS_ADD_SUS_KSTAT */
-			susfs_add_sus_kstat(&info);
-			return 0;
-		case 0x55571: /* CMD_SUSFS_UPDATE_SUS_KSTAT */
-			susfs_update_sus_kstat(&info);
-			return 0;
-		case 0x55590: /* CMD_SUSFS_SET_UNAME */
-			susfs_set_uname(&info);
-			return 0;
-		case 0x555a0: /* CMD_SUSFS_ENABLE_LOG */
-			susfs_enable_log(&info);
-			return 0;
-		case 0x555b0: /* CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG */
-			susfs_set_cmdline_or_bootconfig(&info);
-			return 0;
-		case 0x555c0: /* CMD_SUSFS_ADD_OPEN_REDIRECT */
-			susfs_add_open_redirect(&info);
-			return 0;
-		case 0x555e1: /* CMD_SUSFS_SHOW_VERSION */
-			susfs_show_version(&info);
-			return 0;
-		case 0x555e2: /* CMD_SUSFS_SHOW_ENABLED_FEATURES */
-			susfs_get_enabled_features(&info);
-			return 0;
-		case 0x555e3: /* CMD_SUSFS_SHOW_VARIANT */
-			susfs_show_variant(&info);
-			return 0;
-		case 0x60010: /* CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING */
-			susfs_set_avc_log_spoofing(&info);
-			return 0;
-		case 0x60020: /* CMD_SUSFS_ADD_SUS_MAP */
-			susfs_add_sus_map(&info);
-			return 0;
-		default:
-			return -EINVAL;
+		int err = -EINVAL;
+
+		if (likely(current_uid().val == 0)) {
+			switch (arg2) {
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+			case CMD_SUSFS_ADD_SUS_PATH: /* 0x55550 */
+				err = susfs_add_sus_path((struct st_susfs_sus_path __user *)arg3);
+				break;
+			case CMD_SUSFS_ADD_SUS_PATH_LOOP: /* 0x55553 */
+				err = susfs_add_sus_path_loop((struct st_susfs_sus_path __user *)arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+			case CMD_SUSFS_ADD_SUS_MOUNT: /* 0x55560 */
+				err = susfs_add_sus_mount((struct st_susfs_sus_mount __user *)arg3);
+				break;
+			case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS: /* 0x55561, scalar 0|1 */
+				/* hide_sus_mnts_for_all_procs and hide_sus_mnts_for_non_su_procs
+				 * both map here in the universal tool */
+				err = susfs_set_hide_sus_mnts_for_non_su_procs(arg3);
+				break;
+			case CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE: /* 0x55562, scalar 0|1 */
+				/* Not implemented in this fork (no zygote-iso machinery);
+				 * KernelSU natively handles isolated-process umounts in
+				 * ksu_handle_umount. Report not-supported honestly. */
+				err = -1;
+				break;
+			case CMD_SUSFS_ADD_TRY_UMOUNT: /* 0x55580 */
+				err = susfs_add_try_umount((struct st_susfs_try_umount __user *)arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+			case CMD_SUSFS_ADD_SUS_KSTAT: /* 0x55570 */
+				err = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
+				break;
+			case CMD_SUSFS_UPDATE_SUS_KSTAT: /* 0x55571 */
+				err = susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
+				break;
+			case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY: /* 0x55572 */
+				/* Same v1 wire struct; is_statically=true arrives in the struct */
+				err = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+			case CMD_SUSFS_SET_UNAME: /* 0x55590 */
+				err = susfs_set_uname((struct st_susfs_uname __user *)arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+			case CMD_SUSFS_ENABLE_LOG: /* 0x555a0, scalar 0|1 */
+				err = susfs_enable_log(arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+			case CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG: /* 0x555b0, raw NUL-terminated buffer */
+				err = susfs_set_cmdline_or_bootconfig((const char __user *)arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+			case CMD_SUSFS_ADD_OPEN_REDIRECT: /* 0x555c0 */
+				/* v1 wire struct has no uid_scheme; default 2 (UID_NON_SU_PROC)
+				 * matching the module default_uid_scheme */
+				err = susfs_add_open_redirect((struct st_susfs_open_redirect __user *)arg3, 2);
+				break;
+#endif
+			case CMD_SUSFS_SHOW_VERSION: /* 0x555e1, arg3 = char buf[16] */
+				err = susfs_show_version((char __user *)arg3);
+				break;
+			case CMD_SUSFS_SHOW_ENABLED_FEATURES: /* 0x555e2, dual mode:
+				 * arg4==0 -> u64 bitmask at arg3 (deployed R28 tool);
+				 * arg4!=0 -> string list at arg3 bounded by arg4 (v1.5.9+ tools) */
+				err = susfs_get_enabled_features((void __user *)arg3, (unsigned long)arg4);
+				break;
+			case CMD_SUSFS_SHOW_VARIANT: /* 0x555e3, arg3 = char buf[16] */
+				err = susfs_show_variant((char __user *)arg3);
+				break;
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+			case CMD_SUSFS_ADD_SUS_MAP: /* 0x60020 */
+				err = susfs_add_sus_map((struct st_susfs_sus_map __user *)arg3);
+				break;
+#endif
+#ifdef CONFIG_KSU_SUSFS
+			case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING: /* 0x60010, scalar 0|1 */
+				err = susfs_set_avc_log_spoofing(arg3);
+				break;
+#endif
+			default:
+				err = -1; /* tool reads -1 as "not supported" */
+				break;
+			}
 		}
+
+		/* arg5 is the tools only error channel: int error. -1 means
+		 * "not supported"; other negatives are errno-style exit codes.
+		 * Writing the real value (instead of the old always-0 bug) is
+		 * what makes the tool report genuine per-command results. */
+		if (arg5 && copy_to_user((void __user *)arg5, &err, sizeof(err)))
+			return -EFAULT;
+		return 0;
 	}
 #endif /* CONFIG_KSU_SUSFS */
 

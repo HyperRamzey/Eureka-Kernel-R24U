@@ -218,20 +218,7 @@ static inline void susfs_clear_current_proc_no_su(void) {
 		susfs_is_current_proc_umounted_app()
 #endif // #ifndef KSU_SUSFS_DEF_H
 
-/* prctl(0xDEADBEEF) dispatch entry points — defined in fs/susfs.c */
-#ifdef CONFIG_KSU_SUSFS
-void susfs_add_sus_path(void __user **user_info);
-void susfs_add_sus_path_loop(void __user **user_info);
-void susfs_set_hide_sus_mnts_for_non_su_procs(void __user **user_info);
-void susfs_add_sus_kstat(void __user **user_info);
-void susfs_update_sus_kstat(void __user **user_info);
-void susfs_set_uname(void __user **user_info);
-void susfs_enable_log(void __user **user_info);
-void susfs_set_cmdline_or_bootconfig(void __user **user_info);
-void susfs_add_open_redirect(void __user **user_info);
-void susfs_show_version(void __user **user_info);
-void susfs_get_enabled_features(void __user **user_info);
-void susfs_show_variant(void __user **user_info);
-void susfs_set_avc_log_spoofing(void __user **user_info);
-void susfs_add_sus_map(void __user **user_info);
-#endif /* CONFIG_KSU_SUSFS */
+/* prctl(0xDEADBEEF) dispatch entry points are declared in <linux/susfs.h>
+ * (int-returning, v1 wire-ABI signatures). The old void __user ** prototype
+ * block that used to live here was removed: it conflicted with the new
+ * declarations once kernel/sys.c includes <linux/susfs.h>. */
