@@ -1589,7 +1589,12 @@ static struct dentry *lookup_dcache(struct qstr *name, struct dentry *dir,
 		if (d_in_lookup(dentry))
 			d_lookup_done(dentry);
 		dput(dentry);
-		return NULL;
+		/* Report hidden paths as nonexistent. Returning NULL here oopses
+		 * callers: lookup_open() dereferences dentry->d_inode and
+		 * __lookup_hash() hands NULL to filename_parentat(), while every
+		 * caller already handles ERR_PTR correctly. (path_openat+0x258
+		 * NULL-deref, A30s #70.) */
+		return ERR_PTR(-ENOENT);
 	}
 #endif
 	return dentry;
