@@ -93,6 +93,7 @@ config ARM64
 	select IOMMU_DMA if IOMMU_SUPPORT
 	select IRQ_DOMAIN
 	select IRQ_FORCED_THREADING
+	select TRACING_SUPPORT
 	select MODULES_USE_ELF_RELA
 	select NO_BOOTMEM
 	select OF

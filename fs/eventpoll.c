@@ -2060,6 +2060,111 @@ SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
 	return error;
 }
 
+/*
+ * epoll_pwait2(2) backport (upstream Linux 5.11, arm64 nr 441, arm nr 449).
+ * Identical to epoll_pwait(2) except the timeout is a struct timespec
+ * (nanosecond resolution) instead of milliseconds. Gives R-era userspace
+ * (e.g. BufferReleaseChannel release waits) a working syscall instead of
+ * ENOSYS on every call. Additive only; existing paths untouched.
+ */
+static long ep_poll_masked(int epfd, struct epoll_event __user *events,
+			   int maxevents, long timeout_ms,
+			   sigset_t *ksigmask)
+{
+	int error;
+	sigset_t sigsaved;
+	bool masked = (ksigmask != NULL);
+
+	if (masked) {
+		sigsaved = current->blocked;
+		set_current_blocked(ksigmask);
+	}
+
+	error = sys_epoll_wait(epfd, events, maxevents, (int)timeout_ms);
+
+	if (masked) {
+		if (error == -EINTR) {
+			memcpy(&current->saved_sigmask, &sigsaved,
+			       sizeof(sigsaved));
+			set_restore_sigmask();
+		} else
+			set_current_blocked(&sigsaved);
+	}
+
+	return error;
+}
+
+static long ep_timespec_to_ms(const struct timespec *ts)
+{
+	u64 msec;
+
+	msec = (u64)ts->tv_sec * 1000 + (u64)ts->tv_nsec / 1000000;
+	if (msec > INT_MAX)
+		msec = INT_MAX;
+	return (long)msec;
+}
+
+SYSCALL_DEFINE6(epoll_pwait2, int, epfd, struct epoll_event __user *, events,
+		int, maxevents, const struct timespec __user *, timeout,
+		const sigset_t __user *, sigmask, size_t, sigsetsize)
+{
+	struct timespec ts;
+	sigset_t ksigmask, *kmask = NULL;
+	long timeout_ms = -1;
+
+	if (timeout) {
+		if (copy_from_user(&ts, timeout, sizeof(ts)))
+			return -EFAULT;
+		if (!timespec_valid(&ts))
+			return -EINVAL;
+		timeout_ms = ep_timespec_to_ms(&ts);
+	}
+
+	if (sigmask) {
+		if (sigsetsize != sizeof(sigset_t))
+			return -EINVAL;
+		if (copy_from_user(&ksigmask, sigmask, sizeof(ksigmask)))
+			return -EFAULT;
+		kmask = &ksigmask;
+	}
+
+	return ep_poll_masked(epfd, events, maxevents, timeout_ms, kmask);
+}
+
+#ifdef CONFIG_COMPAT
+COMPAT_SYSCALL_DEFINE6(epoll_pwait2, int, epfd,
+			struct epoll_event __user *, events,
+		int, maxevents,
+		const struct compat_timespec __user *, timeout,
+		const compat_sigset_t __user *, sigmask,
+		compat_size_t, sigsetsize)
+{
+	struct timespec ts;
+	compat_sigset_t csigmask;
+	sigset_t ksigmask, *kmask = NULL;
+	long timeout_ms = -1;
+
+	if (timeout) {
+		if (compat_get_timespec(&ts, timeout))
+			return -EFAULT;
+		if (!timespec_valid(&ts))
+			return -EINVAL;
+		timeout_ms = ep_timespec_to_ms(&ts);
+	}
+
+	if (sigmask) {
+		if (sigsetsize != sizeof(compat_sigset_t))
+			return -EINVAL;
+		if (copy_from_user(&csigmask, sigmask, sizeof(csigmask)))
+			return -EFAULT;
+		sigset_from_compat(&ksigmask, &csigmask);
+		kmask = &ksigmask;
+	}
+
+	return ep_poll_masked(epfd, events, maxevents, timeout_ms, kmask);
+}
+#endif
+
 #ifdef CONFIG_COMPAT
 COMPAT_SYSCALL_DEFINE6(epoll_pwait, int, epfd,
 			struct epoll_event __user *, events,

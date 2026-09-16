@@ -803,6 +803,8 @@ __SYSCALL(__NR_userfaultfd, sys_userfaultfd)
 __SYSCALL(__NR_membarrier, sys_membarrier)
 #define __NR_pidfd_open 434
 __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+#define __NR_epoll_pwait2 449
+__SYSCALL(__NR_epoll_pwait2, compat_sys_epoll_pwait2)
 
 /*
  * Please add new compat syscalls above this comment and update
