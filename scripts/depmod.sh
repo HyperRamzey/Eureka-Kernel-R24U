@@ -2,13 +2,13 @@
 #
 # A depmod wrapper used by the toplevel Makefile
 
-if test $# -ne 3; then
+if test $# -lt 2; then
 	echo "Usage: $0 /sbin/depmod <kernelrelease> <symbolprefix>" >&2
 	exit 1
 fi
 DEPMOD=$1
 KERNELRELEASE=$2
-SYMBOL_PREFIX=$3
+SYMBOL_PREFIX=${3:-}
 
 if ! test -r System.map ; then
 	exit 0
