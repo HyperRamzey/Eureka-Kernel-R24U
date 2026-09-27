@@ -476,6 +476,22 @@ struct sec_battery_info {
 
 	int batt_full_capacity;
 
+	/* batt_bypass_mode: hand the system rail over to VBUS once charging has
+	 * stopped, so the pack is neither topped up nor cycled. Engaged through
+	 * the charger's existing POWER_SUPPLY_PROP_AUTHENTIC path, which is the
+	 * same sequence the factory_mode_bypass sysfs node drives.
+	 *
+	 * Tunables (all of them are struct fields rather than constants so they
+	 * can be retuned on a real device without rebuilding):
+	 */
+	bool bypass_mode;			/* sysfs arm, 0 = disarmed (default) */
+	bool bypass_active;		/* bypass is physically engaged right now */
+	bool bypass_candidate;		/* bypass_candidate_jiffies is valid */
+	unsigned long bypass_candidate_jiffies;	/* when 'not charging' first held */
+	unsigned long bypass_release_jiffies;	/* last programmatic release */
+	int bypass_margin_ma;			/* headroom over measured pack draw */
+	int bypass_ichgin_scale;		/* powermeter ICHGIN raw LSB -> mA */
+
 	bool block_water_event;
 
 #if defined(CONFIG_FG_FULLCAP_FROM_BATTERY)
@@ -513,6 +529,27 @@ ssize_t sec_bat_store_attrs(struct device *dev,
 #define EVENT_LTE				(0x1 << 11)
 #define EVENT_LCD			(0x1 << 12)
 #define EVENT_GPS			(0x1 << 13)
+
+/* VBUS bypass policy tuning. See struct field comments in sec_battery.h. */
+#define SEC_BAT_BYPASS_MARGIN_MA		200	/* required headroom, mA */
+#define SEC_BAT_BYPASS_ICHGIN_SCALE	1		/* ICHGIN raw LSB per mA */
+#define SEC_BAT_BYPASS_DEBOUNCE_MS	10000	/* 'not charging' must hold this long */
+#define SEC_BAT_BYPASS_COOLDOWN_MS	60000	/* min gap between a release and re-engage */
+/*
+ * VSYS is the rail the SoC actually runs from once the charger is in bypass.
+ * The s2mu106 regulates VSYS to 4400 mV in the factory-release path
+ * (s2mu106_set_regulation_vsys(charger, 4400)), so 4400 is the nominal rail
+ * this policy runs against:
+ *   floor 3500 mV - ~900 mV (20%) below nominal, i.e. the droop point where a
+ *          charger that has lost regulation under a load step starts pulling
+ *          the PMIC domains down and a brownout reset becomes likely.
+ *   ceiling 5000 mV - VSYS is a regulated 4.4 V rail here, so anything at or
+ *          above 5 V means the buck is no longer regulating (VBUS applied to
+ *          the system rail) or the reading is bogus. Either way the power path
+ *          is not what this policy assumes, so hand control back.
+ */
+#define SEC_BAT_BYPASS_VSYS_MIN_MV		3500
+#define SEC_BAT_BYPASS_VSYS_MAX_MV		5000
 
 enum {
 	BATT_RESET_SOC = 0,
@@ -677,6 +714,7 @@ enum {
 	FACTORY_VOLTAGE_REGULATION,
 	FACTORY_MODE_DISABLE,
 	BATT_FULL_CAPACITY,
+	BATT_BYPASS_MODE,
 };
 
 enum {

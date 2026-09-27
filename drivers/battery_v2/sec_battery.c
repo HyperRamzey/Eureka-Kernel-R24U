@@ -193,6 +193,7 @@ static struct device_attribute sec_battery_attrs[] = {
 	SEC_BATTERY_ATTR(factory_voltage_regulation),
 	SEC_BATTERY_ATTR(factory_mode_disable),
 	SEC_BATTERY_ATTR(batt_full_capacity),
+	SEC_BATTERY_ATTR(batt_bypass_mode),
 };
 
 static enum power_supply_property sec_battery_props[] = {
@@ -3867,6 +3868,318 @@ static void sec_bat_check_full_capacity(struct sec_battery_info *battery)
 	}
 }
 
+/*
+ * VBUS bypass policy (sysfs: batt_bypass_mode)
+ *
+ * Intent: once charging has genuinely stopped - the pack filled at 100%, or the
+ * user's charge limit (battery->batt_full_capacity, 80% by default) was reached
+ * - hand the system rail over to VBUS so the pack is neither topped up nor
+ * cycled while the phone is plugged in and idle.
+ *
+ * Engaging a bypass moves the phone's power path, so it is gated three ways and
+ * watched continuously afterwards:
+ *   1. a real charging source must be present (NONE/OTG/POWER_SHARING do not
+ *      count - there is no VBUS to bypass to),
+ *   2. the "not charging" state must hold continuously for 10 s (a transient
+ *      NOT_CHARGING during a mode change must not trigger a handoff),
+ *   3. measured input current must exceed measured pack draw by a margin.
+ *
+ * While engaged it releases on cable removal, on VSYS leaving its sane band, if
+ * the charger can no longer carry the system load, and as soon as charging
+ * resumes. A cooldown after any release keeps a marginal charger from flapping
+ * the CHG_CTRL0 sequence once per polling interval.
+ *
+ * Default is disarmed: nothing here changes behaviour until a human arms it.
+ */
+
+/* Is a usable charging source attached? is_nocharge_type() is the tree's own
+ * definition of "cannot charge from this": SEC_BATTERY_CABLE_NONE, OTG and
+ * POWER_SHARING. */
+static bool sec_bat_bypass_source_ok(struct sec_battery_info *battery)
+{
+	return !is_nocharge_type(battery->cable_type);
+}
+
+/*
+ * "Charging has stopped" for policy purposes.
+ *
+ * FULL        - the pack filled.
+ * NOT_CHARGING- top-up is suspended: the charge limit was hit, the safety
+ *               timer expired, thermal paused it, etc.
+ *
+ * DISCHARGING is deliberately EXCLUDED. It means the pack is being drained on
+ * purpose (store mode forces it, and the buck-off current-measure path needs
+ * it); handing the rail to VBUS there would fight that intent. It is also the
+ * state a marginal charger produces while the phone is actually running from
+ * the pack, which is exactly the case where engaging is most dangerous.
+ */
+static bool sec_bat_bypass_not_charging(struct sec_battery_info *battery)
+{
+	return battery->status == POWER_SUPPLY_STATUS_FULL ||
+		battery->status == POWER_SUPPLY_STATUS_NOT_CHARGING;
+}
+
+/*
+ * Measured input current in mA, or -1 when it cannot be measured.
+ *
+ * Source: s2mu106_pmeter POWER_SUPPLY_PROP_ICHGIN -> s2mu106_pm_get_ichgin(),
+ * a real ADC reading from the charger. The powermeter psy is registered under
+ * the literal name below; its ->properties[] array is empty in the source, but
+ * that does not matter here because psy_do_property() calls ->get_property()
+ * directly and this tree's power_supply_get_property() does not range-check
+ * psp against num_properties. s2mu106_pm_get_property() handles ICHGIN
+ * explicitly.
+ *
+ * UNIT CAVEAT: s2mu106_pm_get_ichgin() returns the raw 12-bit register value
+ * unscaled and calls it mA. Nothing else in the tree consumes ICHGIN, so that
+ * unit is taken on the driver's word and is NOT independently confirmed -
+ * unlike VSYS and VBYP, which are scaled in the same file. The raw value and
+ * the scaled value are both logged on every decision, so one dmesg line on real
+ * hardware calibrates it; until then bypass_ichgin_scale stays 1.
+ *
+ * NOTE that this getter pr_info()s on every single call, so it is only read on
+ * a decision boundary (engage gate / engaged re-check), never per poll.
+ */
+static int sec_bat_bypass_read_input_ma(struct sec_battery_info *battery)
+{
+	union power_supply_propval value = {0, };
+	int raw = 0;
+	int scale = battery->bypass_ichgin_scale;
+
+	if (scale < 1)
+		scale = 1;
+
+	psy_do_property("s2mu106_pmeter", get, POWER_SUPPLY_PROP_ICHGIN,
+			value);
+	raw = value.intval;
+
+	/* psy_do_property() zeroes value on a missing psy or a failed read, and a
+	 * genuine zero here means the charger is delivering nothing. All three
+	 * mean "input current unknown or absent", and an unknown supply current is
+	 * exactly the condition under which engaging is unsafe, so fail closed. */
+	if (raw <= 0)
+		return -1;
+
+	/* Always log the unscaled register value next to the converted one, so
+	 * a single dmesg line is enough to settle the unit question above. */
+	dev_info(battery->dev, "bypass: ichgin raw %d (scale %d) -> %d mA\n",
+		raw, scale, raw / scale);
+
+	return raw / scale;
+}
+
+/* Measured system rail in mV, or -1 when unreadable.
+ * Source: s2mu106_pmeter POWER_SUPPLY_PROP_VSYS -> s2mu106_pm_get_vsysa(),
+ * which scales the raw register by 25/10, i.e. 2.5 mV per LSB. */
+static int sec_bat_bypass_read_vsys_mv(struct sec_battery_info *battery)
+{
+	union power_supply_propval value = {0, };
+
+	psy_do_property("s2mu106_pmeter", get, POWER_SUPPLY_PROP_VSYS, value);
+
+	return value.intval;
+}
+
+/* Measured pack draw in mA, or -1 when unreadable.
+ *
+ * Read fresh rather than reusing battery->current_now: that field carries two
+ * different units depending on which code path wrote it last (this driver's
+ * monitor work leaves mA there, while sec_bat_get_property() overwrites it with
+ * uA on every sysfs read). That pre-existing hazard is out of scope here, so
+ * this takes a uA reading and converts locally. */
+static int sec_bat_bypass_read_batt_ma(struct sec_battery_info *battery)
+{
+	union power_supply_propval value = {0, };
+
+	value.intval = SEC_BATTERY_CURRENT_UA;
+	psy_do_property(battery->pdata->fuelgauge_name, get,
+			POWER_SUPPLY_PROP_CURRENT_NOW, value);
+
+	if (value.intval < 0)
+		return -1;
+
+	return value.intval / 1000;
+}
+
+/* Drive the bypass. Every transition is logged - this is the only diagnostic
+ * anyone gets. `reason` is a literal, never user data. */
+static void sec_bat_bypass_set(struct sec_battery_info *battery, int on,
+			const char *reason)
+{
+	union power_supply_propval value = {0, };
+
+	value.intval = on ? 1 : 0;
+
+	/* Exactly the path the factory_mode_bypass sysfs node uses. The charger
+	 * owns the whole sequence (CHG_CTRL0 0x10->0x30, 0x88, 0x6E, 0xE5, 0xEF,
+	 * 0xE4, 0xEA, 0x72), sets PM_FACTORY on the powermeter and hands off to
+	 * s2mu106-usbpd. Deliberately not reimplemented here. */
+	psy_do_property(battery->pdata->charger_name, set,
+			POWER_SUPPLY_PROP_AUTHENTIC, value);
+
+	if (battery->bypass_active == (on ? true : false))
+		dev_info(battery->dev, "bypass: %s: %s (no state change)\n",
+			on ? "engage" : "release", reason);
+
+	battery->bypass_active = on ? true : false;
+
+	if (!on)
+		battery->bypass_release_jiffies = jiffies;
+
+	if (on)
+		dev_info(battery->dev,
+			"bypass: ENGAGED (%s) - system now runs from VBUS\n",
+			reason);
+	else
+		dev_info(battery->dev,
+			"bypass: RELEASED (%s) - charger back in control\n",
+			reason);
+}
+
+/* Clear the debounce candidate, logging the reason the wait was abandoned. */
+static void sec_bat_bypass_clear_candidate(struct sec_battery_info *battery,
+			const char *why)
+{
+	if (battery->bypass_candidate) {
+		dev_info(battery->dev,
+			"bypass: candidate cleared after %llu ms (%s)\n",
+			(unsigned long long)jiffies_to_msecs(
+				jiffies - battery->bypass_candidate_jiffies),
+			why);
+		battery->bypass_candidate = false;
+	}
+}
+
+static void sec_bat_bypass_policy(struct sec_battery_info *battery)
+{
+	unsigned long now = jiffies;
+	unsigned long held_ms;
+	int input_ma = -1;
+	int batt_ma = -1;
+	int need_ma;
+	int margin = battery->bypass_margin_ma;
+	int vsys_mv;
+
+	/* ---- disarmed: never hold the rail --------------------------- */
+	if (!battery->bypass_mode) {
+		if (battery->bypass_active)
+			sec_bat_bypass_set(battery, 0, "policy disarmed");
+		sec_bat_bypass_clear_candidate(battery, "disarmed");
+		return;
+	}
+
+	/* ---- engaged: watch, and let go the moment it stops being safe -- */
+	if (battery->bypass_active) {
+		if (battery->status == POWER_SUPPLY_STATUS_CHARGING) {
+			sec_bat_bypass_set(battery, 0, "charging resumed");
+			return;
+		}
+		if (!sec_bat_bypass_source_ok(battery)) {
+			sec_bat_bypass_set(battery, 0, "cable removed");
+			return;
+		}
+
+		vsys_mv = sec_bat_bypass_read_vsys_mv(battery);
+		if (vsys_mv < SEC_BAT_BYPASS_VSYS_MIN_MV ||
+			vsys_mv > SEC_BAT_BYPASS_VSYS_MAX_MV) {
+			dev_info(battery->dev,
+				"bypass: vsys %d mV outside %d..%d mV\n",
+				vsys_mv, SEC_BAT_BYPASS_VSYS_MIN_MV,
+				SEC_BAT_BYPASS_VSYS_MAX_MV);
+			sec_bat_bypass_set(battery, 0,
+				"vsys out of range");
+			return;
+		}
+
+		input_ma = sec_bat_bypass_read_input_ma(battery);
+		batt_ma = sec_bat_bypass_read_batt_ma(battery);
+		if (batt_ma < 0) {
+			dev_info(battery->dev,
+				"bypass: pack draw unreadable - releasing\n");
+			sec_bat_bypass_set(battery, 0,
+				"pack draw unreadable");
+			return;
+		}
+		need_ma = batt_ma + margin;
+		if (input_ma < 0 || input_ma < need_ma) {
+			dev_info(battery->dev,
+				"bypass: charger cannot hold, in %d mA < need %d mA (draw %d + margin %d, vsys %d mV)\n",
+				input_ma, need_ma, batt_ma, margin, vsys_mv);
+			sec_bat_bypass_set(battery, 0,
+				"charger cannot hold");
+			return;
+		}
+
+		/* Still healthy. */
+		return;
+	}
+
+	/* ---- not engaged: is the policy even applicable right now? ---- */
+	if (battery->status == POWER_SUPPLY_STATUS_CHARGING) {
+		sec_bat_bypass_clear_candidate(battery, "charging");
+		return;
+	}
+	if (!sec_bat_bypass_source_ok(battery)) {
+		sec_bat_bypass_clear_candidate(battery, "no charging source");
+		return;
+	}
+	if (!sec_bat_bypass_not_charging(battery)) {
+		sec_bat_bypass_clear_candidate(battery, "still charging");
+		return;
+	}
+
+	/* Cooldown after the last release, so a charger that cannot quite hold
+	 * the rail does not drive the CHG_CTRL0 sequence once per poll. */
+	held_ms = jiffies_to_msecs(now - battery->bypass_release_jiffies);
+	if (battery->bypass_release_jiffies &&
+		held_ms < SEC_BAT_BYPASS_COOLDOWN_MS) {
+		return;
+	}
+
+	/* ---- debounce ------------------------------------------------ */
+	if (!battery->bypass_candidate) {
+		battery->bypass_candidate = true;
+		battery->bypass_candidate_jiffies = now;
+		dev_info(battery->dev,
+			"bypass: candidate (status %d, cable %d) - holding %d ms before engaging\n",
+			battery->status, battery->cable_type,
+			SEC_BAT_BYPASS_DEBOUNCE_MS);
+		return;
+	}
+
+	held_ms = jiffies_to_msecs(now - battery->bypass_candidate_jiffies);
+	if (held_ms < SEC_BAT_BYPASS_DEBOUNCE_MS)
+		return;
+
+	/* ---- headroom gate ------------------------------------------- */
+	input_ma = sec_bat_bypass_read_input_ma(battery);
+	batt_ma = sec_bat_bypass_read_batt_ma(battery);
+	if (batt_ma < 0) {
+		dev_info(battery->dev,
+			"bypass: pack draw unreadable - not engaging\n");
+		return;
+	}
+	need_ma = batt_ma + margin;
+
+	dev_info(battery->dev,
+		"bypass: gate - input %d mA vs need %d mA (draw %d + margin %d)\n",
+		input_ma, need_ma, batt_ma, margin);
+
+	if (input_ma < 0) {
+		dev_info(battery->dev,
+			"bypass: input current unreadable - not engaging\n");
+		return;
+	}
+	if (input_ma < need_ma) {
+		dev_info(battery->dev,
+			"bypass: insufficient headroom - not engaging\n");
+		return;
+	}
+
+	sec_bat_bypass_clear_candidate(battery, "engaging");
+	sec_bat_bypass_set(battery, 1, "charge stopped, supply has headroom");
+}
+
 static void sec_bat_monitor_work(
 				struct work_struct *work)
 {
@@ -4078,6 +4391,8 @@ skip_current_monitor:
 		}
 	}
 	power_supply_changed(battery->psy_bat);
+
+sec_bat_bypass_policy(battery);
 
 skip_monitor:
 	sec_bat_set_polling(battery);
@@ -5534,6 +5849,14 @@ ssize_t sec_bat_show_attrs(struct device *dev,
 		pr_info("%s: BATT_FULL_CAPACITY = %d\n", __func__, battery->batt_full_capacity);
 		i += scnprintf(buf + i, PAGE_SIZE - i, "%d\n", battery->batt_full_capacity);
 		break;
+	case BATT_BYPASS_MODE:
+		i += scnprintf(buf + i, PAGE_SIZE - i, "%d\n",
+			battery->bypass_mode);
+		i += scnprintf(buf + i, PAGE_SIZE - i, "active:%d margin:%d debounce:%d vsys:%d..%d\n",
+			battery->bypass_active, battery->bypass_margin_ma,
+			SEC_BAT_BYPASS_DEBOUNCE_MS, SEC_BAT_BYPASS_VSYS_MIN_MV,
+			SEC_BAT_BYPASS_VSYS_MAX_MV);
+		break;
 	default:
 		i = -EINVAL;
 		break;
@@ -6883,6 +7206,38 @@ ssize_t sec_bat_store_attrs(
 				pr_info("%s: out of range(%d)\n", __func__, x);
 			}
 			ret = count;
+		}
+		break;
+	case BATT_BYPASS_MODE:
+		if (sscanf(buf, "%10d\n", &x) == 1) {
+			if (x != 0 && x != 1) {
+				dev_info(battery->dev,
+					"%s: batt_bypass_mode must be 0 or 1, got %d\n",
+					__func__, x);
+				break;
+			}
+			if (x == (battery->bypass_mode ? 1 : 0)) {
+				dev_info(battery->dev,
+					"%s: skip same batt_bypass_mode: %d\n",
+					__func__, x);
+				ret = count;
+				break;
+			}
+			battery->bypass_mode = x ? true : false;
+			battery->bypass_candidate = false;
+			if (battery->bypass_mode)
+				dev_info(battery->dev,
+					"%s: ARMED - bypass policy active (margin %d mA)\n",
+					__func__, battery->bypass_margin_ma);
+			else
+				dev_info(battery->dev,
+					"%s: DISARMED - bypass policy inactive\n",
+					__func__);
+			ret = count;
+
+			wake_lock(&battery->monitor_wake_lock);
+			queue_delayed_work(battery->monitor_wqueue,
+				&battery->monitor_work, 0);
 		}
 		break;
 	default:
@@ -10519,6 +10874,15 @@ static int sec_battery_probe(struct platform_device *pdev)
 	battery->factory_mode = false;
 	battery->store_mode = false;
 	battery->slate_mode = false;
+	/* VBUS bypass policy: disarmed by default. It moves the phone's power
+	 * path, so it stays inert until a human turns it on with a cable in. */
+	battery->bypass_mode = false;
+	battery->bypass_active = false;
+	battery->bypass_candidate = false;
+	battery->bypass_candidate_jiffies = 0;
+	battery->bypass_release_jiffies = 0;
+	battery->bypass_margin_ma = SEC_BAT_BYPASS_MARGIN_MA;
+	battery->bypass_ichgin_scale = SEC_BAT_BYPASS_ICHGIN_SCALE;
 	battery->usb_suspend_mode = false;
 	battery->is_hc_usb = false;
 	battery->is_sysovlo = false;
