@@ -1095,6 +1095,7 @@ struct decon_device {
 
 #if defined(CONFIG_SUPPORT_MASK_LAYER)
 	bool current_mask_layer;
+	bool force_mask_layer;
 	struct decon_reg_data *mask_regs;
 	u32 wait_mask_layer_trigger;
 	wait_queue_head_t wait_mask_layer_trigger_queue;
@@ -1281,6 +1282,7 @@ int decon_create_vsync_thread(struct decon_device *decon);
 void decon_destroy_vsync_thread(struct decon_device *decon);
 int decon_create_psr_info(struct decon_device *decon);
 int decon_create_pixel_shift(struct decon_device *decon);
+int decon_create_fingerprint_illum(struct decon_device *decon);
 void decon_destroy_psr_info(struct decon_device *decon);
 
 /* DECON to writeback interface functions */

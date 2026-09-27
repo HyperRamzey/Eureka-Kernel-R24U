@@ -428,6 +428,49 @@ int decon_create_pixel_shift(struct decon_device *decon)
 	return 0;
 }
 
+#if defined(CONFIG_SUPPORT_MASK_LAYER)
+static ssize_t decon_fingerprint_illum_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct decon_device *decon = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", decon->force_mask_layer ? 1 : 0);
+}
+
+static ssize_t decon_fingerprint_illum_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct decon_device *decon = dev_get_drvdata(dev);
+	bool enable;
+
+	enable = simple_strtoul(buf, NULL, 10) ? true : false;
+	decon->force_mask_layer = enable;
+	decon_info("fingerprint illumination (mask layer) %s by userspace\n",
+			enable ? "enabled" : "disabled");
+
+	return count;
+}
+/* 0644, not 0666: sysfs may not be group-writable (VERIFY_OCTAL_PERMISSIONS). */
+static DEVICE_ATTR(fingerprint_illum, 0644, decon_fingerprint_illum_show,
+		decon_fingerprint_illum_store);
+
+int decon_create_fingerprint_illum(struct decon_device *decon)
+{
+	int ret;
+
+	if (decon->dt.out_type != DECON_OUT_DSI)
+		return 0;
+
+	ret = device_create_file(decon->dev, &dev_attr_fingerprint_illum);
+	if (ret) {
+		decon_err("failed to create fingerprint_illum file\n");
+		return ret;
+	}
+
+	return 0;
+}
+#endif
+
 static int decon_vsync_thread(void *data)
 {
 	struct decon_device *decon = data;

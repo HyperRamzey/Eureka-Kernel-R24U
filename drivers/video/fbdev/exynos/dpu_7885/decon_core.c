@@ -1819,7 +1819,7 @@ static bool decon_get_mask_layer(struct decon_device *decon,
 	struct decon_win_config_data *win_data)
 {
 	int i;
-	bool mask = false;
+	bool mask = decon->force_mask_layer;
 	struct decon_win_config *config;
 	struct decon_win_config *win_config = win_data->config;
 
@@ -3113,6 +3113,10 @@ static int decon_probe(struct platform_device *pdev)
 	ret = decon_create_pixel_shift(decon);
 	if (ret)
 		goto err_psr;
+
+#if defined(CONFIG_SUPPORT_MASK_LAYER)
+	decon_create_fingerprint_illum(decon);
+#endif
 
 	ret = decon_get_pinctrl(decon);
 	if (ret)
