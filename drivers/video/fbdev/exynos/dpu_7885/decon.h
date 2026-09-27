@@ -21,6 +21,7 @@
 #include <linux/kthread.h>
 #include <linux/pm_qos.h>
 #include <linux/delay.h>
+#include <linux/workqueue.h>
 #include <linux/seq_file.h>
 #include <linux/platform_device.h>
 #include <media/v4l2-device.h>
@@ -55,6 +56,14 @@ extern struct decon_bts_ops decon_bts_control;
 #define DEFAULT_BPP		32
 
 #define MAX_DECON_WIN		4
+
+/*
+ * Whole-plane pixel shift, in pixels.  Bounds the runtime-writable shift so a
+ * bad value can never reach the DECON window-position registers unchecked.
+ * 0 == disabled, which is the stock behaviour.
+ */
+#define MAX_DECON_PIXEL_SHIFT	3
+
 #define MAX_DPP_SUBDEV		4	/* check later */
 
 #define MIN_WIN_BLOCK_WIDTH	360
@@ -1123,6 +1132,14 @@ struct decon_device {
 	struct decon_hiber hiber;
 	struct decon_bts bts;
 
+	/*
+	 * OLED burn-in mitigation: pixel shift of the full-screen window.
+	 * 0/0 == disabled (stock).  Clamped to
+	 * [-MAX_DECON_PIXEL_SHIFT, +MAX_DECON_PIXEL_SHIFT] on every write.
+	 */
+	int pixel_shift_x;
+	int pixel_shift_y;
+
 	int frame_cnt;
 	int frame_cnt_target;
 	wait_queue_head_t wait_vstatus;
@@ -1154,6 +1171,12 @@ struct decon_device {
 #endif
 #ifdef CONFIG_EXYNOS_SUPPORT_FB_HANDOVER
 	unsigned int reserved_release;
+	/*
+	 * One-shot fallback that stops the panel being pinned to the
+	 * bootloader's framebuffer (the charging screen) when nothing ever
+	 * submits a window.  See decon_arm_handover_timeout().
+	 */
+	struct delayed_work handover_work;
 #endif
 	unsigned int partial_force_disable;
 };
@@ -1257,6 +1280,7 @@ int decon_register_ext_irq(struct decon_device *decon);
 int decon_create_vsync_thread(struct decon_device *decon);
 void decon_destroy_vsync_thread(struct decon_device *decon);
 int decon_create_psr_info(struct decon_device *decon);
+int decon_create_pixel_shift(struct decon_device *decon);
 void decon_destroy_psr_info(struct decon_device *decon);
 
 /* DECON to writeback interface functions */

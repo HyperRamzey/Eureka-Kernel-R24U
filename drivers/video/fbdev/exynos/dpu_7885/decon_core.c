@@ -1670,6 +1670,8 @@ end:
 
 	decon_dpp_stop(decon, false);
 #ifdef CONFIG_EXYNOS_SUPPORT_FB_HANDOVER
+	if (!decon->reserved_release)
+		cancel_delayed_work(&decon->handover_work);
 	dpu_of_reserved_mem_device_release(decon);
 #endif
 }
@@ -1842,6 +1844,61 @@ static bool decon_get_mask_layer(struct decon_device *decon,
 }
 #endif
 
+/*
+ * Apply the configured pixel shift to every full-screen window.
+ *
+ * Only windows spanning the whole panel are moved: a partial window has no
+ * "screen origin" worth protecting, and moving one would desynchronise its
+ * block/mask rectangles.  Must be called after the OFF/TUI early return and
+ * before the mask-layer scan, the window-update region computation and
+ * decon_check_limitation(), so every consumer sees one consistent origin.
+ */
+static void decon_apply_pixel_shift(struct decon_device *decon,
+		struct decon_win_config_data *win_data)
+{
+	struct decon_win_config *config;
+	struct decon_win_config *win_config = win_data->config;
+	struct decon_lcd *lcd = decon->lcd_info;
+	int i;
+
+	if (!decon->pixel_shift_x && !decon->pixel_shift_y)
+		return;
+
+	if (!lcd || lcd->xres <= 0 || lcd->yres <= 0)
+		return;
+
+	for (i = 0; i < decon->dt.max_win; i++) {
+		config = &win_config[i];
+
+		switch (config->state) {
+		case DECON_WIN_STATE_COLOR:
+		case DECON_WIN_STATE_BUFFER:
+			break;
+		default:
+			continue;
+		}
+
+		if (config->dst.w != (u32)lcd->xres ||
+				config->dst.h != (u32)lcd->yres)
+			continue;
+
+		config->dst.x += decon->pixel_shift_x;
+		config->dst.y += decon->pixel_shift_y;
+
+		/*
+		 * decon_check_limitation() rejects negative origins, and the
+		 * fixed-address panel cannot display a window starting past
+		 * the last column/row.  Clamp rather than fail the frame:
+		 * silently dropping the shift is invisible, rejecting the
+		 * config is not.
+		 */
+		if (config->dst.x < 0 || config->dst.x > lcd->xres - 16)
+			config->dst.x = 0;
+		if (config->dst.y < 0 || config->dst.y > lcd->yres - 16)
+			config->dst.y = 0;
+	}
+}
+
 static int decon_set_win_config(struct decon_device *decon,
 		struct decon_win_config_data *win_data)
 {
@@ -1863,6 +1920,9 @@ static int decon_set_win_config(struct decon_device *decon,
 		decon_signal_fence(decon);
 		goto err;
 	}
+
+	/* TUI/keyguard/AOD is already handled by the early return above */
+	decon_apply_pixel_shift(decon, win_data);
 
 	regs = kzalloc(sizeof(struct decon_reg_data), GFP_KERNEL);
 	if (!regs) {
@@ -2958,6 +3018,49 @@ decon_init_done:
 }
 
 /* --------- DRIVER INITIALIZATION ---------- */
+#ifdef CONFIG_EXYNOS_SUPPORT_FB_HANDOVER
+/*
+ * How long to keep the bootloader's framebuffer before forcing the panel back
+ * under our control.  Generous: a normal framework handover happens on the very
+ * first submitted frame, so this only ever fires when it does not happen at all.
+ */
+#define DECON_HANDOVER_TIMEOUT_MS	10000
+
+/*
+ * Bounded fallback for a stuck bootloader framebuffer.
+ *
+ * Reached only while reserved_release is still 0, which means the framework
+ * has never submitted a window and the panel is still showing the bootloader's
+ * image.  decon_set_black_window() is the vendor's own blanking path, normally
+ * compiled out by CONFIG_EXYNOS_SUPPORT_FB_HANDOVER; reuse it rather than
+ * inventing one.
+ */
+static void decon_handover_timeout_cb(struct work_struct *work)
+{
+	struct decon_device *decon = container_of(to_delayed_work(work),
+			struct decon_device, handover_work);
+
+	if (decon->reserved_release)
+		return;
+
+	decon_warn("fb handover unreleased after %d ms - clearing panel\n",
+			DECON_HANDOVER_TIMEOUT_MS);
+
+	mutex_lock(&decon->lock);
+	decon_set_black_window(decon);
+	mutex_unlock(&decon->lock);
+
+	dpu_of_reserved_mem_device_release(decon);
+}
+
+static void decon_arm_handover_timeout(struct decon_device *decon)
+{
+	INIT_DELAYED_WORK(&decon->handover_work, decon_handover_timeout_cb);
+	schedule_delayed_work(&decon->handover_work,
+			msecs_to_jiffies(DECON_HANDOVER_TIMEOUT_MS));
+}
+#endif /* CONFIG_EXYNOS_SUPPORT_FB_HANDOVER */
+
 static int decon_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3004,6 +3107,10 @@ static int decon_probe(struct platform_device *pdev)
 		goto err_vsync;
 
 	ret = decon_create_psr_info(decon);
+	if (ret)
+		goto err_psr;
+
+	ret = decon_create_pixel_shift(decon);
 	if (ret)
 		goto err_psr;
 
@@ -3083,6 +3190,16 @@ static int decon_probe(struct platform_device *pdev)
 	if (decon->dt.psr_mode == DECON_VIDEO_MODE) {
 		decon_set_black_window(decon);
 	}
+#endif
+
+#ifdef CONFIG_EXYNOS_SUPPORT_FB_HANDOVER
+	/*
+	 * If nothing ever submits a window the panel would stay on the
+	 * bootloader's framebuffer (the charging screen when on a charger).
+	 * dpu_of_reserved_mem_device_release() sets reserved_release on the
+	 * first real frame, so a healthy boot disarms this immediately.
+	 */
+	decon_arm_handover_timeout(decon);
 #endif
 
 	decon_info("decon%d registered successfully\n", decon->id);

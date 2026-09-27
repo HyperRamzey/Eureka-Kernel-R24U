@@ -193,6 +193,7 @@ static struct device_attribute sec_battery_attrs[] = {
 	SEC_BATTERY_ATTR(factory_voltage_regulation),
 	SEC_BATTERY_ATTR(factory_mode_disable),
 	SEC_BATTERY_ATTR(batt_full_capacity),
+	SEC_BATTERY_ATTR(bypass_charging),
 };
 
 static enum power_supply_property sec_battery_props[] = {
@@ -5534,6 +5535,10 @@ ssize_t sec_bat_show_attrs(struct device *dev,
 		pr_info("%s: BATT_FULL_CAPACITY = %d\n", __func__, battery->batt_full_capacity);
 		i += scnprintf(buf + i, PAGE_SIZE - i, "%d\n", battery->batt_full_capacity);
 		break;
+	case BYPASS_CHARGING:
+		i += scnprintf(buf + i, PAGE_SIZE - i, "%d\n",
+			battery->bypass_charging ? 1 : 0);
+		break;
 	default:
 		i = -EINVAL;
 		break;
@@ -6869,6 +6874,55 @@ ssize_t sec_bat_store_attrs(
 			psy_do_property(battery->pdata->charger_name, set, (enum power_supply_property) POWER_SUPPLY_EXT_PROP_DISABLE_FACTORY_MODE, value);
 			ret = count;
 		}
+		break;
+	case BYPASS_CHARGING:
+		if (sscanf(buf, "%10d\n", &x) != 1 || (x != 0 && x != 1)) {
+			pr_info("%s: expect 0 or 1\n", __func__);
+			break;
+		}
+
+		if (x) {
+			/*
+			 * Bypass = system runs from VBUS, pack is not
+			 * charged.  Refuse without external power, on a
+			 * nearly flat pack or outside a sane pack
+			 * temperature rather than risk a brownout.
+			 */
+			if (battery->cable_type == SEC_BATTERY_CABLE_NONE) {
+				pr_info("%s: no external power, refusing\n", __func__);
+				break;
+			}
+			if (battery->capacity < SEC_BAT_BYPASS_MIN_CAPACITY) {
+				pr_info("%s: capacity %d below %d, refusing\n",
+					__func__, battery->capacity,
+					SEC_BAT_BYPASS_MIN_CAPACITY);
+				break;
+			}
+			if (battery->temperature > SEC_BAT_BYPASS_MAX_TEMP ||
+				battery->temperature < SEC_BAT_BYPASS_MIN_TEMP) {
+				pr_info("%s: temp %d out of range, refusing\n",
+					__func__, battery->temperature);
+				break;
+			}
+
+			if (sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_BUCK_OFF) < 0) {
+				pr_info("%s: buck off failed\n", __func__);
+				break;
+			}
+			battery->bypass_charging = true;
+			pr_info("%s: bypass engaged (cap %d, temp %d, cable %d)\n",
+				__func__, battery->capacity, battery->temperature,
+				battery->cable_type);
+		} else {
+			sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_CHARGING);
+			battery->bypass_charging = false;
+			pr_info("%s: bypass released\n", __func__);
+		}
+
+		wake_lock(&battery->monitor_wake_lock);
+		queue_delayed_work(battery->monitor_wqueue,
+			&battery->monitor_work, 0);
+		ret = count;
 		break;
 	case BATT_FULL_CAPACITY:
 		if (sscanf(buf, "%10d\n", &x) == 1) {
