@@ -7353,14 +7353,24 @@ static int sec_bat_get_property(struct power_supply *psy,
 				__func__, value.intval);
 #endif
 		battery->current_now = value.intval;
-		val->intval = value.intval / 1000;
+		/* current value should be in uA, as the power_supply ABI
+		 * specifies. This used to divide by 1000 and report mA, which
+		 * made Android read -236 as -236uA instead of 236mA. The power
+		 * model then computed ~1mW instead of ~983mW and every app
+		 * rounded to 0mAh in Settings > Battery. Voltage in the same
+		 * switch is already scaled by 1000 for exactly this reason.
+		 * Note battery->current_now itself is deliberately left in the
+		 * fuel gauge's native unit, because the control logic at the
+		 * topoff comparisons compares it against mA thresholds. */
+		val->intval = value.intval;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_AVG:
 		value.intval = SEC_BATTERY_CURRENT_UA;
 		psy_do_property(battery->pdata->fuelgauge_name, get,
 			POWER_SUPPLY_PROP_CURRENT_AVG, value);
 		battery->current_avg = value.intval;
-		val->intval = value.intval / 1000;
+		/* uA, same reason as POWER_SUPPLY_PROP_CURRENT_NOW above */
+		val->intval = value.intval;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
 		psy_do_property(battery->pdata->fuelgauge_name, get,
