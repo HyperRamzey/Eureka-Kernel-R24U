@@ -478,9 +478,6 @@ struct sec_battery_info {
 
 	bool block_water_event;
 
-	/* charger bypass (power path) engaged by userspace */
-	bool bypass_charging;
-
 #if defined(CONFIG_FG_FULLCAP_FROM_BATTERY)
 	struct capacity_measure_info capacity_info;
 #endif
@@ -492,15 +489,6 @@ ssize_t sec_bat_show_attrs(struct device *dev,
 ssize_t sec_bat_store_attrs(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count);
-
-/*
- * Charger bypass gates.  Bypass hands the system to VBUS and stops charging
- * the pack, so it is refused without a real external supply, on a nearly flat
- * pack, and outside a sane pack temperature.
- */
-#define SEC_BAT_BYPASS_MIN_CAPACITY	20
-#define SEC_BAT_BYPASS_MAX_TEMP	450	/* 45.0 degC */
-#define SEC_BAT_BYPASS_MIN_TEMP		0		/*  0.0 degC */
 
 #define SEC_BATTERY_ATTR(_name)						\
 {									\
@@ -689,7 +677,6 @@ enum {
 	FACTORY_VOLTAGE_REGULATION,
 	FACTORY_MODE_DISABLE,
 	BATT_FULL_CAPACITY,
-	BYPASS_CHARGING,
 };
 
 enum {
