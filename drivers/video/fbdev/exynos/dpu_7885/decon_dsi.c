@@ -450,7 +450,12 @@ static ssize_t decon_fingerprint_illum_store(struct device *dev,
 
 	return count;
 }
-/* 0644, not 0666: sysfs may not be group-writable (VERIFY_OCTAL_PERMISSIONS). */
+/* 0644, not 0666: sysfs may not be group-writable (VERIFY_OCTAL_PERMISSIONS).
+ * 0666 does not merely warn here - __ATTR's mode field is an anonymous
+ * bit-field, so a group-writable value gives it a negative width and the
+ * translation unit stops compiling with
+ *     error: anonymous bit-field has negative width (-1)
+ * which is exactly what the 0666 attempt produced. */
 static DEVICE_ATTR(fingerprint_illum, 0644, decon_fingerprint_illum_show,
 		decon_fingerprint_illum_store);
 
