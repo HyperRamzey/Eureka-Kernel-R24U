@@ -3898,7 +3898,7 @@ static void sec_bat_check_full_capacity(struct sec_battery_info *battery)
 static bool sec_bat_bypass_source_ok(struct sec_battery_info *battery)
 {
 	/*
-	 * battery->cable_type is NOT usable here.
+	 * battery->cable_type is NOT usable on its own here.
 	 *
 	 * When slate mode is on - which is what the user's charge limit sets -
 	 * sec_bat_cable_work() does this:
@@ -3908,32 +3908,44 @@ static bool sec_bat_bypass_source_ok(struct sec_battery_info *battery)
 	 *     sec_bat_set_charging_status(battery, POWER_SUPPLY_STATUS_DISCHARGING);
 	 *     sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_BUCK_OFF);
 	 *
-	 * (sec_battery.c:4669-4676). It blanks the cable type *because* it has
-	 * stopped charging. So a gate of !is_nocharge_type(battery->cable_type)
-	 * sees NONE and refuses to engage, which made this whole policy
-	 * unreachable at any user-chosen limit - it could only ever fire at 100%
-	 * full, where cable_type is still populated.
+	 * It blanks the cable type *because* it has stopped charging. So a gate
+	 * built only on cable_type sees NONE and refuses to engage, which makes
+	 * the policy unreachable at any user-chosen limit.
 	 *
-	 * pd_usb_attached is the field that tells the truth. It is written from
-	 * the CCIC hardware notifier (CCIC_NOTIFY_ID_USB, sec_battery.c:8733),
-	 * so it knows a cable is physically present regardless of what the
-	 * charging state machine decided. Confirmed on the live device with
-	 * slate mode engaged and a USB cable fitted, the monitor prints
+	 * wire_status is the field to trust: it tracks the physically attached
+	 * cable and is set back to SEC_BATTERY_CABLE_NONE on detach (see the
+	 * assignments at :6262 and :6939), so it is not derived from the charging
+	 * state the way cable_type is.
 	 *
-	 *     Cable(NONE, USB, 1, 0)
+	 * Correction worth recording, because I got this wrong first. The
+	 * monitor's log line reads
 	 *
-	 * which is cable_type=NONE, muic_cable_type=USB, pd_usb_attached=1.
+	 *     "Status(%s), ..., Cable(%s, %s, %d, %d), ..."
+	 *
+	 * and I had assumed the two integers were muic_cable_type and
+	 * pd_usb_attached, concluding from "Cable(NONE, USB, 1, 0)" that
+	 * pd_usb_attached was 1. The actual argument list is
+	 *
+	 *     sec_cable_type[battery->cable_type],
+	 *     sec_cable_type[battery->wire_status],   <- the "USB"
+	 *     battery->muic_cable_type,                <- the 1
+	 *     battery->pd_usb_attached,                <- the 0
+	 *
+	 * so pd_usb_attached really is 0 on this board, and an earlier version
+	 * gated on it and therefore declined every single time. The "USB" that
+	 * proves a cable is attached is wire_status. Both are accepted here: the
+	 * log format is easy to misread, and on a board that does drive
+	 * pd_usb_attached it is equally valid.
 	 */
+	if (!is_nocharge_type(battery->wire_status))
+		return true;
+
 	if (battery->pd_usb_attached)
 		return true;
 
-	/*
-	 * A wireless pad is a genuine source too, and it does not raise
-	 * pd_usb_attached. muic_cable_type is checked as well as cable_type
-	 * because slate mode blanks the latter.
-	 */
-	if (!is_nocharge_type(battery->muic_cable_type) &&
-			!is_nocharge_type(battery->cable_type))
+	/* Last resort: slate mode blanks cable_type, so this only helps in the
+	 * states where slate mode is not the reason charging stopped. */
+	if (!is_nocharge_type(battery->cable_type))
 		return true;
 
 	return false;
@@ -4010,14 +4022,45 @@ static int sec_bat_bypass_read_input_ma(struct sec_battery_info *battery)
 	if (scale < 1)
 		scale = 1;
 
+	/*
+	 * Preferred source is a real measurement: the powermeter's ICHGIN.
+	 *
+	 * On this device that read never actually happens. The name is right
+	 * ("s2mu106_pmeter", s2mu106_pmeter.c:430) and this tree's
+	 * power_supply_get_property() deliberately does not range-check psp
+	 * against num_properties, so the empty props array is not the obstacle.
+	 * The obstacle is the use_cnt guard at the top of that function: the
+	 * powermeter registers its power supply and its sysfs directory appears,
+	 * but nothing ever opens it, so use_cnt stays 0 and every get returns
+	 * -ENODEV before the driver's handler runs. The giveaway is that
+	 * s2mu106_pm_get_ichgin() pr_info()s unconditionally on every call, and
+	 * that line never appears in dmesg - the handler is not being entered.
+	 *
+	 * So fall back to the charger's CURRENT_MAX, which is
+	 * s2mu106_get_input_current_limit(): the input current the charger has
+	 * actually negotiated with the supply. It is a configured capability
+	 * rather than an instantaneous measurement, which for a headroom test is
+	 * arguably the more correct of the two anyway - the question is whether
+	 * the supply can carry the load, not what it happened to be delivering at
+	 * one instant - and the charger power supply is demonstrably reachable.
+	 */
 	psy_do_property("s2mu106_pmeter", get, POWER_SUPPLY_PROP_ICHGIN,
 			value);
 	raw = value.intval;
 
-	/* psy_do_property() zeroes value on a missing psy or a failed read, and a
-	 * genuine zero here means the charger is delivering nothing. All three
-	 * mean "input current unknown or absent", and an unknown supply current is
-	 * exactly the condition under which engaging is unsafe, so fail closed. */
+	if (raw <= 0) {
+		psy_do_property("s2mu106-charger", get,
+				POWER_SUPPLY_PROP_CURRENT_MAX, value);
+		raw = value.intval;
+		if (raw > 0)
+			dev_info(battery->dev,
+				"bypass: ichgin unavailable, using negotiated input limit %d mA\n",
+				raw);
+	}
+
+	/* A missing psy, a failed read, and a genuine zero all mean "input current
+	 * unknown or absent", and an unknown supply current is exactly the
+	 * condition under which engaging is unsafe, so fail closed. */
 	if (raw <= 0)
 		return -1;
 
@@ -4051,15 +4094,36 @@ static int sec_bat_bypass_read_vsys_mv(struct sec_battery_info *battery)
 static int sec_bat_bypass_read_batt_ma(struct sec_battery_info *battery)
 {
 	union power_supply_propval value = {0, };
+	int ua;
 
 	value.intval = SEC_BATTERY_CURRENT_UA;
 	psy_do_property(battery->pdata->fuelgauge_name, get,
 			POWER_SUPPLY_PROP_CURRENT_NOW, value);
+	ua = value.intval;
 
-	if (value.intval < 0)
-		return -1;
+	/*
+	 * The sign carries the direction: the fuel gauge returns negative while
+	 * discharging, positive while charging. The battery power_supply node
+	 * agrees - idle on battery it reads current_now = -97000 uA.
+	 *
+	 * The previous version treated any negative value as a failed read and
+	 * returned -1, which meant the headroom gate could never be evaluated in
+	 * the one state that matters: a pack that is discharging because charging
+	 * has stopped is exactly when this policy is supposed to act, and that is
+	 * precisely when the reading is negative. On hardware the policy sat at
+	 * "pack draw unreadable - not engaging" indefinitely while the draw was
+	 * plainly readable the whole time.
+	 *
+	 * So take the magnitude. -EINVAL and friends are still rejected below,
+	 * because those are large negatives rather than a plausible current.
+	 */
+	if (ua < -1000000 || ua > 1000000)
+		return -1;		/* implausible: an errno, not a current */
 
-	return value.intval / 1000;
+	if (ua < 0)
+		ua = -ua;
+
+	return ua / 1000;
 }
 
 /* Drive the bypass. Every transition is logged - this is the only diagnostic
@@ -4120,6 +4184,27 @@ static void sec_bat_bypass_policy(struct sec_battery_info *battery)
 	int need_ma;
 	int margin = battery->bypass_margin_ma;
 	int vsys_mv;
+
+	/*
+	 * Rate-limited entry log. Every early-out below is a legitimate steady
+	 * state - no cable, still charging, cooling off - and without this the
+	 * policy is entirely silent while declining to act, which is
+	 * indistinguishable from the policy never being called at all. That is
+	 * not hypothetical: an armed policy on real hardware produced no output
+	 * anywhere and there was no way to tell which branch it took. One line
+	 * every 30s makes every state reachable and costs nothing.
+	 */
+	if (time_after(jiffies,
+			battery->bypass_log_jiffies + SEC_BAT_BYPASS_LOG_MS)) {
+		battery->bypass_log_jiffies = jiffies;
+		dev_info(battery->dev,
+			"bypass: tick armed=%d active=%d status=%d cable=%d muic=%d pdusb=%d slate=%d store=%d cand=%d\n",
+			battery->bypass_mode, battery->bypass_active,
+			battery->status, battery->cable_type,
+			battery->muic_cable_type, battery->pd_usb_attached,
+			battery->slate_mode, battery->store_mode,
+			battery->bypass_candidate);
+	}
 
 	/* ---- disarmed: never hold the rail --------------------------- */
 	if (!battery->bypass_mode) {
@@ -4453,9 +4538,34 @@ skip_current_monitor:
 	}
 	power_supply_changed(battery->psy_bat);
 
-sec_bat_bypass_policy(battery);
-
 skip_monitor:
+	/*
+	 * The bypass policy lives here, AFTER the skip_monitor label, and that
+	 * placement is the entire point.
+	 *
+	 * It used to sit immediately above the label, so the ordinary "monitor
+	 * once after wakeup" path stepped straight over it:
+	 *
+	 *	if (battery->polling_in_sleep) {
+	 *		if (status == DISCHARGING && ps_enable != true)
+	 *			if (elapsed < 10 * 60)
+	 *				goto skip_monitor;
+	 *	}
+	 *
+	 * polling_in_sleep is set by the screen-off path, so "screen off while
+	 * discharging" never reached the policy at all. That is not a corner
+	 * case: it is the normal state of a phone running on battery, and it is
+	 * precisely the state in which a charge-stopped bypass is supposed to
+	 * act. Observed on hardware as an armed policy that ticked once at boot
+	 * with the screen on and then never emitted another line, indefinitely.
+	 *
+	 * After the label, both the normal path and every skip arrive here, so the
+	 * policy is evaluated on every monitor tick. It is cheap: the disarmed
+	 * check is first, and the heartbeat is rate limited, so a steady no-op
+	 * costs one predictable branch.
+	 */
+	sec_bat_bypass_policy(battery);
+
 	sec_bat_set_polling(battery);
 
 	if (battery->capacity <= 0 || battery->health_change)
