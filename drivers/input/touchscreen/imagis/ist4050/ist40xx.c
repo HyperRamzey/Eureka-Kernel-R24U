@@ -2613,15 +2613,49 @@ static struct i2c_driver ist40xx_i2c_driver = {
 		   },
 };
 
+/*
+ * Samsung's LPM guard: the ist40xx driver used to refuse to register at all when
+ * the bootloader handed off with androidboot.mode=charger, because a genuine
+ * charging-only LPM session shows no UI and there is no reason to power the panel.
+ * It returned -ENODEV before i2c_add_driver() was ever reached.
+ *
+ * On this device that guard is simply wrong, and it is the reason a hard reset
+ * on the charger leaves the phone with a working screen and NO touch:
+ *
+ *   /proc/cmdline : ... androidboot.mode=charger ...
+ *   dmesg        : sec-battery battery: sec_bat_monitor_work: ... lpcharge(1)
+ *   /sys/bus/i2c/drivers/                       -> no ist40xx driver registered
+ *   /sys/bus/i2c/devices/11-0050/driver         -> absent
+ *   /sys/class/input  (grep sec_touchscreen)    -> 0 hits
+ *   regulator.1 (tsp_ldo_en) num_users          -> 0, gpio-119 out lo
+ *
+ * The other ~30 i2c clients on this board all bind normally; 11-0050 was the only
+ * unbound one, because its driver had never registered. The panel LDO is never
+ * enabled either, so the touch IC stays unpowered and does not even ACK 0x50 on
+ * i2c-11. The full 24-entry /sys/bus/i2c/drivers listing contains no ist40xx name
+ * at all, which is how the driver was proven absent rather than merely failed.
+ *
+ * The premise of the guard does not hold for this ROM: there is no charging-only
+ * UI here, Android always boots. The evidence is a boot that reached
+ * boot_completed=1 with adb up, SurfaceFlinger running and a live screen while
+ * the touchscreen was entirely absent. The bootloader leaves
+ * androidboot.mode=charger set from the charging handoff and nothing in
+ * userspace ever clears it, so lpcharge stays 1 for the whole session even though
+ * a full UI is running. Loading the driver is therefore required, not optional.
+ *
+ * The cost in a real LPM session is small and bounded: the driver powers
+ * tsp_ldo_en, probes the IC and waits on the ATTN IRQ, which simply never fires
+ * while the panel is off. Nothing is drawn and no input is consumed.
+ *
+ * The lpcharge guard in dump_tsp_log() is deliberately left alone - that one only
+ * suppresses log dumping, which is still correct to skip while charging.
+ */
 static int __init ist40xx_init(void)
 {
-#ifdef CONFIG_BATTERY_SAMSUNG
 	if (lpcharge == 1) {
-		tsp_info("%s: Do not load driver due to : lpm %d\n", __func__,
-			 lpcharge);
-		return -ENODEV;
+		pr_info("IST40XX: androidboot.mode=charger (lpcharge=1), "
+			"loading touchscreen anyway - this ROM has no LPM UI\n");
 	}
-#endif
 
 	return i2c_add_driver(&ist40xx_i2c_driver);
 }
