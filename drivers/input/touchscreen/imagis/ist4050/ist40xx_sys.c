@@ -738,6 +738,10 @@ int ts_power_enable(struct ist40xx_data *data, int en)
 	input_info(true, &data->client->dev, "%s %s\n", __func__,
 		   (en) ? "on" : "off");
 
+	dev_info(&data->client->dev, "TSP_DIAG: ts_power_enable en=%d by_gpio=%d power_gpio=%d avdd=%s\n",
+		 en, data->dt_data->is_power_by_gpio, data->dt_data->power_gpio,
+		 data->dt_data->regulator_avdd ? data->dt_data->regulator_avdd : "(none)");
+
 	if(data->dt_data->is_power_by_gpio) {
 		if (gpio_is_valid(data->dt_data->power_gpio)) {
 			gpio_set_value(data->dt_data->power_gpio, en);
@@ -746,6 +750,9 @@ int ts_power_enable(struct ist40xx_data *data, int en)
 		struct regulator *regulator_avdd;
 
 		regulator_avdd = regulator_get(NULL, data->dt_data->regulator_avdd);
+		dev_info(&data->client->dev, "TSP_DIAG: regulator_get(%s) -> %s\n",
+			 data->dt_data->regulator_avdd,
+			 IS_ERR(regulator_avdd) ? "ERR" : "ok");
 		if (IS_ERR(regulator_avdd)) {
 			input_err(true, &data->client->dev,
 				  "%s: Failed to get %s regulator.\n", __func__,
@@ -755,6 +762,7 @@ int ts_power_enable(struct ist40xx_data *data, int en)
 
 		if (en) {
 			ret = regulator_enable(regulator_avdd);
+			dev_info(&data->client->dev, "TSP_DIAG: regulator_enable ret=%d\n", ret);
 			if (ret) {
 				input_err(true, &data->client->dev,
 					  "%s: Failed to enable avdd: %d\n",
