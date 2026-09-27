@@ -107,6 +107,12 @@ struct lcd_info {
 	unsigned int			temperature_index;
 
 	unsigned int			adaptive_control;
+	/*
+	 * Low-brightness current-limit floor.  0 == disabled (stock).
+	 * See dc_dimming_store() for why this is a current limit and not a
+	 * PWM->DC mode switch.
+	 */
+	unsigned int			dc_dimming_floor;
 	int				lux;
 	struct class			*mdnie_class;
 
@@ -291,6 +297,16 @@ static int dsim_panel_set_acl(struct lcd_info *lcd, int force)
 #endif
 
 	opr_status = brightness_opr_table[!!lcd->adaptive_control][lcd->brightness];
+	/*
+	 * DC-dimming policy: at or below the configured floor, drive the
+	 * panel with the most restrictive ACL/OPR it exposes.  This only
+	 * *raises* the current limit (ACL_STATUS_15P), it never relaxes an
+	 * already tighter one, so it cannot make the panel draw more than
+	 * adaptive_control already asked for.
+	 */
+	if (lcd->dc_dimming_floor && lcd->brightness <= lcd->dc_dimming_floor &&
+			opr_status < ACL_STATUS_15P)
+		opr_status = ACL_STATUS_15P;
 #if defined(CONFIG_SUPPORT_MASK_LAYER)
 	if (decon && decon->current_mask_layer)
 		opr_status = brightness_opr_table[ACL_STATUS_OFF][lcd->brightness];
@@ -1360,6 +1376,55 @@ static DEVICE_ATTR(temperature, 0664, temperature_show, temperature_store);
 static DEVICE_ATTR(color_coordinate, 0444, color_coordinate_show, NULL);
 static DEVICE_ATTR(manufacture_date, 0444, manufacture_date_show, NULL);
 static DEVICE_ATTR(adaptive_control, 0664, adaptive_control_show, adaptive_control_store);
+
+static ssize_t dc_dimming_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct lcd_info *lcd = dev_get_drvdata(dev);
+
+	sprintf(buf, "%d\n", lcd->dc_dimming_floor);
+
+	return strlen(buf);
+}
+
+/*
+ * DC dimming, expressed as a brightness floor in platform-brightness units
+ * (0..UI_MAX_BRIGHTNESS).  Writing 0 disables it and restores the pristine
+ * stock path.  Above the floor, drive the panel with the DDIC's most
+ * restrictive ACL/OPR current limit.
+ */
+static ssize_t dc_dimming_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct lcd_info *lcd = dev_get_drvdata(dev);
+	int rc;
+	unsigned int value;
+
+	rc = kstrtouint(buf, 0, &value);
+	if (rc < 0)
+		return rc;
+
+	/* reject nonsense rather than silently clamping it */
+	if (value > UI_MAX_BRIGHTNESS) {
+		dev_info(&lcd->ld->dev,
+			"%s: %u above UI_MAX_BRIGHTNESS (%d)\n",
+			__func__, value, UI_MAX_BRIGHTNESS);
+		return -EINVAL;
+	}
+
+	if (lcd->dc_dimming_floor != value) {
+		dev_info(&lcd->ld->dev, "%s: %d -> %d\n", __func__,
+			lcd->dc_dimming_floor, value);
+		mutex_lock(&lcd->lock);
+		lcd->dc_dimming_floor = value;
+		mutex_unlock(&lcd->lock);
+		if (lcd->state == PANEL_STATE_RESUMED)
+			dsim_panel_set_brightness(lcd, 1);
+	}
+
+	return size;
+}
+static DEVICE_ATTR(dc_dimming, 0644, dc_dimming_show, dc_dimming_store);
 static DEVICE_ATTR(lux, 0644, lux_show, lux_store);
 static DEVICE_ATTR(octa_id, 0444, octa_id_show, NULL);
 static DEVICE_ATTR(SVC_OCTA, 0444, cell_id_show, NULL);
@@ -1380,6 +1445,7 @@ static struct attribute *lcd_sysfs_attributes[] = {
 	&dev_attr_manufacture_date.attr,
 	&dev_attr_brightness_table.attr,
 	&dev_attr_adaptive_control.attr,
+	&dev_attr_dc_dimming.attr,
 	&dev_attr_lux.attr,
 	&dev_attr_octa_id.attr,
 #if defined(CONFIG_DISPLAY_USE_INFO)

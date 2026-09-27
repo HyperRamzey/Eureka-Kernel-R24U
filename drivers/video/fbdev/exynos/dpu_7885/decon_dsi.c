@@ -354,6 +354,80 @@ static ssize_t decon_show_vsync(struct device *dev,
 }
 static DEVICE_ATTR(vsync, S_IRUGO, decon_show_vsync, NULL);
 
+/*
+ * OLED pixel shift, OLED burn-in mitigation.
+ *
+ *   cat  <decon>/pixel_shift   -> "<x> <y>" in pixels, "0 0" when disabled
+ *   echo "2 0" > .../pixel_shift
+ *   echo "0 0"  > .../pixel_shift   (back to the pristine origin)
+ *
+ * Only the full-screen window origin is translated; see
+ * decon_apply_pixel_shift().  Values are clamped to
+ * +/-MAX_DECON_PIXEL_SHIFT so an over-large value can never reach the DECON
+ * window-position registers.  Ships disabled and stays disabled across
+ * suspend/resume until userspace writes it.
+ */
+static ssize_t decon_show_pixel_shift(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct decon_device *decon = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d %d\n",
+			decon->pixel_shift_x, decon->pixel_shift_y);
+}
+
+static ssize_t decon_store_pixel_shift(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct decon_device *decon = dev_get_drvdata(dev);
+	int x = 0, y = 0, ret;
+
+	ret = sscanf(buf, "%d %d", &x, &y);
+	if (ret != 2) {
+		decon_err("pixel_shift: expected \"<x> <y>\" in pixels, got \"%s\"\n",
+				buf);
+		return -EINVAL;
+	}
+
+	/* Reject rather than silently clamp an obviously wrong request. */
+	if (x < -MAX_DECON_PIXEL_SHIFT || x > MAX_DECON_PIXEL_SHIFT ||
+			y < -MAX_DECON_PIXEL_SHIFT || y > MAX_DECON_PIXEL_SHIFT) {
+		decon_err("pixel_shift: %d %d out of range (+/-%d)\n",
+				x, y, MAX_DECON_PIXEL_SHIFT);
+		return -EINVAL;
+	}
+
+	mutex_lock(&decon->lock);
+	decon->pixel_shift_x = x;
+	decon->pixel_shift_y = y;
+	mutex_unlock(&decon->lock);
+
+	decon_info("pixel shift set to %d %d (origin (0,0) when 0 0)\n", x, y);
+
+	return count;
+}
+static DEVICE_ATTR(pixel_shift, 0644, decon_show_pixel_shift,
+		decon_store_pixel_shift);
+
+int decon_create_pixel_shift(struct decon_device *decon)
+{
+	int ret;
+
+	if (decon->dt.out_type != DECON_OUT_DSI)
+		return 0;
+
+	decon->pixel_shift_x = 0;
+	decon->pixel_shift_y = 0;
+
+	ret = device_create_file(decon->dev, &dev_attr_pixel_shift);
+	if (ret) {
+		decon_err("failed to create pixel_shift file\n");
+		return ret;
+	}
+
+	return 0;
+}
+
 static int decon_vsync_thread(void *data)
 {
 	struct decon_device *decon = data;
