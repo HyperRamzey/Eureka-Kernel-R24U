@@ -842,7 +842,16 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 	struct s2mu106_charger_data *charger = power_supply_get_drvdata(psy);
 	enum power_supply_ext_property ext_psp = (enum power_supply_ext_property)psp;
 	int buck_state = ENABLE;
-	union power_supply_propval value;
+	/* Initialised: the POWER_SUPPLY_PROP_AUTHENTIC case passes this to
+	 * PM_FACTORY (:1036) and to the usbpd AUTHENTIC handoff (:1051) without
+	 * assigning it first, as does the PM_FACTORY call at :1099, so all three
+	 * read uninitialised stack. Both callees ignore the value today - the
+	 * usbpd AUTHENTIC setter works on VBUS_MUX directly and the pmeter calls
+	 * s2mu106_pm_factory() with no argument - so this is a latent defect
+	 * rather than a live one, but reading indeterminate stack is undefined
+	 * behaviour and would break the moment either callee started using it.
+	 * Zeroing it is behaviour-preserving today. */
+	union power_supply_propval value = {0,};
 	int ret;
 	u8 data = 0;
 
