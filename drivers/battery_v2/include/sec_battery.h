@@ -489,6 +489,7 @@ struct sec_battery_info {
 	bool bypass_candidate;		/* bypass_candidate_jiffies is valid */
 	unsigned long bypass_candidate_jiffies;	/* when 'not charging' first held */
 	unsigned long bypass_release_jiffies;	/* last programmatic release */
+	unsigned long bypass_log_jiffies;	/* rate-limited heartbeat */
 	int bypass_margin_ma;			/* headroom over measured pack draw */
 	int bypass_ichgin_scale;		/* powermeter ICHGIN raw LSB -> mA */
 
@@ -535,6 +536,7 @@ ssize_t sec_bat_store_attrs(struct device *dev,
 #define SEC_BAT_BYPASS_ICHGIN_SCALE	1		/* ICHGIN raw LSB per mA */
 #define SEC_BAT_BYPASS_DEBOUNCE_MS	10000	/* 'not charging' must hold this long */
 #define SEC_BAT_BYPASS_COOLDOWN_MS	60000	/* min gap between a release and re-engage */
+#define SEC_BAT_BYPASS_LOG_MS		30000	/* heartbeat while armed, ms */
 /*
  * VSYS is the rail the SoC actually runs from once the charger is in bypass.
  * The s2mu106 regulates VSYS to 4400 mV in the factory-release path
