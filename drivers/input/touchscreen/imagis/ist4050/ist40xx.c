@@ -2185,6 +2185,11 @@ static int ist40xx_probe(struct i2c_client *client,
 
 	input_info(true, &client->dev, "### IMAGIS probe(Slave Addr:0x%02X) ###\n",
 		   client->addr);
+	/* TSP_DIAG: dev_info, not input_info - input_info compiles to a no-op unless
+	 * CONFIG_SEC_DEBUG_TSP_LOG is set, which is why a failed probe was previously
+	 * completely invisible on device. These markers are temporary diagnostics.
+	 */
+	dev_info(&client->dev, "TSP_DIAG: probe ENTER addr=0x%02x\n", client->addr);
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 		input_err(true, &client->dev, "i2c_check_functionality error\n");
@@ -2206,6 +2211,7 @@ static int ist40xx_probe(struct i2c_client *client,
 		}
 
 		ret = ist40xx_parse_dt(&client->dev, data);
+		dev_info(&client->dev, "TSP_DIAG: parse_dt ret=%d\n", ret);
 		if (ret)
 			goto err_alloc_dev;
 
@@ -2221,6 +2227,9 @@ static int ist40xx_probe(struct i2c_client *client,
 	}
 
 	ist40xx_request_gpio(client, data);
+	dev_info(&client->dev, "TSP_DIAG: after request_gpio irq_gpio=%d irq=%d is_power_by_gpio=%d avdd=%s\n",
+		 data->dt_data->irq_gpio, client->irq, data->dt_data->is_power_by_gpio,
+		 data->dt_data->regulator_avdd ? data->dt_data->regulator_avdd : "(none)");
 
 	data->client = client;
 #ifdef IST40XX_PINCTRL
@@ -2336,11 +2345,14 @@ static int ist40xx_probe(struct i2c_client *client,
 	ret = request_threaded_irq(client->irq, NULL, ist40xx_irq_thread,
 				   IRQF_TRIGGER_FALLING | IRQF_ONESHOT, "ist40xx_ts",
 				   data);
+	dev_info(&client->dev, "TSP_DIAG: request_threaded_irq irq=%d ret=%d\n",
+		 client->irq, ret);
 	if (ret)
 		goto err_init_drv;
 
 	/* system power init */
 	ret = ist40xx_init_system(data);
+	dev_info(&client->dev, "TSP_DIAG: init_system ret=%d\n", ret);
 	if (ret) {
 		input_err(true, &client->dev, "chip initialization failed\n");
 		goto err_init_drv;
@@ -2434,6 +2446,7 @@ static int ist40xx_probe(struct i2c_client *client,
 #endif
 
 	input_info(true, &client->dev, "### IMAGIS probe success ###\n");
+	dev_info(&client->dev, "TSP_DIAG: probe SUCCESS\n");
 
 	return 0;
 
