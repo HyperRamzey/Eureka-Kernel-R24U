@@ -3897,26 +3897,87 @@ static void sec_bat_check_full_capacity(struct sec_battery_info *battery)
  * POWER_SHARING. */
 static bool sec_bat_bypass_source_ok(struct sec_battery_info *battery)
 {
-	return !is_nocharge_type(battery->cable_type);
+	/*
+	 * battery->cable_type is NOT usable here.
+	 *
+	 * When slate mode is on - which is what the user's charge limit sets -
+	 * sec_bat_cable_work() does this:
+	 *
+	 *     battery->cable_type = SEC_BATTERY_CABLE_NONE;
+	 *     battery->charging_mode = SEC_BATTERY_CHARGING_NONE;
+	 *     sec_bat_set_charging_status(battery, POWER_SUPPLY_STATUS_DISCHARGING);
+	 *     sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_BUCK_OFF);
+	 *
+	 * (sec_battery.c:4669-4676). It blanks the cable type *because* it has
+	 * stopped charging. So a gate of !is_nocharge_type(battery->cable_type)
+	 * sees NONE and refuses to engage, which made this whole policy
+	 * unreachable at any user-chosen limit - it could only ever fire at 100%
+	 * full, where cable_type is still populated.
+	 *
+	 * pd_usb_attached is the field that tells the truth. It is written from
+	 * the CCIC hardware notifier (CCIC_NOTIFY_ID_USB, sec_battery.c:8733),
+	 * so it knows a cable is physically present regardless of what the
+	 * charging state machine decided. Confirmed on the live device with
+	 * slate mode engaged and a USB cable fitted, the monitor prints
+	 *
+	 *     Cable(NONE, USB, 1, 0)
+	 *
+	 * which is cable_type=NONE, muic_cable_type=USB, pd_usb_attached=1.
+	 */
+	if (battery->pd_usb_attached)
+		return true;
+
+	/*
+	 * A wireless pad is a genuine source too, and it does not raise
+	 * pd_usb_attached. muic_cable_type is checked as well as cable_type
+	 * because slate mode blanks the latter.
+	 */
+	if (!is_nocharge_type(battery->muic_cable_type) &&
+			!is_nocharge_type(battery->cable_type))
+		return true;
+
+	return false;
 }
 
 /*
- * "Charging has stopped" for policy purposes.
+ * "Charging has stopped" for policy purposes, for ANY level the user chose.
  *
- * FULL        - the pack filled.
- * NOT_CHARGING- top-up is suspended: the charge limit was hit, the safety
- *               timer expired, thermal paused it, etc.
+ * FULL         - the pack filled at 100%.
+ * NOT_CHARGING - top-up is suspended by something other than the limit: the
+ *                safety timer expired, thermal paused it, and so on.
+ * DISCHARGING *while slate_mode is set* - this is the charge limit, and it was
+ *                missing here.
  *
- * DISCHARGING is deliberately EXCLUDED. It means the pack is being drained on
- * purpose (store mode forces it, and the buck-off current-measure path needs
- * it); handing the rail to VBUS there would fight that intent. It is also the
- * state a marginal charger produces while the phone is actually running from
- * the pack, which is exactly the case where engaging is most dangerous.
+ * On the limit: whatever level is chosen in Settings, the framework writes
+ * batt_slate_mode=1 when capacity reaches it, and the kernel responds with the
+ * slate branch above. The limit therefore does NOT arrive as NOT_CHARGING. It
+ * arrives as DISCHARGING, with cable_type blanked. Excluding DISCHARGING, as
+ * this function originally did, excluded the entire reason the feature was
+ * asked for, and left it able to fire only at 100%.
+ *
+ * The slate_mode guard is what keeps the two genuinely unwanted DISCHARGING
+ * cases excluded, so nothing broadens by accident:
+ *
+ *   - store mode, which forces DISCHARGING to drain the pack on purpose
+ *     (store_mode_charging_max branch in sec_bat_monitor_work), and
+ *   - a marginal charger that cannot keep the phone running, which is also a
+ *     DISCHARGING state and the single most dangerous moment to hand the rail
+ *     over. Both leave slate_mode clear, so both are still refused here and
+ *     still have to pass the headroom gate.
  */
 static bool sec_bat_bypass_not_charging(struct sec_battery_info *battery)
 {
-	return battery->status == POWER_SUPPLY_STATUS_FULL ||
-		battery->status == POWER_SUPPLY_STATUS_NOT_CHARGING;
+	if (battery->status == POWER_SUPPLY_STATUS_FULL)
+		return true;
+
+	if (battery->status == POWER_SUPPLY_STATUS_NOT_CHARGING)
+		return true;
+
+	if (battery->status == POWER_SUPPLY_STATUS_DISCHARGING &&
+			battery->slate_mode && !battery->store_mode)
+		return true;
+
+	return false;
 }
 
 /*
