@@ -131,7 +131,7 @@ int fimc_is_search_sensor_module(struct fimc_is_device_sensor *device,
 			break;
 #endif
 		default:
-			merr("invalid module position(%d)", device, position);
+			mwarn("%s:%d: no sensor bound to module position(%d)", device, __func__, __LINE__, position);
 			ret = -EINVAL;
 			goto p_err;
 		}
