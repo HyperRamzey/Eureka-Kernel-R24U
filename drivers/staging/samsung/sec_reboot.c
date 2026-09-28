@@ -93,8 +93,27 @@ enum sec_reset_reason {
  * the gate would read as "lpm_off set" and silently make the *new* behaviour
  * the default - the opposite of what is intended, and invisible until someone
  * noticed they could no longer get the charging screen at all.
+ *
+ * The early_param alone is not sufficient on this device. The kernel cmdline
+ * is composed by the bootloader (androidboot.bootloader=, androidboot.serialno=,
+ * androidboot.warranty_bit=, androidboot.hmac_mismatch=, androidboot.odin_download=
+ * and androidboot.dtbo_idx=3 are all bootloader-supplied), and the DT copy under
+ * /proc/device-tree/chosen/bootargs comes from the AVB-signed dtbo prebuilt, which
+ * cannot be re-signed. So lpm_off=1 is not deliverable through bootargs here, and
+ * an early_param-only version of this change would be unreachable in practice.
+ *
+ * Hence the sysfs control below, which is the only way to set it on this device:
+ *
+ *     echo 1 > /sys/kernel/lpm_off      # poweroff stays a poweroff
+ *     echo 0 > /sys/kernel/lpm_off      # stock charging mode on poweroff
+ *
+ * It is deliberately runtime-writable rather than build-time. Whether losing
+ * "power off while plugged in and charge overnight" is worth it is the owner's
+ * call per boot, not a compile-time decision baked into a shipped kernel.
  */
 static int lpm_off;
+static DEFINE_MUTEX(lpm_off_lock);
+static struct kobject *lpm_off_kobj;
 
 static int __init lpm_off_setup(char *str)
 {
@@ -102,13 +121,71 @@ static int __init lpm_off_setup(char *str)
 
 	if (!get_option(&str, &v) || v < 0 || v > 1)
 		v = 0;
+
+	mutex_lock(&lpm_off_lock);
 	lpm_off = v;
-	pr_info("%s: lpm_off=%d (%s)\n", __func__, lpm_off,
-			lpm_off ? "poweroff stays a poweroff" :
-				   "stock: poweroff on charger enters charging mode");
+	mutex_unlock(&lpm_off_lock);
 	return 1;
 }
 early_param("lpm_off", lpm_off_setup);
+
+static ssize_t lpm_off_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int v;
+
+	mutex_lock(&lpm_off_lock);
+	v = lpm_off;
+	mutex_unlock(&lpm_off_lock);
+	return sysfs_emit(buf, "%d\n", v);
+}
+
+static ssize_t lpm_off_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int v, ret;
+
+	ret = kstrtoint(buf, 10, &v);
+	if (ret || v < 0 || v > 1)
+		return -EINVAL;
+
+	mutex_lock(&lpm_off_lock);
+	lpm_off = v;
+	mutex_unlock(&lpm_off_lock);
+
+	pr_emerg("%s: lpm_off=%d (%s)\n", __func__, v,
+			v ? "poweroff on charger stays a real poweroff" :
+			     "stock: poweroff on charger enters charging mode");
+	return count;
+}
+
+static struct kobj_attribute lpm_off_attr =
+	__ATTR(lpm_off, 0644, lpm_off_show, lpm_off_store);
+
+static int __init lpm_off_sysfs_init(void)
+{
+	int error;
+
+	lpm_off_kobj = kobject_create_and_add("lpm_off", kernel_kobj);
+	if (!lpm_off_kobj)
+		return -ENOMEM;
+
+	/* sysfs_create_file, not kobject_add_attr: the latter is not declared
+	 * by the includes this file carries, and sec_resume_suspend_debug.c
+	 * already establishes sysfs_create_file as the working pattern for a
+	 * kobject hung off kernel_kobj in this tree. */
+	error = sysfs_create_file(lpm_off_kobj, &lpm_off_attr.attr);
+	if (error) {
+		pr_err("%s: cannot create /sys/kernel/lpm_off\n", __func__);
+		kobject_put(lpm_off_kobj);
+		lpm_off_kobj = NULL;
+		return error;
+	}
+
+	pr_info("%s: /sys/kernel/lpm_off = %d\n", __func__, lpm_off);
+	return 0;
+}
+late_initcall(lpm_off_sysfs_init);
 
 static void sec_power_off(void)
 {
