@@ -74,6 +74,42 @@ enum sec_reset_reason {
 #endif
 };
 
+/*
+ * lpm_off - do not convert a poweroff-on-charger into an LP-charging entry.
+ *
+ * Default 0, i.e. stock behaviour: a poweroff with a charger attached writes
+ * SEC_POWER_OFF to INFORM2 and the bootloader shows its charging screen. That
+ * is deliberate upstream, and it is also a trap, because a hard reset cannot
+ * clear INFORM2 - see the comment at the branch below.
+ *
+ * Set lpm_off=1 to make the poweroff real instead. The phone then powers off
+ * properly and the next power-on boots Android, at the cost of not charging
+ * while "off".
+ */
+/*
+ * Default must be 0, and that matters: an early_param handler only runs when
+ * the parameter is actually present on the command line. Initialising this to
+ * -1 would leave it at -1 for a normal boot, and !lpm_off on -1 is false, so
+ * the gate would read as "lpm_off set" and silently make the *new* behaviour
+ * the default - the opposite of what is intended, and invisible until someone
+ * noticed they could no longer get the charging screen at all.
+ */
+static int lpm_off;
+
+static int __init lpm_off_setup(char *str)
+{
+	int v;
+
+	if (!get_option(&str, &v) || v < 0 || v > 1)
+		v = 0;
+	lpm_off = v;
+	pr_info("%s: lpm_off=%d (%s)\n", __func__, lpm_off,
+			lpm_off ? "poweroff stays a poweroff" :
+				   "stock: poweroff on charger enters charging mode");
+	return 1;
+}
+early_param("lpm_off", lpm_off_setup);
+
 static void sec_power_off(void)
 {
 	int poweroff_try = 0;
@@ -119,16 +155,42 @@ static void sec_power_off(void)
 	while (1) {
 		/* Check reboot charging */
 #ifdef CONFIG_SAMSUNG_BATTERY
-		if ((ac_val.intval || water_val.intval || usb_val.intval || wpc_val.intval || (poweroff_try >= 5)) && !lpcharge) {
+		if ((ac_val.intval || water_val.intval || usb_val.intval || wpc_val.intval || (poweroff_try >= 5)) && !lpcharge && !lpm_off) {
 #else
-		if ((ac_val.intval || water_val.intval || usb_val.intval || wpc_val.intval || (poweroff_try >= 5))) {
+		if ((ac_val.intval || water_val.intval || usb_val.intval || wpc_val.intval || (poweroff_try >= 5)) && !lpm_off) {
 #endif
 			pr_emerg("%s: charger connected or power off failed(%d), reboot!\n", __func__, poweroff_try);
 #ifdef CONFIG_SEC_DEBUG
 			sec_debug_reboot_handler();
 #endif
-			/* To enter LP charging */
-			exynos_pmu_write(EXYNOS_PMU_INFORM2, SEC_POWER_OFF);
+			/*
+			 * To enter LP charging.
+			 *
+			 * This is what strands the phone on the charging screen.
+			 * INFORM2 is a one-register handshake with the bootloader:
+			 *
+			 *   sec_reboot()   -> SEC_POWER_RESET  "LPM mode prevention"
+			 *   sec_power_off()-> SEC_POWER_OFF    "enter LP charging"
+			 *
+			 * A hard reset runs neither function. So once INFORM2 holds
+			 * SEC_POWER_OFF it still holds it, the bootloader reads the
+			 * same value on the next power-on, and shows the charging
+			 * screen again. Every hard reset re-enters the trap, and the
+			 * only thing that clears INFORM2 is an OS-initiated reboot,
+			 * which goes through sec_reboot() and writes SEC_POWER_RESET.
+			 *
+			 * With lpm_off the poweroff request is honoured instead of
+			 * being converted into an LP-charging entry: INFORM2 is
+			 * explicitly set to SEC_POWER_RESET and the phone really
+			 * powers off, so the next power-on boots normally.
+			 *
+			 * The cost is the stock behaviour of "plug in, power off,
+			 * charge overnight". The trap costs more than that does:
+			 * there is no escape from it short of an OS reboot, and the
+			 * screen gives no indication of that.
+			 */
+			exynos_pmu_write(EXYNOS_PMU_INFORM2,
+					lpm_off ? SEC_POWER_RESET : SEC_POWER_OFF);
 
 			flush_cache_all();
 			mach_restart(REBOOT_SOFT, "sw reset");
