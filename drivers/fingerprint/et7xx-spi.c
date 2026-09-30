@@ -1286,6 +1286,226 @@ static DEVICE_ATTR(adm, 0444, etspi_adm_show, NULL);
 static DEVICE_ATTR(position, 0444, etspi_position_show, NULL);
 static DEVICE_ATTR(rb, 0444, et7xx_rb_show, NULL);
 
+/*
+ * fingerprint_power: bring the sensor's power rail and sleep pin up or down.
+ *
+ * Exposed because the HAL never issues FP_POWER_CONTROL on this build, so the
+ * sensor sits unpowered (ldo_enabled=0, sleepPin low) and cannot detect a
+ * touch. Writing 1 enables the regulator/LDO, raises the sleep pin and selects
+ * the run pinctrl state; writing 0 reverses it, including the secure-world
+ * chip-select release.
+ */
+static ssize_t fingerprint_power_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", g_data->ldo_enabled);
+}
+
+static ssize_t fingerprint_power_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	int value;
+
+	if (kstrtoint(buf, 0, &value))
+		return -EINVAL;
+
+	if (value != 0 && value != 1)
+		return -EINVAL;
+
+	if (!g_data) {
+		pr_err("%s: driver not ready\n", __func__);
+		return -ENODEV;
+	}
+
+	etspi_power_control(g_data, value);
+
+	return count;
+}
+
+static DEVICE_ATTR(fingerprint_power, 0644, fingerprint_power_show,
+	fingerprint_power_store);
+
+/*
+ * fingerprint_diag: raw SPI register read, deliberately NOT gated by
+ * ENABLE_SENSORS_FPRINT_SECURE.
+ *
+ * Every other SPI path in this driver is #ifdef'd out on this build, so Linux
+ * structurally cannot talk to the ET715 and TrustZone owns the bus. That makes
+ * spi_value a null signal. This attribute performs the transfers itself, using
+ * only Linux-owned resources (the spi_device, the fp-spi clocks and the
+ * pinctrl states the driver already owns), so the sensor's liveness can be
+ * measured without going through - or weakening - the secure world.
+ *
+ * SECURE-BUILD FALLBACK IS WRONG - see the stock-dtbo evidence at the pinmux block below.
+ *
+ * Protocol from etspi_io_read_register(): 3 bytes, tx[0]=OP_REG_R, tx[1]=addr,
+ * value in byte 2.
+ *
+ * Write a register number to read that register; write "sweep" to read
+ * 0x00..FP_DIAG_SWEEP_LAST. The attribute returns the last value read.
+ *
+ * v1 of this attribute did not apply pins_poweron, so the SPI pins were still
+ * muxed as GPIO and every read returned 0x00 regardless of the sensor. That
+ * was a flaw in the probe, not a finding about the sensor.
+ */
+#define FP_DIAG_LEN	3
+#define FP_DIAG_SWEEP_LAST	0x1f
+static u8 fp_diag_val;
+
+static int etspi_diag_xfer(struct etspi_data *etspi, unsigned int addr, u8 *out)
+{
+	struct spi_device *spi;
+	struct spi_message m;
+	struct spi_transfer xfer;
+	struct sec_spi_info spi_info;
+	int status;
+
+	spi = spi_dev_get(etspi->spi);
+	if (!spi) {
+		pr_err("%s: no spi_device\n", __func__);
+		return -ENODEV;
+	}
+
+	spi_info.port = 0;
+	spi_info.speed = 20000000;
+
+	status = etspi_sec_spi_prepare(&spi_info, spi);
+	if (status) {
+		pr_err("%s: sec_spi_prepare failed %d\n", __func__, status);
+		spi_dev_put(spi);
+		return status;
+	}
+
+	memset(etspi->buf, 0, FP_DIAG_LEN);
+	etspi->buf[0] = OP_REG_R;	/* 0x20 */
+	etspi->buf[1] = (u8)addr;
+
+	memset(&xfer, 0, sizeof(xfer));
+	xfer.tx_buf = etspi->buf;
+	xfer.rx_buf = etspi->buf;
+	xfer.len = FP_DIAG_LEN;
+	xfer.bits_per_word = 8;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&xfer, &m);
+	status = spi_sync(spi, &m);
+
+	etspi_sec_spi_unprepare(&spi_info, spi);
+	spi_dev_put(spi);
+
+	if (status < 0)
+		return status;
+
+	*out = etspi->buf[2];
+	return 0;
+}
+
+static ssize_t etspi_diag_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct etspi_data *etspi = g_data;
+	unsigned int addr, i;
+	int do_sweep = 0;
+	int status;
+	u8 val;
+	struct pinctrl_state *diag_pins;
+
+	if (!etspi || !etspi->spi) {
+		pr_err("%s: driver not ready\n", __func__);
+		return -ENODEV;
+	}
+	if (FP_DIAG_LEN > etspi->bufsiz) {
+		pr_err("%s: bufsiz %d too small\n", __func__, etspi->bufsiz);
+		return -ENOMEM;
+	}
+
+	if (buf[0] == 's') {
+		do_sweep = 1;
+		addr = 0;
+	} else if (kstrtouint(buf, 0, &addr) || addr > 0xff) {
+		pr_err("%s: bad address\n", __func__);
+		return -EINVAL;
+	}
+
+	/* the sensor cannot answer a register read while unpowered */
+	if (!etspi->ldo_enabled) {
+		pr_info("%s: powering the sensor on for the read\n", __func__);
+		etspi_power_control(etspi, 1);
+		msleep(20);
+	}
+
+	/*
+	 * Take the SPI pins for the duration of the read.
+	 *
+	 * The secure build's parse_dt lookup of "pins_poweron_tz" fails on
+	 * this DT - and it fails on STOCK's dtbo too, because TrustZone muxes
+	 * these pins on demand itself. So etspi_pin_control() is a no-op here
+	 * and cannot be used. Look the state up directly instead.
+	 *
+	 * Note the asymmetry: "pins_poweron" is selected but "pins_poweroff"
+	 * is deliberately NOT restored at the end. Leaving the pins in SPI
+	 * function agrees with the secure world; forcing them back to GPIO
+	 * would de-mux pins the trustlet owns and could break the real path.
+	 */
+	if (!IS_ERR(etspi->p)) {
+		diag_pins = pinctrl_lookup_state(etspi->p, "pins_poweron");
+		if (IS_ERR(diag_pins)) {
+			pr_err("%s: no pins_poweron state (%li)\n",
+				__func__, PTR_ERR(diag_pins));
+		} else {
+			etspi->p->state = NULL;
+			if (pinctrl_select_state(etspi->p, diag_pins))
+				pr_err("%s: pins_poweron select failed\n",
+					__func__);
+			else
+				pr_info("%s: pins_poweron selected\n",
+					__func__);
+		}
+	} else {
+		pr_err("%s: no pinctrl handle\n", __func__);
+	}
+	msleep(5);
+	etspi_reset(etspi);
+	msleep(50);
+
+	if (do_sweep) {
+		for (i = 0; i <= FP_DIAG_SWEEP_LAST; i++) {
+			status = etspi_diag_xfer(etspi, i, &val);
+			if (status) {
+				pr_err("%s: reg 0x%02x transfer failed %d\n",
+					__func__, i, status);
+				continue;
+			}
+			pr_info("%s: reg 0x%02x -> 0x%02x   (raw %02x %02x %02x)\n",
+				__func__, i, val,
+				etspi->buf[0], etspi->buf[1], etspi->buf[2]);
+			fp_diag_val = val;
+		}
+	} else {
+		status = etspi_diag_xfer(etspi, addr, &val);
+		if (status) {
+			pr_err("%s: transfer failed %d\n", __func__, status);
+			return status;
+		}
+		pr_info("%s: reg 0x%02x -> 0x%02x   (raw %02x %02x %02x)\n",
+			__func__, addr, val,
+			etspi->buf[0], etspi->buf[1], etspi->buf[2]);
+		fp_diag_val = val;
+	}
+
+	/* pins deliberately left in SPI function - see the comment above */
+	return count;
+}
+
+static ssize_t etspi_diag_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "0x%02x\n", fp_diag_val);
+}
+
+static DEVICE_ATTR(fingerprint_diag, 0644, etspi_diag_show, etspi_diag_store);
+
+
 static struct device_attribute *fp_attrs[] = {
 	&dev_attr_bfs_values,
 	&dev_attr_type_check,
@@ -1294,6 +1514,8 @@ static struct device_attribute *fp_attrs[] = {
 	&dev_attr_adm,
 	&dev_attr_position,
 	&dev_attr_rb,
+	&dev_attr_fingerprint_power,
+	&dev_attr_fingerprint_diag,
 	NULL,
 };
 
