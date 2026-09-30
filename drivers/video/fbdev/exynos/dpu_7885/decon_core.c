@@ -1376,9 +1376,14 @@ static int decon_set_mask_layer(struct decon_device *decon, struct decon_reg_dat
 	int ret = 0;
 	struct dsim_device *dsim = NULL;
 
-	if (decon->dt.out_type != DECON_OUT_DSI)
+	if (decon->dt.out_type != DECON_OUT_DSI) {
+		pr_info("FPILLUM: set_mask_layer ABORT out_type=%d want=%d id=%d\n",
+			decon->dt.out_type, DECON_OUT_DSI, decon->id);
 		return 0;
+	}
 
+	pr_info("FPILLUM: set_mask_layer id=%d req=%d cur=%d (no change, bail)\n",
+			decon->id, regs->mask_layer, decon->current_mask_layer);
 	if (regs->mask_layer == decon->current_mask_layer)
 		return 0;
 
@@ -1820,6 +1825,8 @@ static bool decon_get_mask_layer(struct decon_device *decon,
 {
 	int i;
 	bool mask = decon->force_mask_layer;
+	pr_info_ratelimited("FPILLUM: get_mask_layer id=%d force=%d state=%d\n",
+			decon->id, decon->force_mask_layer, decon->state);
 	struct decon_win_config *config;
 	struct decon_win_config *win_config = win_data->config;
 
@@ -1911,6 +1918,9 @@ static int decon_set_win_config(struct decon_device *decon,
 
 	mutex_lock(&decon->lock);
 
+	pr_info_ratelimited("FPILLUM: set_win_config id=%d state=%d ignore_vsync=%d out_type=%d force=%d\n",
+			decon->id, decon->state, decon->ignore_vsync,
+			decon->dt.out_type, decon->force_mask_layer);
 	if (decon->state == DECON_STATE_OFF ||
 		decon->state == DECON_STATE_TUI ||
 		(decon->ignore_vsync)) {
