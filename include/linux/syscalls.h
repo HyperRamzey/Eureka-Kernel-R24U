@@ -798,7 +798,13 @@ asmlinkage long sys_renameat2(int olddfd, const char __user *oldname,
 			      unsigned int flags);
 asmlinkage long sys_futimesat(int dfd, const char __user *filename,
 			      struct timeval __user *utimes);
+struct open_how;
+
 asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode);
+asmlinkage long sys_faccessat2(int dfd, const char __user *filename, int mode,
+				 unsigned int flags);
+asmlinkage long sys_openat2(int dfd, const char __user *filename,
+			     struct open_how __user *how, size_t size);
 asmlinkage long sys_fchmodat(int dfd, const char __user * filename,
 			     umode_t mode);
 asmlinkage long sys_fchownat(int dfd, const char __user *filename, uid_t user,

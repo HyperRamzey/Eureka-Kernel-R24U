@@ -3906,11 +3906,22 @@ static bool sec_bat_bypass_source_ok(struct sec_battery_info *battery)
 	 *     battery->cable_type = SEC_BATTERY_CABLE_NONE;
 	 *     battery->charging_mode = SEC_BATTERY_CHARGING_NONE;
 	 *     sec_bat_set_charging_status(battery, POWER_SUPPLY_STATUS_DISCHARGING);
-	 *     sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_BUCK_OFF);
+	 *     sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_CHARGING_OFF);
+	 *
+	 * CHARGING_OFF and BUCK_OFF look interchangeable here and are not:
+	 * BUCK_OFF clears the CHG_CTRL0 BUCK bit as well as CHG, which takes
+	 * the phone off VBUS and makes it drain the pack down to the resume
+	 * threshold. CHARGING_OFF clears only CHG, so the phone stays on VBUS
+	 * and the pack holds at the limit. cable_type is still blanked, and
+	 * still has to be: cable_work early-outs when the type is unchanged
+	 * and slate_mode is clear, so without the blanking, clearing the
+	 * limit would not re-enter the normal branch and charging would never
+	 * resume until the cable was cycled.
 	 *
 	 * It blanks the cable type *because* it has stopped charging. So a gate
 	 * built only on cable_type sees NONE and refuses to engage, which makes
-	 * the policy unreachable at any user-chosen limit.
+	 * the policy unreachable at any user-chosen limit. (cable_type is still
+	 * blanked after the slate fix; only the charge mode changed.)
 	 *
 	 * wire_status is the field to trust: it tracks the physically attached
 	 * cable and is set back to SEC_BATTERY_CABLE_NONE on detach (see the
@@ -4839,14 +4850,41 @@ static void sec_bat_cable_work(struct work_struct *work)
 			goto end_of_cable_work;
 	} else if (battery->slate_mode) {
 		dev_info(battery->dev,
-			"%s:slate mode on\n",__func__);
+			"%s:slate mode on - holding at limit, "
+			"CHARGING_OFF (buck stays on, pack not charged)\n", __func__);
 		battery->is_recharging = false;
 		battery->cable_type = SEC_BATTERY_CABLE_NONE;
 		battery->charging_mode = SEC_BATTERY_CHARGING_NONE;
 		battery->health = POWER_SUPPLY_HEALTH_GOOD;
 		sec_bat_set_charging_status(battery,
 			POWER_SUPPLY_STATUS_DISCHARGING);
-		sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_BUCK_OFF);
+		/*
+		 * CHARGING_OFF, not BUCK_OFF.
+		 *
+		 * The two differ only in the power path, and that difference is the
+		 * whole of the charge limit. In s2mu106_chg_set_property()
+		 * POWER_SUPPLY_PROP_CHARGING_ENABLED, `int buck_state = ENABLE`:
+		 *
+		 *   BUCK_OFF     falls through to buck_state = DISABLE, so
+		 *                s2mu106_set_buck(0) drops ICHGIN to 50 mA and
+		 *                clears the BUCK bit of CHG_CTRL0 along with CHG.
+		 *                VBUS no longer feeds VSYS: the phone runs off the
+		 *                pack, capacity falls to the resume threshold and
+		 *                charging restarts. That sawtooth is the defect.
+		 *
+		 *   CHARGING_OFF keeps buck_state = ENABLE, so
+		 *                s2mu106_enable_charger_switch(0) runs
+		 *                regmode_vote(CHG|BUCK, REG_MODE_BUCK): the CHG bit
+		 *                is cleared and BUCK is KEPT. VSYS stays fed from
+		 *                VBUS and the pack is not charged, so it holds at
+		 *                the limit instead of draining below it.
+		 *
+		 * This is the state the phone is already in at 100%, and it is one
+		 * bit in CHG_CTRL0. It does not touch the factory AUTHENTIC path
+		 * (which latches CHGIN_UVLO_MUIC_OFF and kills MUIC detection),
+		 * so charger detection is unaffected.
+		 */
+		sec_bat_set_charge(battery, SEC_BAT_CHG_MODE_CHARGING_OFF);
 #if defined (CONFIG_ENABLE_USB_SUSPEND_STATE)
 	} else if (battery->usb_suspend_mode) {
 		dev_info(battery->dev,

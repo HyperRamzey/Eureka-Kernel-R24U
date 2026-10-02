@@ -1376,14 +1376,9 @@ static int decon_set_mask_layer(struct decon_device *decon, struct decon_reg_dat
 	int ret = 0;
 	struct dsim_device *dsim = NULL;
 
-	if (decon->dt.out_type != DECON_OUT_DSI) {
-		pr_info("FPILLUM: set_mask_layer ABORT out_type=%d want=%d id=%d\n",
-			decon->dt.out_type, DECON_OUT_DSI, decon->id);
+	if (decon->dt.out_type != DECON_OUT_DSI)
 		return 0;
-	}
 
-	pr_info("FPILLUM: set_mask_layer id=%d req=%d cur=%d (no change, bail)\n",
-			decon->id, regs->mask_layer, decon->current_mask_layer);
 	if (regs->mask_layer == decon->current_mask_layer)
 		return 0;
 
@@ -1413,6 +1408,37 @@ static int decon_set_mask_layer(struct decon_device *decon, struct decon_reg_dat
 	}
 
 	return 1; /* return 1 for checking trigger done */
+}
+
+/*
+ * Apply decon->force_mask_layer to the panel right now.
+ *
+ * decon_set_mask_layer() otherwise only runs from __decon_update_regs(),
+ * i.e. when a frame is actually submitted, so an echo to fingerprint_illum
+ * used to ARM the change and nothing more. On a static display no frame
+ * arrives, the release never happens, and the panel stays pinned at
+ * mask_brightness (337) with the knob already 0 - exactly the OLED burn-in
+ * case this knob exists to prevent. Observed on device 2026-10-01: knob=0,
+ * actual_mask_brightness=337 for 40s+ after the relay released, healing
+ * only when something next happened to redraw.
+ *
+ * No incoming frame is required to drive the hardware: both branches of
+ * dsim_panel_mask_brightness() issue their own shadow update
+ * (decon_reg_all_win_shadow_update_req + decon_reg_start).
+ *
+ * fp_illum_regs is file-static and never freed, so the value the panel op
+ * reads through decon->mask_regs stays valid for the life of the module.
+ */
+static struct decon_reg_data fp_illum_regs;
+
+int decon_fingerprint_illum_apply(struct decon_device *decon)
+{
+	if (decon->dt.out_type != DECON_OUT_DSI)
+		return 0;
+
+	fp_illum_regs.mask_layer = decon->force_mask_layer;
+
+	return decon_set_mask_layer(decon, &fp_illum_regs);
 }
 #endif
 
@@ -1825,8 +1851,6 @@ static bool decon_get_mask_layer(struct decon_device *decon,
 {
 	int i;
 	bool mask = decon->force_mask_layer;
-	pr_info_ratelimited("FPILLUM: get_mask_layer id=%d force=%d state=%d\n",
-			decon->id, decon->force_mask_layer, decon->state);
 	struct decon_win_config *config;
 	struct decon_win_config *win_config = win_data->config;
 
@@ -1918,9 +1942,6 @@ static int decon_set_win_config(struct decon_device *decon,
 
 	mutex_lock(&decon->lock);
 
-	pr_info_ratelimited("FPILLUM: set_win_config id=%d state=%d ignore_vsync=%d out_type=%d force=%d\n",
-			decon->id, decon->state, decon->ignore_vsync,
-			decon->dt.out_type, decon->force_mask_layer);
 	if (decon->state == DECON_STATE_OFF ||
 		decon->state == DECON_STATE_TUI ||
 		(decon->ignore_vsync)) {

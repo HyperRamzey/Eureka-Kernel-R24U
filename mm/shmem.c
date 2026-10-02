@@ -1404,8 +1404,42 @@ out_nomem:
 	return retval;
 }
 
+/*
+ * F_SEAL_FUTURE_WRITE does not exist on this kernel (added in 5.1; here the
+ * flag is rejected with -EINVAL), so F_SEAL_WRITE is the only write seal a
+ * memfd can be given. Upstream keeps this in include/linux/mm.h as
+ * seal_check_write(); it is local here because shmem_mmap() is its only user.
+ */
+static int seal_check_write(unsigned int seals, struct vm_area_struct *vma)
+{
+	if (seals & F_SEAL_WRITE) {
+		/*
+		 * New PROT_WRITE and MAP_SHARED mmaps are not allowed when a write
+		 * seal is active.
+		 */
+		if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
+			return -EPERM;
+
+		/*
+		 * Since an F_SEAL_WRITE sealed memfd can be mapped as MAP_SHARED and
+		 * read-only, take care to not allow mprotect to revert protections on
+		 * such mappings. Do this only for shared mappings; for private
+		 * mappings there is no need to mask.
+		 */
+		if (vma->vm_flags & VM_SHARED)
+			vma->vm_flags &= ~(VM_MAYWRITE | VM_MAYEXEC);
+	}
+	return 0;
+}
+
 static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	int ret;
+
+	ret = seal_check_write(SHMEM_I(file_inode(file))->seals, vma);
+	if (ret)
+		return ret;
+
 	file_accessed(file);
 	vma->vm_ops = &shmem_vm_ops;
 	return 0;
