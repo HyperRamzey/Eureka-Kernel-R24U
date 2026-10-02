@@ -30,6 +30,7 @@
 #include <linux/fs_struct.h>
 #include <linux/ima.h>
 #include <linux/dnotify.h>
+#include <linux/openat2.h>
 #include <linux/compat.h>
 
 #include "internal.h"
@@ -350,10 +351,45 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int
  * We do this by temporarily clearing all FS-related capabilities and
  * switching the fsuid/fsgid around to the real ones.
  */
-SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+#ifndef AT_EACCESS
+/*
+ * Upstream asm-generic defines AT_EACCESS, AT_NO_AUTOMOUNT and AT_REMOVEDIR all
+ * as 0x200 and relies on the calling syscall to disambiguate. This tree kept
+ * only AT_REMOVEDIR in include/uapi/asm-generic/fcntl.h, so define it here.
+ */
+#define AT_EACCESS		0x200	/* Check effective IDs */
+#endif
+
+/*
+ * access() needs to use the real uid/gid, not the effective uid/gid.
+ * We do this by temporarily clearing all FS-related capabilities and
+ * switching the fsuid/fsgid around to the real ones.
+ *
+ * Shared by faccessat() and faccessat2(). The flags word is interpreted as:
+ *
+ *   AT_SYMLINK_NOFOLLOW  do not follow a final symlink. faccessat() has no
+ *                        flag argument and has always followed, so it passes 0
+ *                        and its behaviour is unchanged.
+ *   AT_EACCESS           use the effective ids, i.e. skip the credential
+ *                        override below. Passing 0 selects the historical
+ *                        real-uid behaviour, again preserving faccessat().
+ *   AT_EMPTY_PATH        accepted, but this 4.4 tree's user_path_at() has no
+ *                        empty-path support, so an empty pathname still
+ *                        resolves to -ENOENT. That is identical to what
+ *                        faccessat() already does, so honouring the flag as
+ *                        accepted-but-ignored is not a regression. Rejecting
+ *                        it with -EINVAL would be, because Bionic passes it.
+ *
+ * NOTE: ksu_handle_faccessat() must stay the first thing done here. It is
+ * KernelSU's sucompat hook (KernelSU/kernel/feature/sucompat.c:108) and it
+ * rewrites dfd/filename for sucompat-eligible callers. A faccessat2 that
+ * skipped it would give 32-bit callers a path around sucompat.
+ */
+static int do_faccessat(int dfd, const char __user *filename, int mode,
+			unsigned int flags)
 {
-	const struct cred *old_cred;
-	struct cred *override_cred;
+	const struct cred *old_cred = NULL;
+	struct cred *override_cred = NULL;
 	struct path path;
 	struct inode *inode;
 	struct vfsmount *mnt;
@@ -365,43 +401,49 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
 		return -EINVAL;
 
-	override_cred = prepare_creds();
-	if (!override_cred)
-		return -ENOMEM;
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		lookup_flags = 0;
 
-	override_cred->fsuid = override_cred->uid;
-	override_cred->fsgid = override_cred->gid;
+	if (!(flags & AT_EACCESS)) {
+		override_cred = prepare_creds();
+		if (!override_cred)
+			return -ENOMEM;
 
-	if (!issecure(SECURE_NO_SETUID_FIXUP)) {
-		/* Clear the capabilities if we switch to a non-root user */
-		kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
-		if (!uid_eq(override_cred->uid, root_uid))
-			cap_clear(override_cred->cap_effective);
-		else
-			override_cred->cap_effective =
-				override_cred->cap_permitted;
+		override_cred->fsuid = override_cred->uid;
+		override_cred->fsgid = override_cred->gid;
+
+		if (!issecure(SECURE_NO_SETUID_FIXUP)) {
+			/* Clear the capabilities if we switch to a non-root user */
+			kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
+			if (!uid_eq(override_cred->uid, root_uid))
+				cap_clear(override_cred->cap_effective);
+			else
+				override_cred->cap_effective =
+					override_cred->cap_permitted;
+		}
+
+		/*
+		 * The new set of credentials can *only* be used in
+		 * task-synchronous circumstances, and does not need
+		 * RCU freeing, unless somebody then takes a separate
+		 * reference to it.
+		 *
+		 * NOTE! This is _only_ true because this credential
+		 * is used purely for override_creds() that installs
+		 * it as the subjective cred. Other threads will be
+		 * accessing ->real_cred, not the subjective cred.
+		 *
+		 * If somebody _does_ make a copy of this (using
+		 * the 'get_current_cred()' function), that will clear
+		 * the non_rcu field, because now that other user may be
+		 * expecting RCU freeing. But normal thread-synchronous
+		 * cred accesses will keep things non-RCY.
+		 */
+		override_cred->non_rcu = 1;
+
+		old_cred = override_creds(override_cred);
 	}
 
-	/*
-	 * The new set of credentials can *only* be used in
-	 * task-synchronous circumstances, and does not need
-	 * RCU freeing, unless somebody then takes a separate
-	 * reference to it.
-	 *
-	 * NOTE! This is _only_ true because this credential
-	 * is used purely for override_creds() that installs
-	 * it as the subjective cred. Other threads will be
-	 * accessing ->real_cred, not the subjective cred.
-	 *
-	 * If somebody _does_ make a copy of this (using the
-	 * 'get_current_cred()' function), that will clear the
-	 * non_rcu field, because now that other user may be
-	 * expecting RCU freeing. But normal thread-synchronous
-	 * cred accesses will keep things non-RCY.
-	 */
-	override_cred->non_rcu = 1;
-
-	old_cred = override_creds(override_cred);
 retry:
 	res = user_path_at(dfd, filename, lookup_flags, &path);
 	if (res)
@@ -428,7 +470,7 @@ retry:
 	 * This is a rare case where using __mnt_is_readonly()
 	 * is OK without a mnt_want/drop_write() pair.  Since
 	 * no actual write to the fs is performed here, we do
-	 * not need to telegraph to that to anyone.
+	 * not need to telegraph this to anyone.
 	 *
 	 * By doing this, we accept that this access is
 	 * inherently racy and know that the fs may change
@@ -444,9 +486,30 @@ out_path_release:
 		goto retry;
 	}
 out:
-	revert_creds(old_cred);
-	put_cred(override_cred);
+	if (override_cred) {
+		revert_creds(old_cred);
+		put_cred(override_cred);
+	}
 	return res;
+}
+
+SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+{
+	return do_faccessat(dfd, filename, mode, 0);
+}
+
+/*
+ * faccessat2(2), added upstream in Linux 5.8. Bionic on Android 16 calls it and
+ * falls back to faccessat() on -ENOSYS, costing an extra syscall round trip on
+ * permission checks in ART and Zygote startup paths.
+ */
+SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,
+		unsigned int, flags)
+{
+	if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
+
+	return do_faccessat(dfd, filename, mode, flags);
 }
 
 SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
@@ -1156,6 +1219,103 @@ SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
 SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 		umode_t, mode)
 {
+	if (force_o_largefile())
+		flags |= O_LARGEFILE;
+
+	return do_sys_open(dfd, filename, flags, mode);
+}
+
+/*
+ * openat2(2) - backport for this 4.4 tree. NR 437 (asm-generic).
+ *
+ * Flags and mode are handled in full by this tree's own build_open_flags(),
+ * so an ordinary open through openat2 behaves exactly like openat().
+ *
+ * RESOLVE_* is validated and then REFUSED with -EINVAL. See the note in
+ * include/uapi/linux/openat2.h: this tree's namei.c has no LOOKUP_BENEATH /
+ * IN_ROOT / NO_XDEV / NO_MAGICLINKS / CACHED, and the resolver in fs/namei.c
+ * cannot be told to enforce them. These bits are a security contract, so
+ * answering "done" for a guarantee we cannot keep would be worse than saying
+ * no: -EINVAL is exactly upstream's answer for an unsupported resolve mask and
+ * callers already handle it. Silently ignoring the bits would hand a caller
+ * asking for a sandboxed open a fully unrestricted one.
+ *
+ * The size check follows upstream: a NULL or short struct is -EFAULT/-EINVAL,
+ * and a longer struct is only accepted when every trailing byte is zero
+ * (otherwise -E2BIG), which is what keeps the ABI forward-compatible.
+ *
+ * NOTE the arity. The syscall takes FOUR arguments:
+ *   openat2(int dfd, const char *filename, struct open_how *how, size_t size)
+ * An earlier version of this patch used SYSCALL_DEFINE5 while supplying only
+ * four "type, name" pairs. The __MAPn macro chain then recursed one level too
+ * far and emitted a literal stray "__MAP1" into the prototype, which produced
+ * a wall of nonsense errors that pointed at the macro rather than at the
+ * mismatch:
+ *   fs/open.c:1247:1: error: too few arguments provided to function-like macro
+ *   fs/open.c:1247:1: error: conflicting types for 'sys_openat2'
+ * The arity of the DEFINE and the number of pairs must agree exactly.
+ */
+SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
+		struct open_how __user *, how, size_t, size)
+{
+	/*
+	 * The parameter is named "how" because that is the upstream ABI name, and
+	 * the macro puts it in scope as a local. So the copy target CANNOT also be
+	 * called "how" - that is a redefinition of the parameter with a
+	 * different type:
+	 *   error: redefinition of 'how' with a different type:
+	 *          'struct open_how' vs 'struct open_how *'
+	 * Use a distinct name and assign rather than aliasing.
+	 */
+	struct open_how uhow;
+	int flags;
+	umode_t mode;
+	u64 resolve;
+
+	if (size == 0)
+		return -EFAULT;
+	if (size < sizeof(struct open_how)) {
+		/* Copy what is there so a short struct is reported properly. */
+		if (copy_from_user(&uhow, how, size))
+			return -EFAULT;
+	} else if (size > sizeof(struct open_how)) {
+		/* Trailing garbage must not be silently ignored. */
+		size_t copied = sizeof(struct open_how);
+		u8 tail = 0;
+		if (copy_from_user(&uhow, how, sizeof(struct open_how)))
+			return -EFAULT;
+		while (copied < size) {
+			if (copy_from_user(&tail, (char __user *)how + copied, 1))
+				return -EFAULT;
+			if (tail)
+				return -E2BIG;
+			copied++;
+		}
+	} else {
+		if (copy_from_user(&uhow, how, sizeof(struct open_how)))
+			return -EFAULT;
+	}
+
+	resolve = uhow.resolve;
+	if (resolve & ~((u64)RESOLVE_MAX))
+		return -EINVAL;
+	/*
+	 * Refuse rather than silently downgrade. Only resolve == 0 is supported.
+	 */
+	if (resolve)
+		return -EINVAL;
+
+	flags = uhow.flags;
+	if (flags & ~(O_ACCMODE | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW |
+		      O_CLOEXEC | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC |
+		      O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | O_PATH |
+		      O_TMPFILE | O_DIRECT))
+		return -EINVAL;
+
+	mode = (umode_t)uhow.mode;
+	if ((mode & ~S_IALLUGO) || !(flags & O_CREAT))
+		return -EINVAL;
+
 	if (force_o_largefile())
 		flags |= O_LARGEFILE;
 

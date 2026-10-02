@@ -1405,6 +1405,22 @@ static inline bool vma_is_anonymous(struct vm_area_struct *vma)
 	return !vma->vm_ops;
 }
 
+/*
+ * i_mmap_writable only counts mappings that could actually be written, i.e.
+ * VM_SHARED ones that also carry VM_MAYWRITE. Testing for VM_SHARED alone
+ * wrongly assumes every shared mapping is writable.
+ */
+static inline bool is_shared_maywrite(unsigned long vm_flags)
+{
+	return (vm_flags & (VM_SHARED | VM_MAYWRITE)) ==
+		(VM_SHARED | VM_MAYWRITE);
+}
+
+static inline bool vma_is_shared_maywrite(struct vm_area_struct *vma)
+{
+	return is_shared_maywrite(vma->vm_flags);
+}
+
 int vma_is_stack_for_task(struct vm_area_struct *vma, struct task_struct *t);
 
 extern unsigned long move_page_tables(struct vm_area_struct *vma,

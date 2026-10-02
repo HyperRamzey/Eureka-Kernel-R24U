@@ -23,6 +23,7 @@
 #include <linux/time.h>
 #include <linux/fs.h>
 #include <linux/fcntl.h>
+#include <linux/openat2.h>
 #include <linux/namei.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
@@ -1017,6 +1018,18 @@ COMPAT_SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t,
 COMPAT_SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags, umode_t, mode)
 {
 	return do_sys_open(dfd, filename, flags, mode);
+}
+
+/*
+ * openat2(2) for 32-bit (arm) callers. struct open_how is three __u64, which
+ * is layout-identical between 32- and 64-bit, so the native entry point can be
+ * reused directly - no u64/32 translation is required. That matters here
+ * because the camera HAL and other vendor pieces are 32-bit.
+ */
+COMPAT_SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
+		struct open_how __user *, how, size_t, size)
+{
+	return sys_openat2(dfd, filename, how, size);
 }
 
 #define __COMPAT_NFDBITS       (8 * sizeof(compat_ulong_t))

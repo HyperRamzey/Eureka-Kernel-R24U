@@ -445,7 +445,11 @@ static ssize_t decon_fingerprint_illum_store(struct device *dev,
 
 	enable = simple_strtoul(buf, NULL, 10) ? true : false;
 	decon->force_mask_layer = enable;
-	pr_info("FPILLUM: store id=%d force=%d\n", decon->id, enable);
+
+	/* Taking effect here, not on the next frame submission. See
+	 * decon_fingerprint_illum_apply(). */
+	decon_fingerprint_illum_apply(decon);
+
 	decon_info("fingerprint illumination (mask layer) %s by userspace\n",
 			enable ? "enabled" : "disabled");
 
