@@ -800,6 +800,10 @@ asmlinkage long sys_futimesat(int dfd, const char __user *filename,
 			      struct timeval __user *utimes);
 struct open_how;
 
+/* derp: E3 clone3 */
+asmlinkage long sys_clone3(unsigned long flags, void __user *uargs,
+			unsigned long size, int __user *tls);
+
 asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode);
 asmlinkage long sys_faccessat2(int dfd, const char __user *filename, int mode,
 				 unsigned int flags);

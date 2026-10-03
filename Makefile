@@ -358,8 +358,22 @@ LDGOLD		= $(CROSS_COMPILE)ld.gold
 LD		= $(CROSS_COMPILE)ld
 AR		= $(CROSS_COMPILE)ar
 NM		= $(CROSS_COMPILE)nm
-OBJCOPY		= $(CROSS_COMPILE)objcopy
-OBJDUMP		= $(CROSS_COMPILE)objdump
+# The else-branch above assumes a GCC cross toolchain, but this device compiles
+# the kernel with Neutron clang (TARGET_KERNEL_NO_GCC := true skips the LLVM
+# branch, which is where the llvm-* names live). The mismatch is invisible while
+# arch/arm64/boot/Makefile skips its objcopy via if_changed; once that is fixed
+# so the Image tracks vmlinux, the objcopy actually runs and a bare
+# "$(CROSS_COMPILE)objcopy" with CROSS_COMPILE empty fails with Error 127.
+#
+# Prefer the llvm binutils that actually exist, and keep the cross-toolchain
+# values as the fallback, so this degrades to the tree's original behaviour if
+# /root/toolchains ever moves. := so the wildcard probe resolves once, at parse
+# time, and the recipe sees a definite path.
+DERP_LLVM_BIN := $(firstword $(wildcard /root/toolchains/bin))
+OBJCOPY		:= $(if $(wildcard $(DERP_LLVM_BIN)/llvm-objcopy),$(DERP_LLVM_BIN)/llvm-objcopy,$(CROSS_COMPILE)objcopy)
+OBJDUMP		:= $(if $(wildcard $(DERP_LLVM_BIN)/llvm-objdump),$(DERP_LLVM_BIN)/llvm-objdump,$(CROSS_COMPILE)objdump)
+NM		:= $(if $(wildcard $(DERP_LLVM_BIN)/llvm-nm),$(DERP_LLVM_BIN)/llvm-nm,$(CROSS_COMPILE)nm)
+AR		:= $(if $(wildcard $(DERP_LLVM_BIN)/llvm-ar),$(DERP_LLVM_BIN)/llvm-ar,$(CROSS_COMPILE)ar)
 endif
 CPP		= $(CC) -E
 AWK		= awk

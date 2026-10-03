@@ -727,6 +727,9 @@ __SYSCALL(__NR_statx, sys_statx)
 __SYSCALL(__NR_pidfd_send_signal, sys_pidfd_send_signal)
 #define __NR_pidfd_open 434
 __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+/* kernel/fork.c */
+#define __NR_clone3 435
+__SYSCALL(__NR_clone3, sys_clone3)
 #define __NR_openat2 437
 __SYSCALL(__NR_openat2, sys_openat2)
 #define __NR_faccessat2 439

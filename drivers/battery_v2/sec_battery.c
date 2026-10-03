@@ -4853,7 +4853,25 @@ static void sec_bat_cable_work(struct work_struct *work)
 			"%s:slate mode on - holding at limit, "
 			"CHARGING_OFF (buck stays on, pack not charged)\n", __func__);
 		battery->is_recharging = false;
-		battery->cable_type = SEC_BATTERY_CABLE_NONE;
+		/*
+		 * REMOVED: `battery->cable_type = SEC_BATTERY_CABLE_NONE;`
+		 *
+		 * Overwriting the cable type made the false "no cable" report
+		 * self-sustaining: every later poll re-derived CABLE_NONE from this
+		 * field, so removing the slate_mode override above would not have
+		 * restored the truth while this line remained.
+		 *
+		 * The charge limit does not need it. It is enforced by the
+		 * SEC_BAT_CHG_MODE_CHARGING_OFF request above - CHG_CTRL0 keeps the
+		 * buck on and stops the pack being charged, verified flat over a
+		 * 20-minute soak. Reporting the cable accurately costs nothing, and
+		 * is what keeps USB - and adb over it - alive while the limit is on.
+		 *
+		 * charging_mode = SEC_BATTERY_CHARGING_NONE below is still set and is
+		 * still correct: the pack genuinely is not charging.
+		 *
+		 * derp: P1b - keep the cable reported while charge-limited
+		 */
 		battery->charging_mode = SEC_BATTERY_CHARGING_NONE;
 		battery->health = POWER_SUPPLY_HEALTH_GOOD;
 		sec_bat_set_charging_status(battery,
@@ -7909,32 +7927,45 @@ static int sec_bat_get_property(struct power_supply *psy,
 		val->intval = battery->voltage_avg * 1000;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		value.intval = SEC_BATTERY_CURRENT_UA;
+		/* derp: P1a current unit */
+		/*
+		 * Read in mA, deliberately. battery->current_now is shared with
+		 * the charging state machine, and every internal consumer of it
+		 * works in mA:
+		 *   sec_battery.c:2630  current_now < full_check_current_1st (DT mA)
+		 *   sec_battery.c:3297  current_now < topoff_current         (DT mA)
+		 *   sec_battery.c:3808  capacity_rep += time_diff * current_avg
+		 * Reading uA here instead made those comparisons 1000x too
+		 * strict, so neither full-charge test could ever pass and the
+		 * pack charged past 100%.
+		 *
+		 * The uA the power_supply ABI wants is produced below, at the
+		 * boundary, instead of being left to leak into internal state.
+		 */
+		value.intval = SEC_BATTERY_CURRENT_MA;
 		psy_do_property(battery->pdata->fuelgauge_name, get,
 			POWER_SUPPLY_PROP_CURRENT_NOW, value);
 #if defined(CONFIG_SEC_FACTORY)
-		pr_err("%s: batt_current_ua_now (%d)\n",
+		pr_err("%s: batt_current_ma_now (%d)\n",
 				__func__, value.intval);
 #endif
 		battery->current_now = value.intval;
-		/* current value should be in uA, as the power_supply ABI
-		 * specifies. This used to divide by 1000 and report mA, which
-		 * made Android read -236 as -236uA instead of 236mA. The power
-		 * model then computed ~1mW instead of ~983mW and every app
-		 * rounded to 0mAh in Settings > Battery. Voltage in the same
-		 * switch is already scaled by 1000 for exactly this reason.
-		 * Note battery->current_now itself is deliberately left in the
-		 * fuel gauge's native unit, because the control logic at the
-		 * topoff comparisons compares it against mA thresholds. */
-		val->intval = value.intval;
+		/*
+		 * mA -> uA for userspace. The power_supply ABI wants uA, and an
+		 * earlier fix got that right here but left the shared field in
+		 * uA too, which is what broke the internal mA comparisons above.
+		 * Scale at the boundary only. Voltage in this same switch is
+		 * already scaled by 1000 for exactly this reason.
+		 */
+		val->intval = value.intval * 1000;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_AVG:
-		value.intval = SEC_BATTERY_CURRENT_UA;
+		/* mA for the shared field, same reason as CURRENT_NOW above */
+		value.intval = SEC_BATTERY_CURRENT_MA;
 		psy_do_property(battery->pdata->fuelgauge_name, get,
 			POWER_SUPPLY_PROP_CURRENT_AVG, value);
 		battery->current_avg = value.intval;
-		/* uA, same reason as POWER_SUPPLY_PROP_CURRENT_NOW above */
-		val->intval = value.intval;
+		val->intval = value.intval * 1000;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
 		psy_do_property(battery->pdata->fuelgauge_name, get,
@@ -8043,8 +8074,23 @@ static int sec_usb_get_property(struct power_supply *psy,
 		break;
 	}
 
-	if (battery->slate_mode)
-		val->intval = 0;
+	/*
+	 * REMOVED HERE: `if (battery->slate_mode) val->intval = 0;`
+	 *
+	 * That forced POWER_SUPPLY_PROP_ONLINE to 0 on this node for as long as
+	 * the charge limit was engaged, even with a cable physically attached.
+	 * Measured on #221 with the cable in: usb/online went 1 -> 0 within a
+	 * second of enabling the limit, while the dwc3 gadget stayed
+	 * "configured" throughout. So no hardware changed - only the report -
+	 * and Android read the false report as "USB unplugged" and tore down
+	 * adb-over-USB. Because the limit can only be switched back off over that
+	 * same adb link, the fault was self-locking.
+	 *
+	 * A charge limit stops charging the PACK; it does not unplug the CABLE.
+	 * The per-cable-type switch above now reports the truth.
+	 *
+	 * derp: P1b - keep the cable reported while charge-limited
+	 */
 	return 0;
 }
 
