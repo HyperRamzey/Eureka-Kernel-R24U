@@ -4205,8 +4205,11 @@ static void sec_bat_bypass_policy(struct sec_battery_info *battery)
 	 * anywhere and there was no way to tell which branch it took. One line
 	 * every 30s makes every state reachable and costs nothing.
 	 */
-	if (time_after(jiffies,
-			battery->bypass_log_jiffies + SEC_BAT_BYPASS_LOG_MS)) {
+	/* SEC_BAT_BYPASS_LOG_MS is milliseconds; jiffies are ticks. Without the
+	 * conversion the heartbeat fires every 30000 TICKS (60 s at HZ=500,
+	 * 120 s at HZ=250) instead of every 30 s. */
+	if (time_after(jiffies, battery->bypass_log_jiffies +
+			msecs_to_jiffies(SEC_BAT_BYPASS_LOG_MS))) {
 		battery->bypass_log_jiffies = jiffies;
 		dev_info(battery->dev,
 			"bypass: tick armed=%d active=%d status=%d cable=%d muic=%d pdusb=%d slate=%d store=%d cand=%d\n",

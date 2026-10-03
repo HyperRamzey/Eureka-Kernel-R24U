@@ -230,12 +230,26 @@ static void sec_power_off(void)
 			__func__, ac_val.intval, usb_val.intval, wpc_val.intval, water_val.intval);
 
 	while (1) {
-		/* Check reboot charging */
+		bool charger_online = ac_val.intval || water_val.intval ||
+					usb_val.intval || wpc_val.intval;
+		bool enter_lpm;
+
+		/*
+		 * Check reboot charging.
+		 *
+		 * lpm_off opts out of the charger-connected LP-charging branch
+		 * ONLY. poweroff_try >= 5 is a different clause: it is the sole
+		 * escape when the PS_HOLD poweroff sequence below keeps failing,
+		 * and folding it under the lpm_off gate turned "poweroff fails
+		 * five times" into an infinite loop with IRQs off. Keep it
+		 * reachable regardless of lpm_off.
+		 */
 #ifdef CONFIG_SAMSUNG_BATTERY
-		if ((ac_val.intval || water_val.intval || usb_val.intval || wpc_val.intval || (poweroff_try >= 5)) && !lpcharge && !lpm_off) {
+		enter_lpm = charger_online && !lpcharge && !lpm_off;
 #else
-		if ((ac_val.intval || water_val.intval || usb_val.intval || wpc_val.intval || (poweroff_try >= 5)) && !lpm_off) {
+		enter_lpm = charger_online && !lpm_off;
 #endif
+		if (enter_lpm || (poweroff_try >= 5)) {
 			pr_emerg("%s: charger connected or power off failed(%d), reboot!\n", __func__, poweroff_try);
 #ifdef CONFIG_SEC_DEBUG
 			sec_debug_reboot_handler();
