@@ -1,5 +1,1 @@
-toolchain
-out/*
-kernel_zip/*
-patches/*
-arch/arm64/configs/merge.config
+(empty)
