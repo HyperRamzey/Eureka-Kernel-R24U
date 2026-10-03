@@ -1313,7 +1313,15 @@ SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
 		return -EINVAL;
 
 	mode = (umode_t)uhow.mode;
-	if ((mode & ~S_IALLUGO) || !(flags & O_CREAT))
+	/*
+	 * Upstream rejects a NON-ZERO mode without O_CREAT. It must NOT reject
+	 * mode == 0 without O_CREAT: O_RDONLY is 0, so a plain read-only open
+	 * passes mode = 0 and no O_CREAT, and rejecting that made EVERY call
+	 * return EINVAL.
+	 */
+	if (mode & ~S_IALLUGO)
+		return -EINVAL;
+	if (mode && !(flags & O_CREAT))
 		return -EINVAL;
 
 	if (force_o_largefile())

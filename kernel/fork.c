@@ -2128,6 +2128,99 @@ SYSCALL_DEFINE0(fork)
 }
 #endif
 
+
+/* derp: E3 clone3 */
+/*
+ * clone3(2) - the modern clone() replacement, from upstream (v5.3).
+ *
+ * Written against THIS tree, which has no kernel_clone() helper: clone() below
+ * calls _do_fork() directly, so clone3() does the same. copy_process() here
+ * already implements CLONE_PIDFD and returns the pidfd out through
+ * parent_tidptr, so clone3 reuses that by passing args.pidfd as that pointer.
+ *
+ * Arguments this kernel cannot honour are REFUSED with -EINVAL, never silently
+ * dropped. set_tid / set_tid_size / cgroup are unimplemented on 4.4, and a
+ * caller that asked for one and silently got none has a real bug. An honest
+ * EINVAL beats a quiet downgrade.
+ */
+SYSCALL_DEFINE4(clone3, unsigned long, flags, void __user *, uargs,
+		unsigned long, size, int __user *, tls)
+{
+	/*
+	 * Every CLONE_* flag this kernel defines. Built from the names, not a
+	 * magic constant, so it cannot drift. CSIGNAL is deliberately absent:
+	 * the signal comes from args.exit_signal (see below).
+	 */
+	const unsigned long valid_flags =
+		CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+		CLONE_PIDFD | CLONE_PTRACE | CLONE_VFORK | CLONE_PARENT |
+		CLONE_THREAD | CLONE_NEWNS | CLONE_SYSVSEM | CLONE_SETTLS |
+		CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED |
+		CLONE_UNTRACED | CLONE_CHILD_SETTID | CLONE_NEWCGROUP |
+		CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
+		CLONE_NEWNET | CLONE_IO;
+
+	struct clone_args args;
+	unsigned long clone_flags;
+	unsigned long stack;
+	int __user *parent_tidptr;
+
+	/* The first argument is reserved upstream; only carried for compat. */
+	if (flags)
+		return -EINVAL;
+
+	if (size == 0)
+		return -EINVAL;
+
+	if (size > PAGE_SIZE)
+		return -E2BIG;
+
+	if (uargs == NULL)
+		return -EFAULT;
+
+	if (copy_from_user(&args, uargs, sizeof(args)))
+		return -EFAULT;
+
+	/* Not implemented on 4.4 - refuse rather than ignore. See above. */
+	if (args.set_tid || args.set_tid_size || args.cgroup)
+		return -EINVAL;
+
+	/*
+	 * The exit signal is carried in args.exit_signal, so the CSIGNAL bits
+	 * are reserved in args.flags. That is the upstream ABI, and honouring
+	 * the same signal from two places would be ambiguous.
+	 */
+	if (args.flags & CSIGNAL)
+		return -EINVAL;
+
+	if (args.flags & ~valid_flags)
+		return -EINVAL;
+
+	/* There is no "stack == 0 means allocate one" in the clone3 ABI. */
+	stack = args.stack;
+	if (!stack)
+		return -EINVAL;
+
+	clone_flags = args.flags | (args.exit_signal & CSIGNAL);
+
+	/*
+	 * copy_process() returns the pidfd through parent_tidptr when
+	 * CLONE_PIDFD is set, so that is where args.pidfd has to go.
+	 */
+	if (clone_flags & CLONE_PIDFD) {
+		if (!args.pidfd)
+			return -EINVAL;
+		parent_tidptr = (int __user *)args.pidfd;
+	} else {
+		parent_tidptr = (int __user *)args.parent_tid;
+	}
+
+	return _do_fork(clone_flags, stack, args.stack_size, parent_tidptr,
+			(int __user *)args.child_tid, (unsigned long)tls);
+}
+
+
+
 #ifdef __ARCH_WANT_SYS_VFORK
 SYSCALL_DEFINE0(vfork)
 {

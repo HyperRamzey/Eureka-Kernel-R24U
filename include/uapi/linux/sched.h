@@ -1,6 +1,8 @@
 #ifndef _UAPI_LINUX_SCHED_H
 #define _UAPI_LINUX_SCHED_H
 
+#include <linux/types.h>
+
 /*
  * cloning flags:
  */
@@ -48,5 +50,25 @@
  * For the sched_{set,get}attr() calls
  */
 #define SCHED_FLAG_RESET_ON_FORK	0x01
+
+/* derp: E3 clone3 */
+/*
+ * clone3() argument structure. Bit-identical to upstream (v5.3) - it is a
+ * userspace ABI, so the layout must not drift. All fields are 64-bit aligned,
+ * hence __aligned_u64 rather than a bare __u64.
+ */
+struct clone_args {
+	__aligned_u64 flags;
+	__aligned_u64 pidfd;
+	__aligned_u64 child_tid;
+	__aligned_u64 parent_tid;
+	__aligned_u64 exit_signal;
+	__aligned_u64 stack;
+	__aligned_u64 stack_size;
+	__aligned_u64 tls;
+	__aligned_u64 set_tid;
+	__aligned_u64 set_tid_size;
+	__aligned_u64 cgroup;
+};
 
 #endif /* _UAPI_LINUX_SCHED_H */
