@@ -2099,7 +2099,9 @@ static long ep_timespec_to_ms(const struct timespec *ts)
 {
 	u64 msec;
 
-	msec = (u64)ts->tv_sec * 1000 + (u64)ts->tv_nsec / 1000000;
+	/* Round up: truncating turns any sub-millisecond timeout into 0,
+	 * which makes epoll_wait busy-poll instead of waiting. */
+	msec = (u64)ts->tv_sec * 1000 + DIV_ROUND_UP((u64)ts->tv_nsec, 1000000);
 	if (msec > INT_MAX)
 		msec = INT_MAX;
 	return (long)msec;

@@ -1433,12 +1433,39 @@ static struct decon_reg_data fp_illum_regs;
 
 int decon_fingerprint_illum_apply(struct decon_device *decon)
 {
+	int ret;
+
 	if (decon->dt.out_type != DECON_OUT_DSI)
 		return 0;
 
-	fp_illum_regs.mask_layer = decon->force_mask_layer;
+	/*
+	 * The sysfs store reaches here with the display in ANY state.
+	 * decon_set_mask_layer() waits for a vsync and then pokes the panel
+	 * over DSI; with the display off there is no vsync (the call burns
+	 * VSYNC_TIMEOUT_MSEC) and the panel/clock block is powered down, so
+	 * the register writes target a gated block.  The store has already
+	 * set decon->force_mask_layer, and the next frame submission applies
+	 * it via __decon_update_regs() -> decon_set_mask_layer(), so nothing
+	 * is lost by deferring while the display is not on.
+	 *
+	 * decon->lock is the lock the frame path (decon_set_win_config())
+	 * holds around __decon_update_regs(); taking it here serialises
+	 * decon->mask_regs and decon->current_mask_layer against a frame
+	 * that happens to be in flight, and against concurrent sysfs stores.
+	 */
+	mutex_lock(&decon->lock);
+	if (decon->state != DECON_STATE_ON) {
+		decon_info("fingerprint_illum: state %d != ON, deferring to next frame\n",
+				decon->state);
+		mutex_unlock(&decon->lock);
+		return 0;
+	}
 
-	return decon_set_mask_layer(decon, &fp_illum_regs);
+	fp_illum_regs.mask_layer = decon->force_mask_layer;
+	ret = decon_set_mask_layer(decon, &fp_illum_regs);
+	mutex_unlock(&decon->lock);
+
+	return ret;
 }
 #endif
 
@@ -1913,20 +1940,47 @@ static void decon_apply_pixel_shift(struct decon_device *decon,
 				config->dst.h != (u32)lcd->yres)
 			continue;
 
-		config->dst.x += decon->pixel_shift_x;
-		config->dst.y += decon->pixel_shift_y;
-
 		/*
-		 * decon_check_limitation() rejects negative origins, and the
-		 * fixed-address panel cannot display a window starting past
-		 * the last column/row.  Clamp rather than fail the frame:
-		 * silently dropping the shift is invisible, rejecting the
-		 * config is not.
+		 * Shift WITHOUT leaving the panel.  The previous version added
+		 * the shift to dst.x/dst.y and clamped: a positive shift pushed
+		 * the window's end position past the panel edge (dst.x + dst.w
+		 * > xres), which decon_check_limitation() does NOT catch - it
+		 * only rejects negative origins and narrow widths - so the
+		 * DECON end-position register went out of range, and a
+		 * negative shift was clamped back to 0, so left/up shifts
+		 * silently did nothing at all.
+		 *
+		 * Instead, keep the window fully on-panel by cropping the
+		 * source and shrinking the window by the shift amount:
+		 *   shift right/down  -> dst.x/dst.y += s, w/h -= s
+		 *   shift left/up     -> src.x/src.y += s, w/h -= s
+		 * Both leave a |s|-pixel strip at one edge uncovered (black),
+		 * which is exactly what a burn-in shift wants.  Requires an
+		 * unscaled window so that one source pixel is one panel pixel;
+		 * a scaled full-screen window keeps its pristine origin.
 		 */
-		if (config->dst.x < 0 || config->dst.x > lcd->xres - 16)
-			config->dst.x = 0;
-		if (config->dst.y < 0 || config->dst.y > lcd->yres - 16)
-			config->dst.y = 0;
+		if (config->src.w != config->dst.w ||
+				config->src.h != config->dst.h)
+			continue;
+
+		if (decon->pixel_shift_x >= 0) {
+			config->dst.x += decon->pixel_shift_x;
+			config->dst.w -= decon->pixel_shift_x;
+			config->src.w -= decon->pixel_shift_x;
+		} else {
+			config->src.x += -decon->pixel_shift_x;
+			config->dst.w += decon->pixel_shift_x;
+			config->src.w += decon->pixel_shift_x;
+		}
+		if (decon->pixel_shift_y >= 0) {
+			config->dst.y += decon->pixel_shift_y;
+			config->dst.h -= decon->pixel_shift_y;
+			config->src.h -= decon->pixel_shift_y;
+		} else {
+			config->src.y += -decon->pixel_shift_y;
+			config->dst.h += decon->pixel_shift_y;
+			config->src.h += decon->pixel_shift_y;
+		}
 	}
 }
 
