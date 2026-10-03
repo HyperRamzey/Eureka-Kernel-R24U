@@ -2131,64 +2131,115 @@ SYSCALL_DEFINE0(fork)
 
 /* derp: E3 clone3 */
 /*
+ * copy_struct_from_user - copy a struct from userspace
+ * @dst:   destination buffer, in kernel space
+ * @ksize: size of @dst struct
+ * @src:   source buffer, in user space
+ * @usize: (alleged) size of @src struct
+ *
+ * Backport of the helper upstream introduced for clone3() (lib/usercopy.c,
+ * commit fa4301e56e6a "lib: introduce copy_struct_from_user() helper").
+ * It implements the versioned-size ABI that clone3() and openat2() share:
+ * a short userspace struct is zero-extended, a long one is accepted only
+ * when every trailing byte is zero, and anything over PAGE_SIZE is E2BIG
+ * (which also bounds the trailing scan, so no cond_resched() is needed).
+ */
+int copy_struct_from_user(void *dst, size_t ksize,
+			  const void __user *src, size_t usize)
+{
+	size_t size = min(ksize, usize);
+	size_t rest = ksize - size;
+
+	if (usize > PAGE_SIZE)
+		return -E2BIG;
+
+	if (copy_from_user(dst, src, size))
+		return -EFAULT;
+	if (rest)
+		memset(dst + size, 0, rest);
+
+	/* Deal with trailing bytes. */
+	while (size < usize) {
+		char buffer[64];
+		size_t bufsize = min(usize - size, sizeof(buffer));
+
+		if (copy_from_user(buffer, (const char __user *)src + size,
+				   bufsize))
+			return -EFAULT;
+		if (memchr_inv(buffer, 0, bufsize))
+			return -E2BIG;
+		size += bufsize;
+	}
+	return 0;
+}
+
+/*
  * clone3(2) - the modern clone() replacement, from upstream (v5.3).
  *
- * Written against THIS tree, which has no kernel_clone() helper: clone() below
- * calls _do_fork() directly, so clone3() does the same. copy_process() here
- * already implements CLONE_PIDFD and returns the pidfd out through
- * parent_tidptr, so clone3 reuses that by passing args.pidfd as that pointer.
+ * The ABI takes TWO arguments, the struct pointer and its size:
+ *	clone3(struct clone_args *uargs, size_t size);
+ * The struct is versioned by size: CLONE_ARGS_SIZE_VER0 (64) is the
+ * smallest legal size, larger sizes are fine as long as unknown trailing
+ * fields are zero (handled by copy_struct_from_user() above).
  *
- * Arguments this kernel cannot honour are REFUSED with -EINVAL, never silently
- * dropped. set_tid / set_tid_size / cgroup are unimplemented on 4.4, and a
- * caller that asked for one and silently got none has a real bug. An honest
- * EINVAL beats a quiet downgrade.
+ * Written against THIS tree, which has no kernel_clone() helper: clone()
+ * below calls _do_fork() directly, so clone3() does the same.
+ * copy_process() here already implements CLONE_PIDFD and returns the
+ * pidfd out through parent_tidptr, so clone3 reuses that by passing
+ * args.pidfd as that pointer.
+ *
+ * TLS and stack: args.tls is handed to _do_fork() and reaches the child
+ * because this tree's arm64 copy_thread() has been switched to
+ * copy_thread_tls() (arch/arm64 selects HAVE_COPY_THREAD_TLS).
+ * args.stack is the LOWEST byte of the stack mapping; like upstream
+ * clone3_stack_valid() we convert base+size to the stack top before
+ * calling _do_fork(), because this tree's copy_thread() installs
+ * stack_start directly as the child sp.
+ *
+ * Arguments this kernel cannot honour are REFUSED with -EINVAL, never
+ * silently dropped. set_tid / set_tid_size / cgroup are unimplemented on
+ * 4.4, and a caller that asked for one and silently got none has a real
+ * bug. An honest EINVAL beats a quiet downgrade.
  */
-SYSCALL_DEFINE4(clone3, unsigned long, flags, void __user *, uargs,
-		unsigned long, size, int __user *, tls)
+SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)
 {
 	/*
-	 * Every CLONE_* flag this kernel defines. Built from the names, not a
-	 * magic constant, so it cannot drift. CSIGNAL is deliberately absent:
-	 * the signal comes from args.exit_signal (see below).
+	 * Every CLONE_* flag this kernel defines. Built from the names, not
+	 * a magic constant, so it cannot drift. CSIGNAL is deliberately
+	 * absent: the signal comes from args.exit_signal (see below).
+	 * CLONE_DETACHED is likewise absent: the clone3 ABI reserves it
+	 * (upstream wants to reuse the bit later).
 	 */
 	const unsigned long valid_flags =
 		CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
 		CLONE_PIDFD | CLONE_PTRACE | CLONE_VFORK | CLONE_PARENT |
 		CLONE_THREAD | CLONE_NEWNS | CLONE_SYSVSEM | CLONE_SETTLS |
-		CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED |
+		CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID |
 		CLONE_UNTRACED | CLONE_CHILD_SETTID | CLONE_NEWCGROUP |
 		CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
 		CLONE_NEWNET | CLONE_IO;
 
 	struct clone_args args;
 	unsigned long clone_flags;
-	unsigned long stack;
+	unsigned long stack_start = 0;
 	int __user *parent_tidptr;
+	int err;
 
-	/* The first argument is reserved upstream; only carried for compat. */
-	if (flags)
+	if (size < CLONE_ARGS_SIZE_VER0)
 		return -EINVAL;
 
-	if (size == 0)
-		return -EINVAL;
-
-	if (size > PAGE_SIZE)
-		return -E2BIG;
-
-	if (uargs == NULL)
-		return -EFAULT;
-
-	if (copy_from_user(&args, uargs, sizeof(args)))
-		return -EFAULT;
+	err = copy_struct_from_user(&args, sizeof(args), uargs, size);
+	if (err)
+		return err;
 
 	/* Not implemented on 4.4 - refuse rather than ignore. See above. */
 	if (args.set_tid || args.set_tid_size || args.cgroup)
 		return -EINVAL;
 
 	/*
-	 * The exit signal is carried in args.exit_signal, so the CSIGNAL bits
-	 * are reserved in args.flags. That is the upstream ABI, and honouring
-	 * the same signal from two places would be ambiguous.
+	 * The exit signal is carried in args.exit_signal, so the CSIGNAL
+	 * bits are reserved in args.flags. That is the upstream ABI, and
+	 * honouring the same signal from two places would be ambiguous.
 	 */
 	if (args.flags & CSIGNAL)
 		return -EINVAL;
@@ -2196,12 +2247,37 @@ SYSCALL_DEFINE4(clone3, unsigned long, flags, void __user *, uargs,
 	if (args.flags & ~valid_flags)
 		return -EINVAL;
 
-	/* There is no "stack == 0 means allocate one" in the clone3 ABI. */
-	stack = args.stack;
-	if (!stack)
+	/*
+	 * A CLONE_THREAD child shares the parent's signal handlers and has
+	 * no distinct exit signal; a CLONE_PARENT child is re-parented and
+	 * its exit signal would be meaningless. Upstream rejects both.
+	 */
+	if ((args.flags & (CLONE_THREAD | CLONE_PARENT)) && args.exit_signal)
+		return -EINVAL;
+
+	if (args.exit_signal & ~(u64)CSIGNAL)
 		return -EINVAL;
 
 	clone_flags = args.flags | (args.exit_signal & CSIGNAL);
+
+	/*
+	 * clone3 stack semantics (upstream clone3_stack_valid()):
+	 * stack == 0 is legal and means "duplicate the parent's stack"
+	 * (fork-style); stack_size without stack, or stack without
+	 * stack_size, is invalid. On a downward-growing stack (arm64)
+	 * the child sp is the TOP of the mapping, so add the size.
+	 */
+	if (!args.stack) {
+		if (args.stack_size)
+			return -EINVAL;
+	} else {
+		if (!args.stack_size)
+			return -EINVAL;
+		if (!access_ok(VERIFY_WRITE, (void __user *)args.stack,
+			       args.stack_size))
+			return -EFAULT;
+		stack_start = args.stack + args.stack_size;
+	}
 
 	/*
 	 * copy_process() returns the pidfd through parent_tidptr when
@@ -2215,8 +2291,9 @@ SYSCALL_DEFINE4(clone3, unsigned long, flags, void __user *, uargs,
 		parent_tidptr = (int __user *)args.parent_tid;
 	}
 
-	return _do_fork(clone_flags, stack, args.stack_size, parent_tidptr,
-			(int __user *)args.child_tid, (unsigned long)tls);
+	return _do_fork(clone_flags, stack_start, args.stack_size,
+			parent_tidptr, (int __user *)args.child_tid,
+			args.tls);
 }
 
 

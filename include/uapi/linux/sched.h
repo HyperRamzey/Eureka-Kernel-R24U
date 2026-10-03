@@ -71,4 +71,13 @@ struct clone_args {
 	__aligned_u64 cgroup;
 };
 
+/*
+ * clone_args structure sizes for versioning. The size argument passed to
+ * clone3() tells the kernel which revision of the structure userspace
+ * compiled against; shorter is zero-extended, longer must be zero-padded.
+ */
+#define CLONE_ARGS_SIZE_VER0 64 /* sizeof first published struct */
+#define CLONE_ARGS_SIZE_VER1 80 /* sizeof second published struct */
+#define CLONE_ARGS_SIZE_VER2 88 /* sizeof third published struct */
+
 #endif /* _UAPI_LINUX_SCHED_H */

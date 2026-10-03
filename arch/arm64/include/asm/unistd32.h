@@ -803,7 +803,16 @@ __SYSCALL(__NR_userfaultfd, sys_userfaultfd)
 __SYSCALL(__NR_membarrier, sys_membarrier)
 #define __NR_pidfd_open 434
 __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
-#define __NR_epoll_pwait2 449
+#define __NR_clone3 435
+__SYSCALL(__NR_clone3, sys_clone3)
+/* 436 is close_range, not backported */
+#define __NR_openat2 437
+__SYSCALL(__NR_openat2, sys_openat2)
+/* 438 is pidfd_getfd, not backported */
+#define __NR_faccessat2 439
+__SYSCALL(__NR_faccessat2, sys_faccessat2)
+/* 440 is process_madvise, not backported */
+#define __NR_epoll_pwait2 441
 __SYSCALL(__NR_epoll_pwait2, compat_sys_epoll_pwait2)
 
 /*
