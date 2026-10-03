@@ -2061,7 +2061,8 @@ SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
 }
 
 /*
- * epoll_pwait2(2) backport (upstream Linux 5.11, arm64 nr 441, arm nr 449).
+ * epoll_pwait2(2) backport (upstream Linux 5.11, nr 441 on both arm64 and
+ * 32-bit ARM EABI; 449 is futex_waitv).
  * Identical to epoll_pwait(2) except the timeout is a struct timespec
  * (nanosecond resolution) instead of milliseconds. Gives R-era userspace
  * (e.g. BufferReleaseChannel release waits) a working syscall instead of

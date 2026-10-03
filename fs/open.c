@@ -1255,6 +1255,20 @@ SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
  *   fs/open.c:1247:1: error: conflicting types for 'sys_openat2'
  * The arity of the DEFINE and the number of pairs must agree exactly.
  */
+/*
+ * sizeof the first published struct open_how; anything shorter is EINVAL
+ * (upstream does the same). Longer is fine if the tail is all zero.
+ */
+#define OPEN_HOW_SIZE_VER0	24
+
+/*
+ * The valid-flags mask is this tree's own VALID_OPEN_FLAGS from
+ * include/linux/fcntl.h, which matches upstream's set: it already
+ * includes FASYNC (the same bit as O_ASYNC - this tree's
+ * asm-generic/fcntl.h never got an O_ASYNC define), O_NOATIME,
+ * __O_SYNC (so O_SYNC == __O_SYNC|O_DSYNC passes) and __O_TMPFILE
+ * (so O_TMPFILE == __O_TMPFILE|O_DIRECTORY passes).
+ */
 SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
 		struct open_how __user *, how, size_t, size)
 {
@@ -1268,61 +1282,51 @@ SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
 	 * Use a distinct name and assign rather than aliasing.
 	 */
 	struct open_how uhow;
+	int err;
 	int flags;
 	umode_t mode;
-	u64 resolve;
 
-	if (size == 0)
-		return -EFAULT;
-	if (size < sizeof(struct open_how)) {
-		/* Copy what is there so a short struct is reported properly. */
-		if (copy_from_user(&uhow, how, size))
-			return -EFAULT;
-	} else if (size > sizeof(struct open_how)) {
-		/* Trailing garbage must not be silently ignored. */
-		size_t copied = sizeof(struct open_how);
-		u8 tail = 0;
-		if (copy_from_user(&uhow, how, sizeof(struct open_how)))
-			return -EFAULT;
-		while (copied < size) {
-			if (copy_from_user(&tail, (char __user *)how + copied, 1))
-				return -EFAULT;
-			if (tail)
-				return -E2BIG;
-			copied++;
-		}
-	} else {
-		if (copy_from_user(&uhow, how, sizeof(struct open_how)))
-			return -EFAULT;
-	}
+	if (size < OPEN_HOW_SIZE_VER0)
+		return -EINVAL;
 
-	resolve = uhow.resolve;
-	if (resolve & ~((u64)RESOLVE_MAX))
+	/*
+	 * copy_struct_from_user() (kernel/fork.c) zero-extends a short
+	 * struct, rejects non-zero trailing bytes in a long one, and caps
+	 * the trailing scan at PAGE_SIZE. Never run with stack garbage
+	 * from a partially-filled uhow.
+	 */
+	err = copy_struct_from_user(&uhow, sizeof(uhow), how, size);
+	if (err)
+		return err;
+
+	if (uhow.resolve & ~(u64)RESOLVE_MAX)
 		return -EINVAL;
 	/*
 	 * Refuse rather than silently downgrade. Only resolve == 0 is supported.
 	 */
-	if (resolve)
+	if (uhow.resolve)
 		return -EINVAL;
 
-	flags = uhow.flags;
-	if (flags & ~(O_ACCMODE | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW |
-		      O_CLOEXEC | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC |
-		      O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | O_PATH |
-		      O_TMPFILE | O_DIRECT))
-		return -EINVAL;
-
-	mode = (umode_t)uhow.mode;
 	/*
-	 * Upstream rejects a NON-ZERO mode without O_CREAT. It must NOT reject
-	 * mode == 0 without O_CREAT: O_RDONLY is 0, so a plain read-only open
-	 * passes mode = 0 and no O_CREAT, and rejecting that made EVERY call
-	 * return EINVAL.
+	 * flags is __u64 in the ABI. Validate the full 64 bits BEFORE
+	 * narrowing to int, so the high half can neither smuggle flags
+	 * past the check nor be silently truncated.
 	 */
-	if (mode & ~S_IALLUGO)
+	if (uhow.flags & ~(u64)VALID_OPEN_FLAGS)
 		return -EINVAL;
-	if (mode && !(flags & O_CREAT))
+	flags = (int)uhow.flags;
+
+	if (uhow.mode & ~(u64)S_IALLUGO)
 		return -EINVAL;
+	/*
+	 * A non-zero mode requires a flag that consumes it: O_CREAT or
+	 * O_TMPFILE. Test the __O_TMPFILE bit, not O_TMPFILE, because
+	 * O_TMPFILE == __O_TMPFILE|O_DIRECTORY and a bare O_DIRECTORY
+	 * must not legitimise a mode.
+	 */
+	if (uhow.mode && !(uhow.flags & (O_CREAT | __O_TMPFILE)))
+		return -EINVAL;
+	mode = (umode_t)uhow.mode;
 
 	if (force_o_largefile())
 		flags |= O_LARGEFILE;
