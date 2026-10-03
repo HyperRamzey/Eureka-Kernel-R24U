@@ -1182,6 +1182,32 @@ static int ist40xx_suspend(struct device *dev)
 	cancel_delayed_work_sync(&data->work_force_release);
 #endif
 
+	/*
+	 * ET715 AOD wake fix (Derp).
+	 *
+	 * The AIDL fingerprint HAL on this ROM never issues the sec_touch
+	 * "fod_lp_mode" ioctl and never sets the IST40XX_FOD bit, so BOTH
+	 * lpm_mode and fod_lp_mode are 0 at screen-off. The condition below
+	 * therefore took the else branch, called ist40xx_power_off() and left
+	 * the touch IRQ unarmed: the controller was physically off, so a finger
+	 * on the AOD panel could not wake the device at all. Verified on device:
+	 * 0 occurrences of the driver's own "fod_lp_mode" marker in dmesg.
+	 *
+	 * When the DT says this panel supports under-display fingerprint, arm the
+	 * FOD report and push it into the IC so low-power touches actually reach
+	 * the CPU, then fall through to the LPM branch which enables gesture and
+	 * calls enable_irq_wake(). Done before mutex_lock() because
+	 * ist40xx_write_sponge_reg() may take the same lock internally.
+	 */
+	if (data->dt_data->support_fod && !(data->lpm_mode & IST40XX_FOD)) {
+		data->lpm_mode |= IST40XX_FOD;
+		ist40xx_write_sponge_reg(data, IST40XX_SPONGE_CTRL,
+					 (u16 *)&data->lpm_mode, 1, true);
+		input_info(true, &data->client->dev,
+			   "FOD_WAKE: armed IST40XX_FOD, lpm_mode=0x%04x\n",
+			   (unsigned int)data->lpm_mode);
+	}
+
 	mutex_lock(&data->lock);
 	if (data->lpm_mode || data->fod_lp_mode) {
 		ist40xx_disable_irq(data);
@@ -1193,6 +1219,10 @@ static int ist40xx_suspend(struct device *dev)
 		data->status.sys_mode = STATE_LPM;
 		ist40xx_enable_irq(data);
 	} else {
+		input_info(true, &data->client->dev,
+			   "FOD_WAKE: SUSPEND POWER-OFF lpm_mode=0x%04x fod_lp_mode=%d support_fod=%d\n",
+			   (unsigned int)data->lpm_mode, data->fod_lp_mode,
+			   data->dt_data->support_fod);
 		ist40xx_power_off(data);
 		ist40xx_disable_irq(data);
 		data->status.sys_mode = STATE_POWER_OFF;
