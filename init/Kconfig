@@ -1133,15 +1133,29 @@ config PSI_DEFAULT_DISABLED
 	help
 	  Disable PSI by default. Say Y if unsure. When enabled, PSI can be
 	  turned on at boot time with the psi=1 command line parameter, or at
-	  runtime by writing "1"/"0" to /proc/sys/kernel/psi.
+	  runtime by writing "1"/"0" to /proc/pressure/enable.
 
 	  Stall accounting adds work to reclaim and IO paths, so on a small
 	  device it is deliberately off until asked for.
 
-	  NOTE: this port has NO runtime switch. There is no
-	  /proc/sys/kernel/psi knob; psi_enable is sampled exactly once, by
-	  the __setup("psi=") early parameter, so PSI can only be turned on at
-	  boot by adding psi=1 to the kernel command line.
+	  ON THIS BOARD leave this OFF (N). The psi=1 command line parameter does
+	  not work here: the Samsung bootloader builds /proc/cmdline itself and
+	  DISCARDS the cmdline field of the boot image. Measured on SM-A307FN -
+	  the packed boot.img header DOES contain "androidboot.hardware=exynos7904
+	  psi=1" (Android boot header, cmdline at file offset 0x40), yet
+	  grep -c psi /proc/cmdline returns 0 at runtime. So with this set to Y,
+	  PSI is unreachable at boot and only /proc/pressure/enable can revive it.
+	  With it N, PSI is live from the moment /proc/pressure exists, which is
+	  what lmkd (ro.lmk.use_psi=true) needs.
+
+	  RUNTIME SWITCH: /proc/pressure/enable (mode 0644). Writing "1" enables
+	  PSI immediately and "0" disables it, by flipping the same psi_disabled
+	  static key that the psi= early parameter sets. Measured on SM-A307FN:
+	  with PSI disabled every /proc/pressure/* read returns EOPNOTSUPP; after
+	  `echo 1 > /proc/pressure/enable` they return live values and the lmkd-
+	  style trigger (write "some <thr> <win>", poll for EPOLLPRI) fires on
+	  cpu, io and memory. There is deliberately NO /proc/sys/kernel/psi -
+	  that path belongs to upstream and is not provided here.
 
 	  The /proc/pressure/{io,memory,cpu} files are registered
 	  unconditionally whenever CONFIG_PSI=y, so they exist even while PSI
