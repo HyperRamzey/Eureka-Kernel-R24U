@@ -580,7 +580,14 @@ int kthread_worker_fn(void *worker_ptr)
 	struct kthread_worker *worker = worker_ptr;
 	struct kthread_work *work;
 
-	WARN_ON(worker->task);
+	/*
+	 * derp: PSI adopts its psimon task into poll_kworker.task before
+	 * waking it, mirroring upstream v4.9's kthread_create_worker(), so
+	 * that insert_kthread_work() can wake the thread for a work queued
+	 * before its first instruction. Allow that case; still catch a
+	 * genuine reassignment to a different task.
+	 */
+	WARN_ON(worker->task && worker->task != current);
 	worker->task = current;
 repeat:
 	set_current_state(TASK_INTERRUPTIBLE);	/* mb paired w/ kthread_stop */

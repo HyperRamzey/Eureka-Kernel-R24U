@@ -16,6 +16,12 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+/*
+ * Included unconditionally: <linux/psi.h> supplies no-op stubs for
+ * psi_memstall_enter/leave when CONFIG_PSI=n, so the reclaim hooks
+ * below need no #ifdef and cost nothing when PSI is off.
+ */
+#include <linux/psi.h>
 #include <linux/highmem.h>
 #include <linux/swap.h>
 #include <linux/interrupt.h>
@@ -2985,11 +2991,13 @@ __perform_reclaim(gfp_t gfp_mask, unsigned int order,
 {
 	struct reclaim_state reclaim_state;
 	int progress;
+	unsigned long pflags;
 
 	cond_resched();
 
 	/* We now go into synchronous reclaim */
 	cpuset_memory_pressure_bump();
+	psi_memstall_enter(&pflags);
 	current->flags |= PF_MEMALLOC;
 	lockdep_set_current_reclaim_state(gfp_mask);
 	reclaim_state.reclaimed_slab = 0;
@@ -3001,6 +3009,7 @@ __perform_reclaim(gfp_t gfp_mask, unsigned int order,
 	current->reclaim_state = NULL;
 	lockdep_clear_current_reclaim_state();
 	current->flags &= ~PF_MEMALLOC;
+	psi_memstall_leave(&pflags);
 
 	cond_resched();
 
