@@ -2925,15 +2925,24 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 		bool *deferred_compaction)
 {
 	unsigned long compact_result;
+	unsigned long pflags;
 	struct page *page;
 
 	if (!order)
 		return NULL;
 
+	/*
+	 * Compaction stalls are memory stalls: upstream v5.4 wraps direct
+	 * compaction in psi_memstall_enter/leave so higher-order allocation
+	 * latency shows up in /proc/pressure/memory instead of being
+	 * invisible to lmkd.
+	 */
+	psi_memstall_enter(&pflags);
 	current->flags |= PF_MEMALLOC;
 	compact_result = try_to_compact_pages(gfp_mask, order, alloc_flags, ac,
 						mode, contended_compaction);
 	current->flags &= ~PF_MEMALLOC;
+	psi_memstall_leave(&pflags);
 
 	switch (compact_result) {
 	case COMPACT_DEFERRED:

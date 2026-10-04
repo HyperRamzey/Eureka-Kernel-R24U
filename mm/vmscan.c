@@ -3486,6 +3486,7 @@ static unsigned long balance_pgdat(pg_data_t *pgdat, int order,
 	int end_zone = 0;	/* Inclusive.  0 = ZONE_DMA */
 	unsigned long nr_soft_reclaimed;
 	unsigned long nr_soft_scanned;
+	unsigned long pflags;
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
 		.order = order,
@@ -3495,6 +3496,16 @@ static unsigned long balance_pgdat(pg_data_t *pgdat, int order,
 		.may_swap = 1,
 		.swappiness = vm_swappiness,
 	};
+
+	/*
+	 * Account kswapd reclaim as memory stall time (upstream v5.4
+	 * placement). Without this, periods where only kswapd is working
+	 * contribute nothing to /proc/pressure/memory, under-reporting
+	 * "some" pressure exactly when a small-RAM device needs lmkd's
+	 * PSI monitor to see it.
+	 */
+	psi_memstall_enter(&pflags);
+
 	count_vm_event(PAGEOUTRUN);
 
 	do {
@@ -3659,6 +3670,8 @@ static unsigned long balance_pgdat(pg_data_t *pgdat, int order,
 		 !pgdat_balanced(pgdat, order, *classzone_idx));
 
 out:
+	psi_memstall_leave(&pflags);
+
 	/*
 	 * Return the order we were reclaiming at so prepare_kswapd_sleep()
 	 * makes a decision on the order we were last reclaiming at. However,
