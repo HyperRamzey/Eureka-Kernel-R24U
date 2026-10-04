@@ -144,6 +144,18 @@
 static int psi_bug __read_mostly;
 
 /*
+ * Last task that ran psi_avgs_work(). 4.4 has no wq_worker_last_func(),
+ * which upstream uses in psi_task_change() to avoid re-arming the
+ * aggregation clock when the aggregation worker itself goes to sleep
+ * (otherwise the work ping-pongs forever and never shuts off when idle).
+ * Remembering the worker's task gives the same persistent answer:
+ * workqueue workers are long-lived and may run other works, but
+ * suppressing the kick for that one task is harmless, exactly like
+ * upstream's persistent last-func test.
+ */
+static struct task_struct *psi_avgs_task __read_mostly;
+
+/*
  * TEMPORARY poll-path diagnostics, exported through /proc/pressure/enable.
  * Remove once the trigger path is confirmed working.
  */
@@ -519,6 +531,9 @@ static void psi_avgs_work(struct work_struct *work)
 	u32 changed_states;
 	bool nonidle;
 	u64 now;
+
+	/* See psi_task_change(): remember who we are for the idle-kick guard. */
+	WRITE_ONCE(psi_avgs_task, current);
 
 	mutex_lock(&group->avgs_lock);
 
@@ -925,15 +940,23 @@ void psi_task_change(struct task_struct *task, int clear, int set)
 	/*
 	 * Periodic aggregation shuts off if there is a period of no task
 	 * changes, so we wake it back up if necessary. However, don't do this
-	 * if the task change is the aggregation thread itself going to sleep,
+	 * if the task change is the aggregation worker itself going to sleep,
 	 * or we'll ping-pong forever.
 	 *
-	 * Upstream asks the workqueue "which function is this worker running?"
-	 * via wq_worker_last_func(). 4.4 has no equivalent question to ask, so
-	 * the avgs side runs on the system workqueue like upstream and this
-	 * test becomes an exact task comparison (is current the avgs worker?)
-	 * instead of an approximate function comparison.
+	 * Upstream asks the workqueue "which function did this worker last
+	 * run?" via wq_worker_last_func(), which 4.4 does not have. The
+	 * equivalent here is a persistent task pointer recorded by
+	 * psi_avgs_work(): by the time the worker dequeues to sleep, its
+	 * current_func has already been cleared, so only a remembered task
+	 * identity catches the ping-pong case. A worker task that once ran
+	 * psi_avgs_work simply never kicks the clock again, which is benign -
+	 * upstream's last-func test has the same permanent effect.
 	 */
+	if (unlikely((clear & TSK_RUNNING) &&
+		     (task->flags & PF_WQ_WORKER) &&
+		     task == READ_ONCE(psi_avgs_task)))
+		wake_clock = false;
+
 	state_mask = psi_group_change(group, cpu, clear, set);
 
 	if (state_mask & group->poll_states)
