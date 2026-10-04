@@ -26,6 +26,7 @@
 #endif
 
 #include <linux/moduleparam.h>
+#include <linux/ratelimit.h>
 
 static int wl_polling = 10;
 module_param(wl_polling, int, 0644);
@@ -1763,16 +1764,28 @@ static void sec_bat_swelling_check(struct sec_battery_info *battery)
 	if (is_wireless_type(battery->cable_type)) {
 		swelling_high_recovery = battery->pdata->swelling_wc_high_temp_recov;
 	}
-	pr_info("%s: swelling highblock(%d), highrecov(%d)\n",
-		__func__, battery->pdata->swelling_high_temp_block, swelling_high_recovery);
+	{
+		static DEFINE_RATELIMIT_STATE(swell_rs, 600 * HZ, 2);
+
+		if (__ratelimit(&swell_rs))
+			pr_info("%s: swelling highblock(%d), highrecov(%d)\n",
+				__func__, battery->pdata->swelling_high_temp_block,
+				swelling_high_recovery);
+	}
 
 	psy_do_property(battery->pdata->charger_name, get,
 			POWER_SUPPLY_PROP_VOLTAGE_MAX, val);
 
-	pr_info("%s: status(%d), swell_mode(%d:%d:%d), cv(%d)mV, temp(%d)\n",
-		__func__, battery->status, battery->swelling_mode,
-		battery->charging_block, (battery->current_event & SEC_BAT_CURRENT_EVENT_LOW_TEMP_MODE),
-		val.intval, battery->temperature);
+	{
+		static DEFINE_RATELIMIT_STATE(swell_st_rs, 600 * HZ, 2);
+
+		if (__ratelimit(&swell_st_rs))
+			pr_info("%s: status(%d), swell_mode(%d:%d:%d), cv(%d)mV, temp(%d)\n",
+				__func__, battery->status, battery->swelling_mode,
+				battery->charging_block,
+				(battery->current_event & SEC_BAT_CURRENT_EVENT_LOW_TEMP_MODE),
+				val.intval, battery->temperature);
+	}
 
 	/* swelling_mode
 		under voltage over voltage, battery missing */
@@ -3056,14 +3069,45 @@ static void sec_bat_get_battery_info(
 		then ignore FG SOC, and report (previous SOC +1)% */
 	battery->capacity = value.intval;
 
-	dev_info(battery->dev,
-		"%s:Vnow(%dmV),Inow(%dmA),Imax(%dmA),Ichg(%dmA),SOC(%d%%),Tbat(%d), Tusb(%d), Tchg(%d),Twpc(%d)"
-		"\n", __func__,
-		battery->voltage_now, battery->current_now,
-		battery->current_max, battery->charging_current,
-		battery->capacity, battery->temperature, 
-		battery->usb_temp, battery->chg_temp, battery->wpc_temp
-	);
+	/*
+	 * Rate-limit the periodic full status line: it fires on every monitor
+	 * poll (30 s while awake) and dominated the dmesg ring, rotating out
+	 * real diagnostics. Log immediately when anything user-visible
+	 * changes (SOC / status / cable), otherwise at most once per 10 min.
+	 * The complete line remains available every poll under DEBUG.
+	 */
+	{
+		static unsigned long last_log;
+		static int last_capacity = -1, last_status = -1,
+			   last_cable = -1;
+		bool changed = battery->capacity != last_capacity ||
+			       battery->status != last_status ||
+			       battery->cable_type != last_cable;
+
+		if (changed || time_after(jiffies, last_log + 600 * HZ)) {
+			dev_info(battery->dev,
+				"%s:Vnow(%dmV),Inow(%dmA),Imax(%dmA),Ichg(%dmA),SOC(%d%%),Tbat(%d), Tusb(%d), Tchg(%d),Twpc(%d)"
+				"\n", __func__,
+				battery->voltage_now, battery->current_now,
+				battery->current_max, battery->charging_current,
+				battery->capacity, battery->temperature,
+				battery->usb_temp, battery->chg_temp, battery->wpc_temp
+			);
+			last_log = jiffies;
+			last_capacity = battery->capacity;
+			last_status = battery->status;
+			last_cable = battery->cable_type;
+		} else {
+			dev_dbg(battery->dev,
+				"%s:Vnow(%dmV),Inow(%dmA),Imax(%dmA),Ichg(%dmA),SOC(%d%%),Tbat(%d), Tusb(%d), Tchg(%d),Twpc(%d)"
+				"\n", __func__,
+				battery->voltage_now, battery->current_now,
+				battery->current_max, battery->charging_current,
+				battery->capacity, battery->temperature,
+				battery->usb_temp, battery->chg_temp, battery->wpc_temp
+			);
+		}
+	}
 	dev_dbg(battery->dev,
 		"%s,Vavg(%dmV),Vocv(%dmV),Tamb(%d),"
 		"Iavg(%dmA),Iadc(%d)\n",
@@ -4353,7 +4397,12 @@ static void sec_bat_monitor_work(
 	c_ts = ktime_to_timespec(ktime_get_boottime());
 
 	if (!battery->wc_enable) {
-		pr_info("%s: wc_enable(%d), cnt(%d)\n",
+		/*
+		 * This fires on every 30 s monitor poll on devices without
+		 * wireless charging and accounted for most of the sec-battery
+		 * dmesg flood (1265 of 3833 lines in one boot). Debug-grade.
+		 */
+		pr_debug("%s: wc_enable(%d), cnt(%d)\n",
 			__func__, battery->wc_enable, battery->wc_enable_cnt);
 		if (battery->wc_enable_cnt > battery->wc_enable_cnt_value) {
 			battery->wc_enable = true;

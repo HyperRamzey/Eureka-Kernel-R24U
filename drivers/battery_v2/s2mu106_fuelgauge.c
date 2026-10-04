@@ -23,6 +23,7 @@
 
 #include "include/fuelgauge/s2mu106_fuelgauge.h"
 #include <linux/of_gpio.h>
+#include <linux/ratelimit.h>
 
 static enum power_supply_property s2mu106_fuelgauge_props[] = {
 };
@@ -525,7 +526,12 @@ static int s2mu106_get_temperature(struct s2mu106_fuelgauge_data *fuelgauge)
 	}
 	temperature = ((temperature * 100) >> 8)/10;
 
-	pr_info("%s: temperature (%d)\n", __func__, temperature);
+	{
+		static DEFINE_RATELIMIT_STATE(fg_temp_rs, 600 * HZ, 2);
+
+		if (__ratelimit(&fg_temp_rs))
+			pr_info("%s: temperature (%d)\n", __func__, temperature);
+	}
 
 	return temperature;
 err:
@@ -568,8 +574,13 @@ static int s2mu106_get_comp_socr(struct s2mu106_fuelgauge_data *fuelgauge)
 	else if (comp_socr < 0)
 		comp_socr = 0;
 
-	pr_info("%s: SOCr = %d, T_SOCr = %d, I_SOCr = %d\n", __func__,
-		comp_socr, t_socr, i_socr / 100000);
+	{
+		static DEFINE_RATELIMIT_STATE(fg_socr_rs, 600 * HZ, 2);
+
+		if (__ratelimit(&fg_socr_rs))
+			pr_info("%s: SOCr = %d, T_SOCr = %d, I_SOCr = %d\n",
+				__func__, comp_socr, t_socr, i_socr / 100000);
+	}
 
 	return comp_socr;
 }
@@ -693,11 +704,16 @@ static void s2mu106_temperature_compensation(struct s2mu106_fuelgauge_data *fuel
 		fuelgauge->soc_r = fuelgauge->rsoc;
 
 #if !(BATCAP_LEARN)
-	pr_info("%s: SOC_M = %d, Chg_stat = %d, VM = %d, flag_mapping = %d, avgCURR = %d, avgTEMP = %d, "
-			"SOCni = %d, SOC0i = %d, SOCr = %d, SOC_R = %d\n",
-			__func__, fuelgauge->rsoc, fuelgauge->bat_charging, fuelgauge->vm_status,
-			fuelgauge->flag_mapping, fuelgauge->avg_curr, fuelgauge->temperature,
-			fuelgauge->socni, fuelgauge->soc0i, fuelgauge->comp_socr, fuelgauge->soc_r);
+	{
+		static DEFINE_RATELIMIT_STATE(fg_soc_rs, 600 * HZ, 2);
+
+		if (__ratelimit(&fg_soc_rs))
+			pr_info("%s: SOC_M = %d, Chg_stat = %d, VM = %d, flag_mapping = %d, avgCURR = %d, avgTEMP = %d, "
+				"SOCni = %d, SOC0i = %d, SOCr = %d, SOC_R = %d\n",
+				__func__, fuelgauge->rsoc, fuelgauge->bat_charging, fuelgauge->vm_status,
+				fuelgauge->flag_mapping, fuelgauge->avg_curr, fuelgauge->temperature,
+				fuelgauge->socni, fuelgauge->soc0i, fuelgauge->comp_socr, fuelgauge->soc_r);
+	}
 #endif
 	fuelgauge->init_start = 0;
 	fuelgauge->pre_comp_socr = fuelgauge->comp_socr;
@@ -714,8 +730,13 @@ static void s2mu106_temperature_compensation(struct s2mu106_fuelgauge_data *fuel
 	/* TODO: Print UI SOC & saved value for debugging */
 	s2mu106_read_reg(fuelgauge->i2c, S2MU106_REG_RSOC_R, data);
 	ui_soc = (data[1] << 8) | (data[0]);
-	pr_info("%s: saved UI SOC = %d, data[1] = 0x%02x, data[0] = 0x%02x\n",
-			__func__, ui_soc, data[1], data[0]);
+	{
+		static DEFINE_RATELIMIT_STATE(fg_ui_rs, 600 * HZ, 2);
+
+		if (__ratelimit(&fg_ui_rs))
+			pr_info("%s: saved UI SOC = %d, data[1] = 0x%02x, data[0] = 0x%02x\n",
+				__func__, ui_soc, data[1], data[0]);
+	}
 }
 #endif
 
