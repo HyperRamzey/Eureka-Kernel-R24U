@@ -15,6 +15,7 @@
 #include <linux/types.h>
 #include <linux/compat.h>
 #include <linux/uaccess.h>
+#include <linux/ratelimit.h>
 #include <linux/mount.h>
 #include <linux/pagevec.h>
 #include <linux/random.h>
@@ -1862,10 +1863,24 @@ static int f2fs_ioc_start_atomic_write(struct file *filp)
 	/*
 	 * Should wait end_io to count F2FS_WB_CP_DATA correctly by
 	 * f2fs_is_atomic_file.
+	 *
+	 * This warning is upstream-normal (identical in v5.4 and later): it
+	 * fires when the file still has dirty pages at START_ATOMIC_WRITE,
+	 * i.e. the app wrote before opening the atomic section - not an
+	 * atomic-commit boundary violation. It is NOT evidence of a missing
+	 * CONFIG_F2FS_FS_ATOMIC_FILE (this tree has atomic write built in).
+	 * Log the offending task so samples can be attributed, and ratelimit
+	 * so a pathological writer cannot flood the ring buffer.
 	 */
-	if (get_dirty_pages(inode))
-		f2fs_warn(F2FS_I_SB(inode), "Unexpected flush for atomic writes: ino=%lu, npages=%u",
-			  inode->i_ino, get_dirty_pages(inode));
+	if (get_dirty_pages(inode)) {
+		static DEFINE_RATELIMIT_STATE(atomic_flush_rs, 60 * HZ, 4);
+
+		if (__ratelimit(&atomic_flush_rs))
+			f2fs_warn(F2FS_I_SB(inode),
+				  "Unexpected flush for atomic writes: ino=%lu, npages=%u, task=%d:%s",
+				  inode->i_ino, get_dirty_pages(inode),
+				  current->pid, current->comm);
+	}
 	ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
 	if (ret) {
 		up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
