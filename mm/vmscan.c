@@ -22,6 +22,12 @@
 #include <linux/init.h>
 #include <linux/highmem.h>
 #include <linux/vmpressure.h>
+/*
+ * Included unconditionally: <linux/psi.h> supplies no-op stubs for
+ * psi_memstall_enter/leave when CONFIG_PSI=n, so the reclaim hooks
+ * below need no #ifdef and cost nothing when PSI is off.
+ */
+#include <linux/psi.h>
 #include <linux/vmstat.h>
 #include <linux/file.h>
 #include <linux/writeback.h>
@@ -2925,6 +2931,7 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 {
 	int initial_priority = sc->priority;
 	unsigned long total_scanned = 0;
+	unsigned long pflags;
 	unsigned long writeback_threshold;
 	bool zones_reclaimable;
 retry:
@@ -2932,6 +2939,9 @@ retry:
 
 	if (global_reclaim(sc))
 		count_vm_event(ALLOCSTALL);
+
+	/* Account the synchronous reclaim as PSI memory stall time. */
+	psi_memstall_enter(&pflags);
 
 	do {
 		vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
@@ -2967,6 +2977,8 @@ retry:
 			sc->may_writepage = 1;
 		}
 	} while (--sc->priority >= 0);
+
+	psi_memstall_leave(&pflags);
 
 	delayacct_freepages_end();
 

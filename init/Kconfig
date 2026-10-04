@@ -1110,6 +1110,46 @@ config CGROUP_PERF
 
 	  Say N if unsure.
 
+config PSI
+	bool "Pressure stall information"
+	help
+	  Pressure stall information (PSI) provides a means of conveying
+	  information regarding resource contention and provides
+	  notifications to userspace when contended resources exceed
+	  certain thresholds.
+
+	  This backport is SYSTEM-LEVEL only: it publishes
+	  /proc/pressure/{cpu,memory,io} and the trigger interface on those
+	  files. Cgroup-v2 PSI is not provided, because this tree's PSI port
+	  targets the system level only and lmkd (ro.lmk.use_psi) reads only
+	  the three top-level files.
+
+	  If unsure, say N.
+
+config PSI_DEFAULT_DISABLED
+	bool "Disable PSI by default"
+	depends on PSI
+	default y
+	help
+	  Disable PSI by default. Say Y if unsure. When enabled, PSI can be
+	  turned on at boot time with the psi=1 command line parameter, or at
+	  runtime by writing "1"/"0" to /proc/sys/kernel/psi.
+
+	  Stall accounting adds work to reclaim and IO paths, so on a small
+	  device it is deliberately off until asked for.
+
+	  NOTE: this port has NO runtime switch. There is no
+	  /proc/sys/kernel/psi knob; psi_enable is sampled exactly once, by
+	  the __setup("psi=") early parameter, so PSI can only be turned on at
+	  boot by adding psi=1 to the kernel command line.
+
+	  The /proc/pressure/{io,memory,cpu} files are registered
+	  unconditionally whenever CONFIG_PSI=y, so they exist even while PSI
+	  is disabled - but reading one then returns -EOPNOTSUPP, because
+	  psi_show() checks the psi_disabled static branch. Their presence is
+	  therefore NOT evidence that PSI is running; read /proc/pressure/cpu
+	  and check it returns "some ..." rather than EOPNOTSUPP.
+
 menuconfig CGROUP_SCHED
 	bool "Group CPU scheduler"
 	default n

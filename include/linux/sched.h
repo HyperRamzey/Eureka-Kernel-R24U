@@ -1798,6 +1798,13 @@ struct task_struct {
 	} vtime_snap_whence;
 #endif
 	unsigned long nvcsw, nivcsw; /* context switch counts */
+#ifdef CONFIG_PSI
+	/* PSI task state bitmask: TSK_IOWAIT/TSK_MEMSTALL/TSK_RUNNING */
+	unsigned int psi_flags;
+	/* Set when a wakeup migrated the task: its sleep-persistent PSI
+	 * states were dropped from the old rq and must be re-added. */
+	unsigned sched_psi_wake_requeue:1;
+#endif
 	u64 start_time;		/* monotonic time in nsec */
 	u64 real_start_time;	/* boot based time in nsec */
 /* mm fault and swap info: this can arguably be seen as either mm-specific or thread-specific */
