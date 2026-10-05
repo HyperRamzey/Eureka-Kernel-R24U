@@ -566,6 +566,16 @@ struct root_domain {
 	bool overload;
 
 	/*
+	 * Energy-aware scheduling (EAS) "tipping point": set when any CPU's
+	 * utilization exceeds its margin-adjusted capacity, i.e. when
+	 * energy-aware task packing must give way to spreading.
+	 */
+	bool overutilized;
+
+	/* CPUs with the max/min original capacity in this root domain */
+	int max_cap_orig_cpu, min_cap_orig_cpu;
+
+	/*
 	 * The bit corresponding to a CPU gets set here if such CPU has more
 	 * than one runnable -deadline task (as it is below for RT tasks).
 	 */
@@ -749,7 +759,12 @@ struct rq {
 #ifdef CONFIG_CPU_IDLE
 	/* Must be inspected within a rcu lock section */
 	struct cpuidle_state *idle_state;
+	/* Idle state index, used by EAS idle-aware task placement. */
+	int idle_state_idx;
 #endif
+
+	/* EAS runqueue statistics */
+	struct eas_stats eas_stats;
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -914,6 +929,9 @@ DECLARE_PER_CPU(int, sd_llc_id);
 DECLARE_PER_CPU(struct sched_domain *, sd_numa);
 DECLARE_PER_CPU(struct sched_domain *, sd_busy);
 DECLARE_PER_CPU(struct sched_domain *, sd_asym);
+/* EAS: highest domain with energy data / domain with shared capacity states */
+DECLARE_PER_CPU(struct sched_domain *, sd_ea);
+DECLARE_PER_CPU(struct sched_domain *, sd_scs);
 
 struct sched_group_capacity {
 	atomic_t ref;
@@ -937,6 +955,13 @@ struct sched_group {
 
 	unsigned int group_weight;
 	struct sched_group_capacity *sgc;
+
+	/*
+	 * Energy model of this group, attached at domain build time from
+	 * the sched-energy-costs DT data (EAS). NULL when no energy data
+	 * is available for this group.
+	 */
+	struct sched_group_energy *sge;
 
 	/*
 	 * The CPUs this group covers.
@@ -1395,6 +1420,17 @@ static inline struct cpuidle_state *idle_get_state(struct rq *rq)
 	WARN_ON(!rcu_read_lock_held());
 	return rq->idle_state;
 }
+
+static inline void idle_set_state_idx(struct rq *rq, int idle_state_idx)
+{
+	rq->idle_state_idx = idle_state_idx;
+}
+
+static inline int idle_get_state_idx(struct rq *rq)
+{
+	WARN_ON(!rcu_read_lock_held());
+	return rq->idle_state_idx;
+}
 #else
 static inline void idle_set_state(struct rq *rq,
 				  struct cpuidle_state *idle_state)
@@ -1404,6 +1440,15 @@ static inline void idle_set_state(struct rq *rq,
 static inline struct cpuidle_state *idle_get_state(struct rq *rq)
 {
 	return NULL;
+}
+
+static inline void idle_set_state_idx(struct rq *rq, int idle_state_idx)
+{
+}
+
+static inline int idle_get_state_idx(struct rq *rq)
+{
+	return -1;
 }
 #endif
 
