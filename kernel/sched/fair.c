@@ -4846,6 +4846,17 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!se) {
 		add_nr_running(rq, 1);
 		schedtune_enqueue_task(p, cpu_of(rq));
+
+		/*
+		 * EAS tipping point: a waking task that pushes this CPU past its
+		 * margin-adjusted capacity switches the system to the regular
+		 * load-balancing driven placement.
+		 */
+		if ((flags & ENQUEUE_WAKEUP) && !rq->rd->overutilized &&
+		    cpu_overutilized(rq->cpu)) {
+			rq->rd->overutilized = true;
+			trace_sched_overutilized(true);
+		}
 	}
 
 	hrtick_update(rq);
@@ -7617,13 +7628,26 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 	int thread_pid;
 #endif
 
-	if (sd_flag & SD_BALANCE_WAKE)
-#ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
-		want_affine = !wake_wide(p) && task_fits_max(p, cpu) &&
+	if (sd_flag & SD_BALANCE_WAKE) {
+		/*
+		 * Energy-aware wakeup placement (EAS). Runs before wake_affine
+		 * and before load balancing, and only while the system is below its
+		 * overutilization tipping point -- past that point, performance
+		 * spreading matters more than energy, and the normal path takes
+		 * over. This mirrors upstream 5.4's select_task_rq_fair().
+		 */
+		if (energy_aware() &&
+		    !READ_ONCE(cpu_rq(prev_cpu)->rd->overutilized))
+			return select_energy_cpu_brute(p, prev_cpu, sync);
+
+		/*
+		 * Abort wake_affine when @p fits neither @cpu nor @prev_cpu.
+		 * Upstream calls wake_cap() unconditionally here because it also
+		 * syncs task and CPU utilisation, which the energy model needs.
+		 */
+		want_affine = !wake_wide(p) && !wake_cap(p, cpu, prev_cpu) &&
 			      cpumask_test_cpu(cpu, tsk_cpus_allowed(p));
-#else
-		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, tsk_cpus_allowed(p));
-#endif
+	}
 
 	rcu_read_lock();
 	for_each_domain(cpu, tmp) {
@@ -9179,11 +9203,12 @@ group_type group_classify(struct sched_group *group,
  * @local_group: Does group contain this_cpu.
  * @sgs: variable to hold the statistics for this group.
  * @overload: Indicate more than one runnable task for any CPU.
+ * @overutilized: Indicate overutilization for any CPU (EAS).
  */
 static inline void update_sg_lb_stats(struct lb_env *env,
 			struct sched_group *group, int load_idx,
 			int local_group, struct sg_lb_stats *sgs,
-			bool *overload)
+			bool *overload, bool *overutilized)
 {
 	unsigned long load;
 	int i;
@@ -9213,6 +9238,9 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 		sgs->sum_weighted_load += weighted_cpuload(i);
 		if (idle_cpu(i))
 			sgs->idle_cpus++;
+
+		if (cpu_overutilized(i))
+			*overutilized = true;
 	}
 
 	/* Adjust by relative CPU capacity of the group */
@@ -9307,6 +9335,14 @@ static inline enum fbq_type fbq_classify_rq(struct rq *rq)
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
+/*
+ * lb_sd_parent() is true when @sd is not the top level of its own
+ * sched_domain chain, i.e. when the overutilization flag should be
+ * propagated upwards rather than merely recomputed.
+ */
+#define lb_sd_parent(sd) \
+	(sd->parent && sd->parent->groups != sd->parent->groups->next)
+
 /**
  * update_sd_lb_stats - Update sched_domain's statistics for load balancing.
  * @env: The load balancing environment.
@@ -9318,7 +9354,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 	struct sched_group *sg = env->sd->groups;
 	struct sg_lb_stats tmp_sgs;
 	int load_idx, prefer_sibling = 0;
-	bool overload = false;
+	bool overload = false, overutilized = false;
 
 	if (child && child->flags & SD_PREFER_SIBLING)
 		prefer_sibling = 1;
@@ -9338,7 +9374,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 		}
 
 		update_sg_lb_stats(env, sg, load_idx, local_group, sgs,
-						&overload);
+						&overload, &overutilized);
 
 		if (local_group)
 			goto next_group;
@@ -9376,10 +9412,26 @@ next_group:
 	if (env->sd->flags & SD_NUMA)
 		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
 
-	if (!env->sd->parent) {
+	if (!lb_sd_parent(env->sd)) {
 		/* update overload indicator if we are at root domain */
 		if (env->dst_rq->rd->overload != overload)
 			env->dst_rq->rd->overload = overload;
+
+		/*
+		 * Update the over-utilization (tipping point, U >= 0) indicator.
+		 * At the top domain this is an exact recomputation; below it, only
+		 * latch it on -- clearing it early would let EAS resume packing
+		 * while a busy lower domain is still over its capacity.
+		 */
+		if (env->dst_rq->rd->overutilized != overutilized) {
+			env->dst_rq->rd->overutilized = overutilized;
+			trace_sched_overutilized(overutilized);
+		}
+	} else {
+		if (!env->dst_rq->rd->overutilized && overutilized) {
+			env->dst_rq->rd->overutilized = true;
+			trace_sched_overutilized(true);
+		}
 	}
 
 }
@@ -10777,12 +10829,17 @@ static inline bool nohz_kick_needed(struct rq *rq)
 		return false;
 #endif
 
-	if (rq->nr_running >= 2)
+	/*
+	 * With EAS active, a CPU is only kicked early once it is actually
+	 * overutilized; packing idle CPUs is what saves energy.
+	 */
+	if (rq->nr_running >= 2 &&
+	    (!energy_aware() || cpu_overutilized(cpu)))
 		return true;
 
 	rcu_read_lock();
 	sd = rcu_dereference(per_cpu(sd_busy, cpu));
-	if (sd) {
+	if (sd && !energy_aware()) {
 		sgc = sd->groups->sgc;
 		nr_busy = atomic_read(&sgc->nr_busy_cpus);
 
@@ -11573,6 +11630,14 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	if (IS_ENABLED(CONFIG_NUMA_BALANCING) &&
 	    static_branch_unlikely(&sched_numa_balancing))
 		task_tick_numa(rq, curr);
+
+#ifdef CONFIG_SMP
+	/* EAS tipping point detection on the regular tick */
+	if (!rq->rd->overutilized && cpu_overutilized(task_cpu(curr))) {
+		rq->rd->overutilized = true;
+		trace_sched_overutilized(true);
+	}
+#endif
 
 	hp_event_update(&curr->se);
 }
