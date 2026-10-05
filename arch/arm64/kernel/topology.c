@@ -19,6 +19,7 @@
 #include <linux/nodemask.h>
 #include <linux/of.h>
 #include <linux/sched.h>
+#include <linux/sched_energy.h>
 #include <linux/slab.h>
 
 #include <asm/cputype.h>
@@ -49,6 +50,14 @@ static void set_power_scale(unsigned int cpu, unsigned long power)
 }
 
 static DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
+
+/*
+ * Highest cpufreq max frequency across all policies, and the CPU that
+ * reaches it. EAS needs a real capacity spread between the clusters: see
+ * arm64_init_cpu_capacities() for why this tree cannot use the DT
+ * "clock-frequency" / table_efficiency[] path.
+ */
+static unsigned long max_cpu_freq_capacity;
 
 unsigned long scale_cpu_capacity(struct sched_domain *sd, int cpu)
 {
@@ -284,7 +293,7 @@ out:
 
 static void __init parse_dt_cpu_power(void)
 {
-	const struct cpu_efficiency *cpu_eff;
+const struct cpu_efficiency *cpu_eff;
 	struct device_node *cn;
 	unsigned long min_capacity = ULONG_MAX;
 	unsigned long max_capacity = 0;
@@ -296,6 +305,9 @@ static void __init parse_dt_cpu_power(void)
 
 	pcpu_efficiency = kcalloc(nr_cpu_ids, sizeof(*pcpu_efficiency),
 				 GFP_NOWAIT);
+
+	if (!__cpu_capacity || !pcpu_efficiency)
+		return;
 
 	for_each_possible_cpu(cpu) {
 		const u32 *rate;
@@ -319,14 +331,47 @@ static void __init parse_dt_cpu_power(void)
 
 		pcpu_efficiency[cpu] = cpu_eff->efficiency;
 
-		rate = of_get_property(cn, "clock-frequency", &len);
-		if (!rate || len != 4) {
-			pr_err("%s: Missing clock-frequency property\n",
-				cn->full_name);
-			continue;
-		}
+		/*
+		 * Relative throughput comes from the CPU's own efficiency, scaled
+		 * by the ratio of its cpufreq policy's max frequency to the
+		 * fastest policy on the system. The original tree read
+		 * "clock-frequency" from the cpu node instead, but no exynos
+		 * board defines that property, so every CPU ended up with zero
+		 * capacity and update_cpu_power() bailed out -- leaving cpu_scale
+		 * identical for all cores and no big.LITTLE spread at all. Reading
+		 * the cpufreq limit is both always available and closer to the
+		 * truth, since on this SoC the cluster ratio is mostly frequency.
+		 *
+		 * A CPU with no cpufreq policy yet gets the system maximum, i.e. it
+		 * does not perturb the reference point.
+		 */
+#ifdef CONFIG_CPU_FREQ
+		{
+			unsigned long cpu_max = cpufreq_scale_max_freq_capacity(cpu);
 
-		capacity = ((be32_to_cpup(rate)) >> 20) * cpu_eff->efficiency;
+			/*
+			 * max_freq_scale is (policy_max << SHIFT)/policy_hw_max, so it
+			 * is 1024 only while the policy still runs at its hardware max.
+			 * Normalising by the fastest policy therefore yields a
+			 * cluster-proportional capacity in [0..1024].
+			 */
+			if (!cpu_max)
+				cpu_max = SCHED_CAPACITY_SCALE;
+			else if (cpu_max > max_cpu_freq_capacity)
+			max_cpu_freq_capacity = cpu_max;
+
+			capacity = ((unsigned long)SCHED_POWER_SCALE * cpu_max) /
+				   (max_cpu_freq_capacity ? max_cpu_freq_capacity
+							    : SCHED_CAPACITY_SCALE);
+			capacity = capacity * cpu_eff->efficiency /
+				   table_efficiency[1].efficiency;
+		}
+#else
+		capacity = cpu_eff->efficiency;
+#endif
+
+		if (!capacity)
+			capacity = 1;
 
 		/* Save min capacity of the system */
 		if (capacity < min_capacity)
@@ -664,6 +709,84 @@ static void __init reset_cpu_power(void)
 		set_power_scale(cpu, SCHED_POWER_SCALE);
 }
 
+/*
+ * sched-energy-costs energy callbacks (EAS).
+ *
+ * kernel/sched/energy.c parses the per-CPU "sched-energy-costs" phandle
+ * array into sge_array[cpu][sd_level], indexed by topology level. These
+ * callbacks hand the generic scheduler the model for each level.
+ */
+static const struct sched_group_energy * const cpu_sge(int cpu, int level)
+{
+#ifdef CONFIG_SMP
+	if (level < 0 || level >= NR_SD_LEVELS)
+		return NULL;
+	return sge_array[cpu][level];
+#else
+	return NULL;
+#endif
+}
+
+/* Energy model of a single CPU (the MC/domain level). */
+static const struct sched_group_energy * const cpu_core_energy(int cpu)
+{
+	return cpu_sge(cpu, SD_LEVEL0);
+}
+
+/* Energy model of a whole cluster (the DIE/domain level). */
+static const struct sched_group_energy * const cpu_cluster_energy(int cpu)
+{
+	return cpu_sge(cpu, SD_LEVEL1);
+}
+
+/*
+ * The MC level groups CPUs of one cluster, so it shares power resources and
+ * capacity states, and carries the asymmetric-capacity flag the
+ * big.LITTLE load-balance scan in fair.c keys off.
+ */
+static int cpu_corepower_flags(void)
+{
+	return SD_SHARE_PKG_RESOURCES  | SD_SHARE_CAP_STATES |
+	       SD_ASYM_CPUCAPACITY | SD_SHARE_POWERDOMAIN;
+}
+
+/*
+ * The top level spans the whole package (here: one SoC).
+ *
+ * CONFIG_DISABLE_CPU_SCHED_DOMAIN_BALANCE exists in this tree because
+ * Samsung's HMP scheduler wanted no load balancing at the package level --
+ * HMP did cross-cluster migration itself, by threshold. With HMP gone
+ * nothing else moves load between the clusters, and EAS only picks a target
+ * at wakeup time, so package-level balancing has to stay enabled or a
+ * cluster can be left stranded. SD_NO_LOAD_BALANCE is therefore only kept
+ * while CONFIG_SCHED_HMP is selected.
+ */
+static int cpu_pkg_flags(void)
+{
+	int flags = SD_SHARE_CPUCAPACITY | SD_SHARE_PKG_RESOURCES;
+
+#ifdef CONFIG_SCHED_HMP
+	flags |= SD_NO_LOAD_BALANCE;
+#endif
+
+	return flags;
+}
+
+/*
+ * Bottom-up topology list. Without this the scheduler falls back to
+ * core.c's default_topology[], which has no .energy callback at all --
+ * sched_group->sge stays NULL, sd_ea is NULL and EAS never engages.
+ */
+static struct sched_domain_topology_level arm64_topology[] = {
+#ifdef CONFIG_SCHED_MC
+	{ cpu_coregroup_mask, cpu_corepower_flags, cpu_core_energy,
+	  SD_INIT_NAME(MC) },
+#endif
+	{ cpu_cpu_mask, cpu_pkg_flags, cpu_cluster_energy,
+	  SD_INIT_NAME(DIE) },
+	{ NULL, },
+};
+
 void __init init_cpu_topology(void)
 {
 	reset_cpu_topology();
@@ -677,4 +800,8 @@ void __init init_cpu_topology(void)
 
 	reset_cpu_power();
 	parse_dt_cpu_power();
+
+#ifdef CONFIG_SMP
+	set_sched_topology(arm64_topology);
+#endif
 }
