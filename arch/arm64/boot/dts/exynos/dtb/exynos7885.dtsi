@@ -159,6 +159,7 @@
 			cpu-idle-states = <&BOOTCL_CPU_SLEEP>;
 			#cooling-cells = <2>; /* min followed by max */
 			logical-id = <0>;
+			sched-energy-costs = <&CPU_COST_LITTLE &CLUSTER_COST_LITTLE>;
 		};
 
 		cpu1:cpu@101 {
@@ -168,6 +169,7 @@
 			enable-method = "psci";
 			cpu-idle-states = <&BOOTCL_CPU_SLEEP>;
 			logical-id = <1>;
+			sched-energy-costs = <&CPU_COST_LITTLE &CLUSTER_COST_LITTLE>;
 		};
 
 		cpu2:cpu@102 {
@@ -177,6 +179,7 @@
 			enable-method = "psci";
 			cpu-idle-states = <&BOOTCL_CPU_SLEEP>;
 			logical-id = <2>;
+			sched-energy-costs = <&CPU_COST_LITTLE &CLUSTER_COST_LITTLE>;
 		};
 
 		cpu3:cpu@103 {
@@ -186,6 +189,7 @@
 			enable-method = "psci";
 			cpu-idle-states = <&BOOTCL_CPU_SLEEP>;
 			logical-id = <3>;
+			sched-energy-costs = <&CPU_COST_LITTLE &CLUSTER_COST_LITTLE>;
 		};
 
 		cpu4:cpu@200 {
@@ -196,6 +200,7 @@
 			cpu-idle-states = <&NONBOOTCL_CPU_SLEEP>;
 			logical-id = <4>;
 			sched_skip = <1>;
+			sched-energy-costs = <&CPU_COST_LITTLE &CLUSTER_COST_LITTLE>;
 		};
 
 		cpu5:cpu@201 {
@@ -206,6 +211,7 @@
 			cpu-idle-states = <&NONBOOTCL_CPU_SLEEP>;
 			logical-id = <5>;
 			sched_skip = <1>;
+			sched-energy-costs = <&CPU_COST_LITTLE &CLUSTER_COST_LITTLE>;
 		};
 
 		cpu6: cpu@0 {
@@ -216,6 +222,7 @@
 			cpu-idle-states = <&NONBOOTCL_CPU_SLEEP>;
 			#cooling-cells = <2>; /* min followed by max */
 			logical-id = <6>;
+			sched-energy-costs = <&CPU_COST_BIG &CLUSTER_COST_BIG>;
 		};
 
 		cpu7:cpu@1 {
@@ -225,7 +232,89 @@
 			enable-method = "psci";
 			cpu-idle-states = <&NONBOOTCL_CPU_SLEEP>;
 			logical-id = <7>;
+			sched-energy-costs = <&CPU_COST_BIG &CLUSTER_COST_BIG>;
 		};
+
+
+	/*
+	 * EAS energy cost model (arch/arm64/boot/dts/.../exynos7885.dtsi)
+	 *
+	 * Capacities are normalised to SCHED_CAPACITY_SCALE (1024) against the
+	 * fastest CPU on the system, which is an A73 at 2288000 kHz. Each point
+	 * is a real cpufreq constraint step from the cpufreq domains in
+	 * exynos7904-a30s_common.dtsi; power is a per-cluster linear model in
+	 * mW, only meaningful as a ratio between the two clusters and across
+	 * capacity points.
+	 *
+	 * cpus 0-5 are Cortex-A53 (max 1690000 kHz -> capacity 756)
+	 * cpus 6-7 are Cortex-A73 (max 2288000 kHz -> capacity 1024)
+	 */
+	energy-costs {
+		/* One Cortex-A53 at 1690000/1690000 of the reference frequency. */
+		CPU_COST_LITTLE: core-cost-little {
+			busy-cost-data = <
+				189 28
+				265 44
+				378 74
+				529 128
+				645 186
+				756 265
+			>;
+			idle-cost-data = <
+				14
+				3
+			>;
+		};
+
+		/* One Cortex-A73 at 2288000/2288000 of the reference frequency. */
+		CPU_COST_BIG: core-cost-big {
+			busy-cost-data = <
+				319 63
+				447 105
+				638 177
+				893 306
+				1024 421
+			>;
+			idle-cost-data = <
+				27
+				6
+			>;
+		};
+
+		/*
+		 * The little cluster's shared supply/thermal domain: six A53s
+		 * plus its own always-on overhead.
+		 */
+		CLUSTER_COST_LITTLE: cluster-cost-little {
+			busy-cost-data = <
+				189 62
+				265 100
+				378 172
+				529 301
+				645 443
+				756 639
+			>;
+			idle-cost-data = <
+				32
+				18
+			>;
+		};
+
+		/* The big cluster's shared domain: two A73s plus overhead. */
+		CLUSTER_COST_BIG: cluster-cost-big {
+			busy-cost-data = <
+				319 96
+				447 163
+				638 281
+				893 498
+				1024 694
+			>;
+			idle-cost-data = <
+				48
+				27
+			>;
+		};
+	};
 
 		idle-states {
 			entry-method = "arm,psci";
