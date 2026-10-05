@@ -49,6 +49,10 @@ struct target_nrg {
 
 #ifdef CONFIG_CGROUP_SCHEDTUNE
 
+/* True once the schedtune cgroups exist (EAS relies on this to bail out
+ * early, before the energy model has been bound). */
+extern bool schedtune_initialized;
+
 int schedtune_cpu_boost(int cpu);
 int schedtune_task_boost(struct task_struct *tsk);
 
@@ -64,6 +68,8 @@ void schedtune_dequeue_task(struct task_struct *p, int cpu);
 #define schedtune_cpu_boost(cpu)  get_sysctl_sched_cfs_boost()
 #define schedtune_task_boost(tsk) get_sysctl_sched_cfs_boost()
 
+#define schedtune_prefer_idle(tsk) 0
+
 #define schedtune_exit_task(task) do { } while (0)
 
 #define schedtune_enqueue_task(task, cpu) do { } while (0)
@@ -72,6 +78,8 @@ void schedtune_dequeue_task(struct task_struct *p, int cpu);
 #endif /* CONFIG_CGROUP_SCHEDTUNE */
 
 int schedtune_normalize_energy(int energy);
+
+extern struct target_nrg schedtune_target_nrg;
 int schedtune_accept_deltas(int nrg_delta, int cap_delta,
                            struct task_struct *task);
 
@@ -79,6 +87,8 @@ int schedtune_accept_deltas(int nrg_delta, int cap_delta,
 
 #define schedtune_cpu_boost(cpu)  0
 #define schedtune_task_boost(tsk) 0
+
+#define schedtune_prefer_idle(tsk) 0
 
 #define schedtune_exit_task(task) do { } while (0)
 

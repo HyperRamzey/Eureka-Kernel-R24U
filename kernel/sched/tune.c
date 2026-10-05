@@ -10,6 +10,66 @@
 
 unsigned int sysctl_sched_cfs_boost __read_mostly;
 
+/*
+ * System energy normalization constants, computed from the platform
+ * energy model at late init (EAS). While min/max are zero the payoff
+ * computation falls back to the raw energy delta.
+ */
+struct target_nrg schedtune_target_nrg;
+
+/*
+ * Performance/Energy threshold hysteresis (EAS SchedTune). Each entry
+ * maps a boost range to a (nrg_gain, cap_gain) pair used by the payoff
+ * computation in __schedtune_accept_deltas().
+ */
+struct threshold_params {
+	int nrg_gain;
+	int cap_gain;
+};
+
+static struct threshold_params
+threshold_gains[] = {
+	{ 0, 5 }, /*   < 10% */
+	{ 1, 5 }, /*   < 20% */
+	{ 2, 5 }, /*   < 30% */
+	{ 3, 5 }, /*   < 40% */
+	{ 4, 5 }, /*   < 50% */
+	{ 5, 4 }, /*   < 60% */
+	{ 5, 3 }, /*   < 70% */
+	{ 5, 2 }, /*   < 80% */
+	{ 5, 1 }, /*   < 90% */
+	{ 5, 0 }  /* <= 100% */
+};
+
+/*
+ * Evaluate an (energy, capacity) variation pair. A positive payoff is the
+ * accept condition for the candidate scheduling decision.
+ */
+static int
+__schedtune_accept_deltas(int nrg_delta, int cap_delta,
+			  int perf_boost_idx, int perf_constrain_idx)
+{
+	int payoff = -INT_MAX;
+	int gain_idx = -1;
+
+	/* Performance Boost (B) region */
+	if (nrg_delta >= 0 && cap_delta > 0)
+		gain_idx = perf_boost_idx;
+	/* Performance Constraint (C) region */
+	else if (nrg_delta < 0 && cap_delta <= 0)
+		gain_idx = perf_constrain_idx;
+
+	/* Default: reject the schedule candidate */
+	if (gain_idx == -1)
+		return payoff;
+
+	/* payoff = (cap_delta * nrg_gain) - (cap_gain * nrg_delta) */
+	payoff  = cap_delta * threshold_gains[gain_idx].nrg_gain;
+	payoff -= nrg_delta * threshold_gains[gain_idx].cap_gain;
+
+	return payoff;
+}
+
 #ifdef CONFIG_CGROUP_SCHEDTUNE
 
 bool schedtune_initialized = false;
@@ -29,6 +89,14 @@ struct schedtune {
 	/* Boost value for tasks on that SchedTune CGroup */
 	int boost;
 
+	/* Performance Boost (B) region threshold index */
+	int perf_boost_idx;
+
+	/* Performance Constraint (C) region threshold index */
+	int perf_constrain_idx;
+
+	/* Bias placement of this group towards idle CPUs */
+	int prefer_idle;
 };
 
 static inline struct schedtune *css_st(struct cgroup_subsys_state *css)
@@ -58,6 +126,9 @@ static inline struct schedtune *parent_st(struct schedtune *st)
 static struct schedtune
 root_schedtune = {
 	.boost	= 0,
+	.perf_boost_idx = 0,
+	.perf_constrain_idx = 0,
+	.prefer_idle = 0,
 };
 
 /*
@@ -316,6 +387,53 @@ int schedtune_task_boost(struct task_struct *p)
 	return task_boost;
 }
 
+int schedtune_prefer_idle(struct task_struct *p)
+{
+	struct schedtune *st;
+	int prefer_idle;
+
+	if (!unlikely(schedtune_initialized))
+		return 0;
+
+	rcu_read_lock();
+	st = task_schedtune(p);
+	prefer_idle = st->prefer_idle;
+	rcu_read_unlock();
+
+	return prefer_idle;
+}
+
+/*
+ * EAS: accept or reject a candidate scheduling decision expressed as an
+ * (energy, capacity) variation pair, using the boost group's configured
+ * performance/energy thresholds.
+ */
+int
+schedtune_accept_deltas(int nrg_delta, int cap_delta,
+			struct task_struct *task)
+{
+	struct schedtune *ct;
+	int perf_boost_idx;
+	int perf_constrain_idx;
+
+	/* Optimal (O) region */
+	if (nrg_delta < 0 && cap_delta > 0)
+		return INT_MAX;
+
+	/* Suboptimal (S) region */
+	if (nrg_delta > 0 && cap_delta < 0)
+		return -INT_MAX;
+
+	rcu_read_lock();
+	ct = task_schedtune(task);
+	perf_boost_idx = ct->perf_boost_idx;
+	perf_constrain_idx = ct->perf_constrain_idx;
+	rcu_read_unlock();
+
+	return __schedtune_accept_deltas(nrg_delta, cap_delta,
+			perf_boost_idx, perf_constrain_idx);
+}
+
 static u64
 boost_read(struct cgroup_subsys_state *css, struct cftype *cft)
 {
@@ -361,11 +479,92 @@ static int prefer_high_cap_write(struct cgroup_subsys_state *css,
 	return 0;
 }
 
+static u64
+prefer_idle_read(struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	struct schedtune *st = css_st(css);
+
+	return st->prefer_idle;
+}
+
+static int
+prefer_idle_write(struct cgroup_subsys_state *css, struct cftype *cft,
+	    u64 prefer_idle)
+{
+	struct schedtune *st = css_st(css);
+
+	if (prefer_idle > 1)
+		return -EINVAL;
+
+	st->prefer_idle = prefer_idle;
+
+	return 0;
+}
+
+static u64
+perf_boost_read(struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	struct schedtune *st = css_st(css);
+
+	return st->perf_boost_idx;
+}
+
+static int
+perf_boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
+	    u64 perf_boost)
+{
+	struct schedtune *st = css_st(css);
+
+	if (perf_boost >= BOOSTGROUPS_COUNT)
+		return -EINVAL;
+
+	st->perf_boost_idx = (int)perf_boost;
+
+	return 0;
+}
+
+static u64
+perf_constrain_read(struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	struct schedtune *st = css_st(css);
+
+	return st->perf_constrain_idx;
+}
+
+static int
+perf_constrain_write(struct cgroup_subsys_state *css, struct cftype *cft,
+	    u64 perf_constrain)
+{
+	struct schedtune *st = css_st(css);
+
+	if (perf_constrain >= BOOSTGROUPS_COUNT)
+		return -EINVAL;
+
+	st->perf_constrain_idx = (int)perf_constrain;
+
+	return 0;
+}
+
 static struct cftype files[] = {
 	{
 		.name = "boost",
 		.read_u64 = boost_read,
 		.write_u64 = boost_write,
+	},
+	{
+		.name = "prefer_idle",
+		.read_u64 = prefer_idle_read,
+		.write_u64 = prefer_idle_write,
+	},
+	{
+		.name = "perf_boost",
+		.read_u64 = perf_boost_read,
+		.write_u64 = perf_boost_write,
+	},
+	{
+		.name = "perf_constrain",
+		.read_u64 = perf_constrain_read,
+		.write_u64 = perf_constrain_write,
 	},
 	{
 		.name = "prefer_high_cap",
@@ -484,7 +683,143 @@ struct cgroup_subsys schedtune_cgrp_subsys = {
 	.early_init	= 1,
 };
 
+#else /* CONFIG_CGROUP_SCHEDTUNE */
+
+/*
+ * System-wide only boosting: evaluate the energy/performance tradeoff
+ * with the default (index 0) threshold gains.
+ */
+int
+schedtune_accept_deltas(int nrg_delta, int cap_delta,
+			struct task_struct *task)
+{
+	/* Optimal (O) region */
+	if (nrg_delta < 0 && cap_delta > 0)
+		return INT_MAX;
+
+	/* Suboptimal (S) region */
+	if (nrg_delta > 0 && cap_delta < 0)
+		return -INT_MAX;
+
+	return __schedtune_accept_deltas(nrg_delta, cap_delta, 0, 0);
+}
+
 #endif /* CONFIG_CGROUP_SCHEDTUNE */
+
+#ifdef CONFIG_SMP
+#include <linux/sched_energy.h>
+
+/*
+ * Accumulate a cluster's and its CPUs' energy into the system-wide
+ * normalization constants (EAS).
+ */
+static void
+schedtune_add_cluster_nrg(struct sched_group *sg,
+		struct target_nrg *ste)
+{
+	struct sched_domain *sd2;
+	struct sched_group *sg2;
+	const struct cpumask *cluster_cpus;
+	char str[32];
+	unsigned long min_pwr;
+	unsigned long max_pwr;
+	int cpu;
+
+	cluster_cpus = sched_group_cpus(sg);
+	snprintf(str, 32, "CLUSTER[%*pbl]", cpumask_pr_args(cluster_cpus));
+
+	min_pwr = sg->sge->idle_states[sg->sge->nr_idle_states - 1].power;
+	max_pwr = sg->sge->cap_states[sg->sge->nr_cap_states - 1].power;
+	pr_info("schedtune: %-17s min_pwr: %5lu max_pwr: %5lu\n",
+		str, min_pwr, max_pwr);
+
+	ste->min_power += min_pwr;
+	ste->max_power += max_pwr;
+
+	for_each_cpu(cpu, cluster_cpus) {
+		for_each_domain(cpu, sd2) {
+			sg2 = sd2->groups;
+
+			/* Skip non-CPU groups (i.e. cluster groups) */
+			if (sg2->group_weight != 1)
+				continue;
+			if (!sg2->sge)
+				continue;
+
+			min_pwr = sg2->sge->idle_states[sg2->sge->nr_idle_states - 1].power;
+			max_pwr = sg2->sge->cap_states[sg2->sge->nr_cap_states - 1].power;
+
+			ste->min_power += min_pwr;
+			ste->max_power += max_pwr;
+
+			snprintf(str, 32, "CPU[%d]", cpu);
+			pr_info("schedtune: %-17s min_pwr: %5lu max_pwr: %5lu\n",
+				str, min_pwr, max_pwr);
+			break;
+		}
+	}
+}
+
+/*
+ * Initialize the constants required to compute normalized energy. The
+ * values depend on the energy model of the target system and its topology,
+ * so this runs at late_initcall when the sched domains and the model
+ * binding are guaranteed to be in place.
+ */
+static int __init
+schedtune_init_nrg(void)
+{
+	struct target_nrg *ste = &schedtune_target_nrg;
+	unsigned long delta_pwr = 0;
+	struct sched_domain *sd;
+	struct sched_group *sg;
+
+	ste->max_power = 0;
+	ste->min_power = 0;
+
+	if (!sched_energy_present) {
+		pr_info("schedtune: no energy model data, EAS energy normalization disabled\n");
+		return 0;
+	}
+
+	pr_info("schedtune: init normalization constants...\n");
+
+	rcu_read_lock();
+
+	/* With EAS in use we always have a pointer to the highest SD
+	 * which provides energy model data. */
+	sd = rcu_dereference(per_cpu(sd_ea, cpumask_first(cpu_online_mask)));
+	if (!sd) {
+		pr_info("schedtune: no energy model data\n");
+		goto nodata;
+	}
+
+	sg = sd->groups;
+	do {
+		if (sg->sge)
+			schedtune_add_cluster_nrg(sg, ste);
+	} while (sg = sg->next, sg != sd->groups);
+
+	rcu_read_unlock();
+
+	pr_info("schedtune: %-17s min_pwr: %5lu max_pwr: %5lu\n",
+		"SYSTEM", ste->min_power, ste->max_power);
+
+	delta_pwr = ste->max_power - ste->min_power;
+	if (delta_pwr)
+		ste->rdiv = reciprocal_value(delta_pwr);
+	pr_info("schedtune: using normalization constants mul: %u sh1: %u sh2: %u\n",
+		ste->rdiv.m, ste->rdiv.sh1, ste->rdiv.sh2);
+
+	return 0;
+
+nodata:
+	pr_warn("schedtune: energy normalization disabled\n");
+	rcu_read_unlock();
+	return -EINVAL;
+}
+late_initcall(schedtune_init_nrg);
+#endif /* CONFIG_SMP */
 
 #ifdef CONFIG_FREQVAR_SCHEDTUNE
 static struct freqvar_boost_state freqvar_boost_state[CONFIG_NR_CPUS];
