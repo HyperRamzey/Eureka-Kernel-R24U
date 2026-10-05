@@ -3448,19 +3448,20 @@ static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
 #endif
 
 /*
- * Bring a task's load average up to date without enqueuing it.
- * EAS needs this before comparing task utilisation against a CPU's
- * capacity on the wakeup path.
+ * Bring a task's load average up to date with the cfs_rq it last ran on,
+ * without enqueuing it. EAS needs this before comparing task utilisation
+ * against a CPU's capacity on the wakeup path.
+ *
+ * The task being woken is, by definition, NOT on a runqueue (se->on_rq is 0
+ * in try_to_wake_up() -> select_task_rq()), so this must not bail out on
+ * !on_rq: that would turn it into a no-op for its only use, leaving the
+ * sleeper's util_avg undecayed since it blocked.
  */
-void sync_entity_load_avg(struct sched_entity *se)
+static inline void sync_entity_load_avg(struct sched_entity *se)
 {
-	struct cfs_rq *cfs_rq;
+	struct cfs_rq *cfs_rq = cfs_rq_of(se);
 	u64 last_update_time;
 
-	if (!se->on_rq)
-		return;
-
-	cfs_rq = cfs_rq_of(se);
 	last_update_time = cfs_rq_last_update_time(cfs_rq);
 
 	__update_load_avg(last_update_time, cpu_of(rq_of(cfs_rq)),
@@ -7272,8 +7273,12 @@ static inline int normalize_energy(int energy_diff)
 {
 	u32 normalized_nrg;
 
-	/* During early setup the extents are not yet known */
-	if (unlikely(!schedtune_initialized))
+	/*
+	 * During early setup the extents are not yet known:
+	 * schedtune_initialized is set when the first schedtune cgroup is
+	 * allocated, but the constants are only computed at late_initcall.
+	 */
+	if (unlikely(!schedtune_initialized || !schedtune_target_nrg.max_power))
 		return energy_diff < 0 ? -1 : 1 ;
 
 	/* Do the scaling using positive numbers to increase the range */
@@ -7339,10 +7344,6 @@ static bool cpu_overutilized(int cpu)
 }
 
 /*
- * cpu_util_next(): CPU utilisation with any contribution from the migrating
- * task @p removed (dst_cpu != cpu) or added (dst_cpu == cpu).
- */
-/*
  * cpu_util_wake(): CPU utilisation with any contribution from the waking
  * task @p removed.
  */
@@ -7358,19 +7359,6 @@ static unsigned long cpu_util_wake(int cpu, struct task_struct *p)
 	util = max_t(long, cpu_util(cpu) - task_util(p), 0);
 
 	return (util >= capacity) ? capacity : util;
-}
-
-static unsigned long cpu_util_next(int cpu, struct task_struct *p, int dst_cpu)
-{
-	struct cfs_rq *cfs_rq = &cpu_rq(cpu)->cfs;
-	unsigned long util = READ_ONCE(cfs_rq->avg.util_avg);
-
-	if (task_cpu(p) == cpu && dst_cpu != cpu)
-		util = max_t(long, util - task_util(p), 0);
-	else if (task_cpu(p) != cpu && dst_cpu == cpu)
-		util += task_util(p);
-
-	return min(util, capacity_orig_of(cpu));
 }
 
 static int start_cpu(bool boosted)
@@ -7637,8 +7625,15 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 		 * over. This mirrors upstream 5.4's select_task_rq_fair().
 		 */
 		if (energy_aware() &&
-		    !READ_ONCE(cpu_rq(prev_cpu)->rd->overutilized))
+		    !READ_ONCE(cpu_rq(prev_cpu)->rd->overutilized)) {
+			/*
+			 * Decay the sleeper's utilisation up to now: the energy
+			 * model compares task_util(p) against CPU capacity, and
+			 * wake_cap() (which would do this) is not reached here.
+			 */
+			sync_entity_load_avg(&p->se);
 			return select_energy_cpu_brute(p, prev_cpu, sync);
+		}
 
 		/*
 		 * Abort wake_affine when @p fits neither @cpu nor @prev_cpu.
