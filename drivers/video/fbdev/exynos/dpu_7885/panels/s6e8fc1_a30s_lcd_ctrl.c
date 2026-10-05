@@ -1356,6 +1356,23 @@ static ssize_t mask_brightness_store(struct device *dev,
 	if (value > 0) {
 		decon = get_decon_drvdata(0);
 		if (decon) {
+			/*
+			 * Force a REAL false -> true transition.
+			 * decon_set_mask_layer() early-returns when
+			 * regs->mask_layer == current_mask_layer, and
+			 * current_mask_layer is already true from boot, so
+			 * merely arming force_mask_layer is a no-op and the
+			 * panel is never touched - then any later path with
+			 * force_mask_layer == false takes the release branch
+			 * and zeroes actual_mask_brightness. Measured on
+			 * kernel #71: mask(337) to current(1), actual_mask=0,
+			 * enrollment screen black with no lit sensor target.
+			 *
+			 * Clearing current_mask_layer first makes the driver
+			 * run the apply branch for real, which emits at
+			 * mask_brightness and publishes the readback.
+			 */
+			decon->current_mask_layer = false;
 			decon->force_mask_layer = true;
 			decon_fingerprint_illum_apply(decon);
 		}
