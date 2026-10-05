@@ -111,7 +111,14 @@ void gpu_destroy_context(void *ctx)
 #if MALI_SEC_PROBE_TEST != 1
 	struct kbase_context *kctx;
 	struct kbase_device *kbdev;
-#if (defined(CONFIG_SCHED_EMS) || defined(CONFIG_SCHED_EHMP) || defined(CONFIG_SCHED_HMP) || defined(CONFIG_MALI_SEC_VK_BOOST))
+/*
+ * CONFIG_MALI_SEC_CL_BOOST belongs in this guard: it uses `platform` too,
+ * and with CONFIG_SCHED_HMP gone it was the only remaining config that
+ * could be true, so the declaration disappeared while the use stayed.
+ */
+#if (defined(CONFIG_SCHED_EMS) || defined(CONFIG_SCHED_EHMP) || \
+	defined(CONFIG_SCHED_HMP) || defined(CONFIG_MALI_SEC_VK_BOOST) || \
+	defined(CONFIG_MALI_SEC_CL_BOOST))
 	struct exynos_context *platform;
 #endif
 
