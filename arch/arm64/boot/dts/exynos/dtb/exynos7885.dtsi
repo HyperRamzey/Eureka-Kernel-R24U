@@ -237,81 +237,101 @@
 
 
 	/*
-	 * EAS energy cost model (arch/arm64/boot/dts/.../exynos7885.dtsi)
+	 * EAS energy cost model -- Galaxy A30s (exynos7904 on the exynos7885 base).
 	 *
-	 * Capacities are normalised to SCHED_CAPACITY_SCALE (1024) against the
-	 * fastest CPU on the system, which is an A73 at 2288000 kHz. Each point
-	 * is a real cpufreq constraint step from the cpufreq domains in
-	 * exynos7904-a30s_common.dtsi; power is a per-cluster linear model in
-	 * mW, only meaningful as a ratio between the two clusters and across
-	 * capacity points.
+	 * Capacity points are the real a30s cpufreq steps (dtbo
+	 * exynos7904-a30s_common.dtsi: little 208..1794 MHz, big 208..2288 MHz),
+	 * scaled so the fastest CPU (A73 @ 2288 MHz) is SCHED_CAPACITY_SCALE and
+	 * the A53 is scaled by the same efficiency ratio as table_efficiency[] in
+	 * arch/arm64/kernel/topology.c (2048 : 5035):
+	 *     cap(f) = 1024 * f * eff / (2288000 * 5035)
+	 * arch/arm64/kernel/topology.c takes each CPU's capacity_orig from the TOP
+	 * point of its core-cost node, so the two can never disagree: change a
+	 * top point here and the CPU capacity follows.
 	 *
-	 * cpus 0-5 are Cortex-A53 (max 1690000 kHz -> capacity 756)
-	 * cpus 6-7 are Cortex-A73 (max 2288000 kHz -> capacity 1024)
+	 * Power is a first-order f*V^2 + leakage estimate in mW, NOT measured
+	 * data. It is only used as ratios; calibrate it on the device.
+	 *
+	 * idle-cost-data has 1 + (number of cpuidle states) entries: index 0 is
+	 * "active idle" (not in a cpuidle state), index N+1 is cpuidle state N.
+	 * The exynos64 cpuidle driver registers WFI (0) and c2 (1) => 3 entries.
+	 * kernel/sched/fair.c group_idle_state() indexes idle_states[state + 1],
+	 * so a shorter array is read out of bounds.
 	 */
 	energy-costs {
-		/* One Cortex-A53 at 1690000/1690000 of the reference frequency. */
+		/* One Cortex-A53 */
 		CPU_COST_LITTLE: core-cost-little {
 			busy-cost-data = <
-				189 28
-				265 44
-				378 74
-				529 128
-				645 186
-				756 265
+				62    33
+				82    44
+				123   73
+				164   109
+				208   157
+				246   207
+				289   273
+				327   342
 			>;
 			idle-cost-data = <
-				14
-				3
+				8	/* active idle (not in cpuidle) */
+				8	/* cpuidle state 0: WFI (c1) */
+				1	/* cpuidle state 1: c2 */
 			>;
 		};
 
-		/* One Cortex-A73 at 2288000/2288000 of the reference frequency. */
+		/* One Cortex-A73 */
 		CPU_COST_BIG: core-cost-big {
 			busy-cost-data = <
-				319 63
-				447 105
-				638 177
-				893 306
-				1024 421
+				140   122
+				233   179
+				326   251
+				419   340
+				605   572
+				791   890
+				931   1192
+				1024  1426
 			>;
 			idle-cost-data = <
-				27
-				6
+				30	/* active idle (not in cpuidle) */
+				30	/* cpuidle state 0: WFI (c1) */
+				2	/* cpuidle state 1: c2 */
 			>;
 		};
 
-		/*
-		 * The little cluster's shared supply/thermal domain: six A53s
-		 * plus its own always-on overhead.
-		 */
+		/* Little cluster shared logic (L2/SCU/clock tree), cpus 0-5 */
 		CLUSTER_COST_LITTLE: cluster-cost-little {
 			busy-cost-data = <
-				189 62
-				265 100
-				378 172
-				529 301
-				645 443
-				756 639
+				62    15
+				82    17
+				123   24
+				164   32
+				208   42
+				246   53
+				289   67
+				327   81
 			>;
 			idle-cost-data = <
-				32
-				18
+				9	/* active idle (not in cpuidle) */
+				9	/* cpuidle state 0: WFI (c1) */
+				4	/* cpuidle state 1: c2 */
 			>;
 		};
 
-		/* The big cluster's shared domain: two A73s plus overhead. */
+		/* Big cluster shared logic (L2/SCU/clock tree), cpus 6-7 */
 		CLUSTER_COST_BIG: cluster-cost-big {
 			busy-cost-data = <
-				319 96
-				447 163
-				638 281
-				893 498
-				1024 694
+				140   38
+				233   55
+				326   77
+				419   104
+				605   174
+				791   269
+				931   360
+				1024  430
 			>;
 			idle-cost-data = <
-				48
-				27
+				12	/* active idle (not in cpuidle) */
+				12	/* cpuidle state 0: WFI (c1) */
+				5	/* cpuidle state 1: c2 */
 			>;
 		};
 	};
