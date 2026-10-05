@@ -1319,6 +1319,7 @@ static ssize_t mask_brightness_store(struct device *dev,
 	struct lcd_info *lcd = dev_get_drvdata(dev);
 	unsigned int value;
 	int rc;
+	struct decon_device *decon;
 
 	rc = kstrtouint(buf, 0, &value);
 	if (rc < 0)
@@ -1332,6 +1333,33 @@ static ssize_t mask_brightness_store(struct device *dev,
 	mutex_lock(&lcd->lock);
 	lcd->mask_brightness = value;
 	mutex_unlock(&lcd->lock);
+
+	/*
+	 * Storing the level is not enough. lcd->mask_brightness is read in
+	 * exactly one place, dsim_panel_mask_brightness(), and the only
+	 * caller of that panel op is decon_set_mask_layer() (decon_core.c),
+	 * which runs solely when decon->force_mask_layer has been armed via
+	 * the DECON fingerprint_illum knob. The HAL uses this LEVEL attribute
+	 * as the on/off switch for fingerprint illumination - it writes 337
+	 * to light the sensor and 0 to clear - and never arms the knob, so
+	 * the level sat inert: mask_brightness=337, knob=0,
+	 * actual_mask_brightness=0, and the trustlet returned 39
+	 * (BAD_QUALITY) on every poll because the sensor was dark.
+	 *
+	 * Arm force_mask_layer from a non-zero level and push it through the
+	 * existing apply path, which already defers while the display is not
+	 * on and serialises on decon->lock against an in-flight frame.
+	 *
+	 * Zero is left alone on purpose: clearing the level must not un-arm
+	 * a mask that something else armed.
+	 */
+	if (value > 0) {
+		decon = get_decon_drvdata(0);
+		if (decon) {
+			decon->force_mask_layer = true;
+			decon_fingerprint_illum_apply(decon);
+		}
+	}
 
 	return size;
 }
