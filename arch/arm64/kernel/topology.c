@@ -457,7 +457,11 @@ static void update_siblings_masks(unsigned int cpuid)
 	}
 }
 
-#ifdef CONFIG_SCHED_HMP
+/*
+ * SoC fuse read from the androidboot.lassen.apfuse kernel cmdline. Used by
+ * the Exynos cpufreq drivers unconditionally, so it must NOT be inside the
+ * CONFIG_SCHED_HMP guard (this used to be a link error once HMP was off).
+ */
 unsigned int ap_fuse = 0;
 EXPORT_SYMBOL_GPL(ap_fuse);
 static int __init setup_ap_fuse(char *str)
@@ -468,6 +472,7 @@ static int __init setup_ap_fuse(char *str)
 }
 early_param("androidboot.lassen.apfuse", setup_ap_fuse);
 
+#ifdef CONFIG_SCHED_HMP
 void __init arch_get_fast_and_slow_cpus(struct cpumask *fast,
 					struct cpumask *slow)
 {
