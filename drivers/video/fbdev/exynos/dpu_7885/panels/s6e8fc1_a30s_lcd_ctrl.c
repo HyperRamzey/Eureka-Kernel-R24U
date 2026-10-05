@@ -1319,7 +1319,6 @@ static ssize_t mask_brightness_store(struct device *dev,
 	struct lcd_info *lcd = dev_get_drvdata(dev);
 	unsigned int value;
 	int rc;
-	struct decon_device *decon;
 
 	rc = kstrtouint(buf, 0, &value);
 	if (rc < 0)
@@ -1335,48 +1334,21 @@ static ssize_t mask_brightness_store(struct device *dev,
 	mutex_unlock(&lcd->lock);
 
 	/*
-	 * Storing the level is not enough. lcd->mask_brightness is read in
-	 * exactly one place, dsim_panel_mask_brightness(), and the only
-	 * caller of that panel op is decon_set_mask_layer() (decon_core.c),
-	 * which runs solely when decon->force_mask_layer has been armed via
-	 * the DECON fingerprint_illum knob. The HAL uses this LEVEL attribute
-	 * as the on/off switch for fingerprint illumination - it writes 337
-	 * to light the sensor and 0 to clear - and never arms the knob, so
-	 * the level sat inert: mask_brightness=337, knob=0,
-	 * actual_mask_brightness=0, and the trustlet returned 39
-	 * (BAD_QUALITY) on every poll because the sensor was dark.
+	 * Store the level; do not force an apply.
 	 *
-	 * Arm force_mask_layer from a non-zero level and push it through the
-	 * existing apply path, which already defers while the display is not
-	 * on and serialises on decon->lock against an in-flight frame.
+	 * Forcing an apply from here made the mask oscillate: this HAL
+	 * writes the DECON knob itself, that write releases the mask via
+	 * the frame path, and the two writers alternated - five applies and
+	 * five releases in ten seconds, a release ~183ms after each apply.
 	 *
-	 * Zero is left alone on purpose: clearing the level must not un-arm
-	 * a mask that something else armed.
+	 * The knob is the authority. On its own it lights the panel:
+	 * knob=1 with actual_mask_brightness=337. The real fault was
+	 * permissions, fixed in c3c9c32 (genfscon labelled a /sys/class
+	 * symlink it can never match), cf4e3c6 (no
+	 * hal_fingerprint_default sysfs_lcd_writable:dir search) and
+	 * 56b92d8 (both nodes root:root 0644 while the HAL runs as uid
+	 * 1000). Those three stand.
 	 */
-	if (value > 0) {
-		decon = get_decon_drvdata(0);
-		if (decon) {
-			/*
-			 * Force a REAL false -> true transition.
-			 * decon_set_mask_layer() early-returns when
-			 * regs->mask_layer == current_mask_layer, and
-			 * current_mask_layer is already true from boot, so
-			 * merely arming force_mask_layer is a no-op and the
-			 * panel is never touched - then any later path with
-			 * force_mask_layer == false takes the release branch
-			 * and zeroes actual_mask_brightness. Measured on
-			 * kernel #71: mask(337) to current(1), actual_mask=0,
-			 * enrollment screen black with no lit sensor target.
-			 *
-			 * Clearing current_mask_layer first makes the driver
-			 * run the apply branch for real, which emits at
-			 * mask_brightness and publishes the readback.
-			 */
-			decon->current_mask_layer = false;
-			decon->force_mask_layer = true;
-			decon_fingerprint_illum_apply(decon);
-		}
-	}
 
 	return size;
 }
