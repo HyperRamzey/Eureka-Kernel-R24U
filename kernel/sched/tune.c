@@ -461,6 +461,14 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 	if (css == &root_schedtune.css)
 		sysctl_sched_cfs_boost = boost;
 
+	/*
+	 * Keep the performance/energy payoff thresholds in step with the
+	 * boost: one threshold_gains[] bucket per 10% of boost. perf_boost and
+	 * perf_constrain can still be overridden individually afterwards.
+	 */
+	st->perf_boost_idx = min_t(u64, boost, 99) / 10;
+	st->perf_constrain_idx = st->perf_boost_idx;
+
 	/* Update CPU boost */
 	schedtune_boostgroup_update(st->idx, st->boost);
 
@@ -515,7 +523,7 @@ perf_boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 {
 	struct schedtune *st = css_st(css);
 
-	if (perf_boost >= BOOSTGROUPS_COUNT)
+	if (perf_boost >= ARRAY_SIZE(threshold_gains))
 		return -EINVAL;
 
 	st->perf_boost_idx = (int)perf_boost;
@@ -537,7 +545,7 @@ perf_constrain_write(struct cgroup_subsys_state *css, struct cftype *cft,
 {
 	struct schedtune *st = css_st(css);
 
-	if (perf_constrain >= BOOSTGROUPS_COUNT)
+	if (perf_constrain >= ARRAY_SIZE(threshold_gains))
 		return -EINVAL;
 
 	st->perf_constrain_idx = (int)perf_constrain;
