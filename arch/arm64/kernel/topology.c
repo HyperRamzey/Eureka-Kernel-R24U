@@ -51,14 +51,6 @@ static void set_power_scale(unsigned int cpu, unsigned long power)
 
 static DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
 
-/*
- * Highest cpufreq max frequency across all policies, and the CPU that
- * reaches it. EAS needs a real capacity spread between the clusters: see
- * arm64_init_cpu_capacities() for why this tree cannot use the DT
- * "clock-frequency" / table_efficiency[] path.
- */
-static unsigned long max_cpu_freq_capacity;
-
 unsigned long scale_cpu_capacity(struct sched_domain *sd, int cpu)
 {
 #ifdef CONFIG_CPU_FREQ
@@ -291,13 +283,50 @@ out:
 	return ret;
 }
 
+/*
+ * EAS capacity of a CPU, taken from the energy model itself: the highest
+ * capacity point of the CPU's own (first-phandle, core level) cost node in
+ * "sched-energy-costs".
+ *
+ * The energy model and cpu_capacity_orig must agree: find_new_capacity()
+ * and group_norm_util() compare utilisation, which is scaled by
+ * capacity_orig, against the cap_states[] of the model. Deriving one from
+ * the other here makes that true by construction, and it does not depend on
+ * cpufreq being up (init_cpu_topology() runs from smp_prepare_cpus(), long
+ * before any cpufreq driver has probed).
+ *
+ * Returns 0 when the CPU has no energy model.
+ */
+static unsigned long __init dt_energy_cpu_capacity(struct device_node *cn)
+{
+	struct device_node *cp;
+	const __be32 *val;
+	unsigned long cap = 0;
+	int i, len = 0;
+
+	cp = of_parse_phandle(cn, "sched-energy-costs", 0);
+	if (!cp)
+		return 0;
+
+	/* busy-cost-data is an array of (capacity, power) u32 tuples */
+	val = of_get_property(cp, "busy-cost-data", &len);
+	len /= sizeof(u32);
+	for (i = 0; val && i + 1 < len; i += 2)
+		cap = max_t(unsigned long, cap, be32_to_cpu(val[i]));
+
+	of_node_put(cp);
+
+	return cap;
+}
+
 static void __init parse_dt_cpu_power(void)
 {
-const struct cpu_efficiency *cpu_eff;
+	const struct cpu_efficiency *cpu_eff;
 	struct device_node *cn;
 	unsigned long min_capacity = ULONG_MAX;
 	unsigned long max_capacity = 0;
 	unsigned long capacity = 0;
+	bool energy_caps = true;
 	int cpu;
 
 	__cpu_capacity = kcalloc(nr_cpu_ids, sizeof(*__cpu_capacity),
@@ -331,47 +360,27 @@ const struct cpu_efficiency *cpu_eff;
 
 		pcpu_efficiency[cpu] = cpu_eff->efficiency;
 
-		/*
-		 * Relative throughput comes from the CPU's own efficiency, scaled
-		 * by the ratio of its cpufreq policy's max frequency to the
-		 * fastest policy on the system. The original tree read
-		 * "clock-frequency" from the cpu node instead, but no exynos
-		 * board defines that property, so every CPU ended up with zero
-		 * capacity and update_cpu_power() bailed out -- leaving cpu_scale
-		 * identical for all cores and no big.LITTLE spread at all. Reading
-		 * the cpufreq limit is both always available and closer to the
-		 * truth, since on this SoC the cluster ratio is mostly frequency.
-		 *
-		 * A CPU with no cpufreq policy yet gets the system maximum, i.e. it
-		 * does not perturb the reference point.
-		 */
-#ifdef CONFIG_CPU_FREQ
-		{
-			unsigned long cpu_max = cpufreq_scale_max_freq_capacity(cpu);
+		/* EAS: capacity straight from the energy model (already 0..1024) */
+		capacity = dt_energy_cpu_capacity(cn);
 
+		if (!capacity) {
 			/*
-			 * max_freq_scale is (policy_max << SHIFT)/policy_hw_max, so it
-			 * is 1024 only while the policy still runs at its hardware max.
-			 * Normalising by the fastest policy therefore yields a
-			 * cluster-proportional capacity in [0..1024].
+			 * No energy model for this CPU: legacy path, relative
+			 * throughput from the DT clock-frequency and the
+			 * efficiency table, normalised below.
 			 */
-			if (!cpu_max)
-				cpu_max = SCHED_CAPACITY_SCALE;
-			else if (cpu_max > max_cpu_freq_capacity)
-			max_cpu_freq_capacity = cpu_max;
+			energy_caps = false;
 
-			capacity = ((unsigned long)SCHED_POWER_SCALE * cpu_max) /
-				   (max_cpu_freq_capacity ? max_cpu_freq_capacity
-							    : SCHED_CAPACITY_SCALE);
-			capacity = capacity * cpu_eff->efficiency /
-				   table_efficiency[1].efficiency;
+			rate = of_get_property(cn, "clock-frequency", &len);
+			if (!rate || len != 4) {
+				pr_err("%s: Missing clock-frequency property\n",
+					cn->full_name);
+				continue;
+			}
+
+			capacity = ((be32_to_cpup(rate)) >> 20) *
+				   cpu_eff->efficiency;
 		}
-#else
-		capacity = cpu_eff->efficiency;
-#endif
-
-		if (!capacity)
-			capacity = 1;
 
 		/* Save min capacity of the system */
 		if (capacity < min_capacity)
@@ -382,6 +391,19 @@ const struct cpu_efficiency *cpu_eff;
 			max_capacity = capacity;
 
 		cpu_capacity(cpu) = capacity;
+	}
+
+	if (!max_capacity)
+		return;
+
+	if (energy_caps) {
+		/* Already on the scheduler's scale: cpu_scale = capacity. */
+		middle_capacity = 1;
+
+		if (max_capacity != SCHED_CAPACITY_SCALE)
+			pr_warn("sched-energy: fastest CPU capacity is %lu, expected %lu\n",
+				max_capacity, SCHED_CAPACITY_SCALE);
+		return;
 	}
 
 	/* If min and max capacities are equal we bypass the update of the
@@ -397,6 +419,10 @@ const struct cpu_efficiency *cpu_eff;
 	else
 		middle_capacity = ((max_capacity / 3)
 				>> (SCHED_POWER_SHIFT-1)) + 1;
+
+	/* update_cpu_power() divides by this */
+	if (!middle_capacity)
+		middle_capacity = 1;
 }
 
 /*
@@ -745,30 +771,40 @@ static const struct sched_group_energy * const cpu_cluster_energy(int cpu)
 }
 
 /*
- * The MC level groups CPUs of one cluster, so it shares power resources and
- * capacity states, and carries the asymmetric-capacity flag the
- * big.LITTLE load-balance scan in fair.c keys off.
+ * The MC level groups the CPUs of one cluster: they share the cache (LLC),
+ * the power domain and the capacity (OPP) state, which is what sd_scs and
+ * the energy model's shared-capacity handling key off.
+ *
+ * SD_ASYM_CPUCAPACITY does NOT belong here: every CPU of a cluster has the
+ * same capacity. It describes the level whose groups differ in capacity.
  */
 static int cpu_corepower_flags(void)
 {
-	return SD_SHARE_PKG_RESOURCES  | SD_SHARE_CAP_STATES |
-	       SD_ASYM_CPUCAPACITY | SD_SHARE_POWERDOMAIN;
+	return SD_SHARE_PKG_RESOURCES | SD_SHARE_POWERDOMAIN |
+	       SD_SHARE_CAP_STATES;
 }
 
 /*
- * The top level spans the whole package (here: one SoC).
+ * The top level spans both clusters, so this is the domain whose groups have
+ * different capacity: fair.c's find_busiest_queue() tests SD_ASYM_CPUCAPACITY
+ * on the domain being balanced, i.e. this one, to avoid pulling a lone task
+ * from a big CPU onto a little one.
+ *
+ * It must NOT carry SD_SHARE_CPUCAPACITY (SMT semantics: imbalance_pct 110,
+ * smt_gain, "never cache-hot") nor SD_SHARE_PKG_RESOURCES: the clusters do
+ * not share a cache, and the latter would make the whole SoC one LLC domain
+ * and send select_idle_sibling() scanning across clusters.
  *
  * CONFIG_DISABLE_CPU_SCHED_DOMAIN_BALANCE exists in this tree because
- * Samsung's HMP scheduler wanted no load balancing at the package level --
- * HMP did cross-cluster migration itself, by threshold. With HMP gone
- * nothing else moves load between the clusters, and EAS only picks a target
- * at wakeup time, so package-level balancing has to stay enabled or a
- * cluster can be left stranded. SD_NO_LOAD_BALANCE is therefore only kept
- * while CONFIG_SCHED_HMP is selected.
+ * Samsung's HMP scheduler did cross-cluster migration itself, by threshold.
+ * With HMP gone nothing else moves load between the clusters, and EAS only
+ * picks a target at wakeup time, so package-level balancing has to stay
+ * enabled or a cluster can be left stranded. SD_NO_LOAD_BALANCE is therefore
+ * only kept while CONFIG_SCHED_HMP is selected.
  */
 static int cpu_pkg_flags(void)
 {
-	int flags = SD_SHARE_CPUCAPACITY | SD_SHARE_PKG_RESOURCES;
+	int flags = SD_ASYM_CPUCAPACITY;
 
 #ifdef CONFIG_SCHED_HMP
 	flags |= SD_NO_LOAD_BALANCE;
@@ -805,6 +841,20 @@ void __init init_cpu_topology(void)
 
 	reset_cpu_power();
 	parse_dt_cpu_power();
+
+	/*
+	 * Apply the capacities now. update_cpu_power() is otherwise only
+	 * reached from store_cpu_topology(), which returns early for every CPU
+	 * whose core_id was already filled in from the DT cpu-map (as it is
+	 * here), so without this cpu_scale would stay at SCHED_POWER_SCALE for
+	 * all CPUs no matter what parse_dt_cpu_power() computed.
+	 */
+	{
+		unsigned int cpu;
+
+		for_each_possible_cpu(cpu)
+			update_cpu_power(cpu);
+	}
 
 #ifdef CONFIG_SMP
 	set_sched_topology(arm64_topology);
