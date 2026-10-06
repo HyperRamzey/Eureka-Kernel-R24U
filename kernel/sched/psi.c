@@ -155,17 +155,6 @@ static int psi_bug __read_mostly;
  */
 static struct task_struct *psi_avgs_task __read_mostly;
 
-/*
- * TEMPORARY poll-path diagnostics, exported through /proc/pressure/enable.
- * Remove once the trigger path is confirmed working.
- */
-static atomic_long_t psi_dbg_sched;
-static atomic_long_t psi_dbg_runs;
-static atomic_long_t psi_dbg_trigs;
-static int psi_dbg_task_nonnull;
-static int psi_dbg_list_empty;
-static int psi_dbg_curwork_nonnull;
-
 DEFINE_STATIC_KEY_FALSE(psi_disabled);
 
 #ifdef CONFIG_PSI_DEFAULT_DISABLED
@@ -309,7 +298,7 @@ void __init psi_init(void)
 	/*
 	 * The group is initialised UNCONDITIONALLY, unlike upstream, which
 	 * returns early when PSI is disabled at boot. We have a runtime
-	 * switch (/proc/pressure/enable), and without an initialised group
+	 * psi= early parameter, and without an initialised group
 	 * there would be nothing to switch on later.
 	 *
 	 * No thread and no workqueue is created here, deliberately.
@@ -706,18 +695,6 @@ static void psi_schedule_poll_work(struct psi_group *group, unsigned long delay)
 		return;
 	}
 
-	atomic_long_inc(&psi_dbg_sched);
-
-	/*
-	 * Diagnostic: what did insert_kthread_work() see? It only calls
-	 * wake_up_process() when current_work is NULL, and 4.4's
-	 * kthread_worker_fn sets worker->task itself on its first
-	 * instruction - so a NULL here means the wake is skipped.
-	 */
-	psi_dbg_task_nonnull = (group->poll_kworker.task != NULL);
-	psi_dbg_list_empty = list_empty(&group->poll_kworker.work_list);
-	psi_dbg_curwork_nonnull = (group->poll_kworker.current_work != NULL);
-
 	/*
 	 * Called from the scheduler hot path with rq->lock held, via
 	 * enqueue_task -> psi_enqueue -> psi_task_change. Only leaf-spinlock
@@ -758,7 +735,6 @@ static void psi_poll_work(struct kthread_work *work)
 	/* Same ordering as upstream: clear before doing any work. */
 	atomic_set(&group->poll_scheduled, 0);
 
-	atomic_long_inc(&psi_dbg_runs);
 	psi_poll_fn(group);
 }
 
@@ -779,7 +755,6 @@ static void psi_poll_fn(struct psi_group *group)
 	u32 changed_states;
 	u64 now;
 
-	atomic_long_inc(&psi_dbg_runs);
 	mutex_lock(&group->trigger_lock);
 
 	now = sched_clock();
@@ -805,10 +780,8 @@ static void psi_poll_fn(struct psi_group *group)
 		goto out;
 	}
 
-	if (now >= group->polling_next_update) {
-		atomic_long_inc(&psi_dbg_trigs);
+	if (now >= group->polling_next_update)
 		group->polling_next_update = update_triggers(group, now);
-	}
 
 	psi_schedule_poll_work(group,
 		nsecs_to_jiffies(group->polling_next_update - now) + 1);
@@ -1019,8 +992,9 @@ void psi_task_change(struct task_struct *task, int clear, int set)
 	 * Upstream v5.4 cannot hit any of this: workqueue_init_early() runs in
 	 * start_kernel() right after sched_init(), so the pools exist before any
 	 * task can change scheduler state. It is also why enabling PSI from
-	 * userspace has always worked - by the time /proc/pressure/enable can be
-	 * written, init_workqueues has finished.
+	 * userspace always worked - by the time init_workqueues has finished,
+	 * the pool this test guards exists. There is no runtime switch: PSI is
+	 * selected once, at boot, by CONFIG_PSI_DEFAULT_DISABLED or psi=.
 	 *
 	 * Nothing can read /proc/pressure before initcalls, so skipping the kick
 	 * in this window loses no observable behaviour: WORK_STRUCT_PENDING_BIT
@@ -1254,7 +1228,8 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group,
 		 * new task parked; only kthread() itself wakes it. Nothing in this
 		 * port did, so psimon never reached kthread_worker_fn(): it never
 		 * set worker->task and never drained work_list. Measured on #37 as
-		 * psi_dbg_sched climbing 1->3 with psi_dbg_runs stuck at 0 and
+		 * the poll-path schedule counter climbing 1->3 with the worker-run
+		 * counter stuck at 0 and
 		 * "ps -A -T | grep psimon" returning nothing.
 		 *
 		 * Setting .task first is what makes insert_kthread_work()'s
@@ -1396,20 +1371,40 @@ static ssize_t psi_write(struct file *file, const char __user *user_buf,
 	if (!nbytes)
 		return -EINVAL;
 
-	buf_size = min(nbytes, sizeof(buf));
+	/*
+	 * Copy at most sizeof(buf)-1 bytes and terminate in the byte that is
+	 * left over. The old code copied sizeof(buf) bytes and then overwrote
+	 * buf[buf_size - 1], so an exact-size write such as
+	 * strlen("some 500000 1000000") lost its final digit.
+	 */
+	buf_size = min(nbytes, sizeof(buf) - 1);
 	if (copy_from_user(buf, user_buf, buf_size))
 		return -EFAULT;
+	buf[buf_size] = '\0';
 
-	buf[buf_size - 1] = '\0';
-
-	new = psi_trigger_create(&psi_system, buf, nbytes, res);
-	if (IS_ERR(new))
-		return PTR_ERR(new);
-
+	/*
+	 * At most one trigger per file descriptor.
+	 *
+	 * Replacing a live trigger frees it while a concurrent poll() may still
+	 * hold a reference to its waitqueue - the use-after-free upstream fixed
+	 * by removing the replacement path entirely (a06247c6804f). This tree
+	 * keeps the existing kref/RCU teardown for the release path and keeps its
+	 * own timer-driven poller, so the equivalent fix is to refuse a second
+	 * trigger rather than swap the first one out. The test and the install
+	 * happen under seq->lock, so two concurrent writes cannot both pass.
+	 */
 	seq = file->private_data;
-	/* Take seq->lock to protect seq->private from concurrent writes */
 	mutex_lock(&seq->lock);
-	psi_trigger_replace(&seq->private, new);
+	if (seq->private) {
+		mutex_unlock(&seq->lock);
+		return -EBUSY;
+	}
+	new = psi_trigger_create(&psi_system, buf, buf_size, res);
+	if (IS_ERR(new)) {
+		mutex_unlock(&seq->lock);
+		return PTR_ERR(new);
+	}
+	seq->private = new;
 	mutex_unlock(&seq->lock);
 
 	return nbytes;
@@ -1475,86 +1470,12 @@ static const struct file_operations psi_cpu_fops = {
 	.release        = psi_fop_release,
 };
 
-/*
- * Runtime switch: /proc/pressure/enable
- *
- * Non-standard, and deliberately so. libpsi only ever touches the three
- * /proc/pressure/{io,memory,cpu} files, so adding a fourth file cannot confuse
- * it. This exists because psi=1 on the kernel command line is unusable on this
- * device: the bootloader owns /proc/cmdline and boot.img's cmdline field is
- * ignored, so CONFIG_PSI_DEFAULT_DISABLED can never be overridden at boot.
- *
- *   echo 1 > /proc/pressure/enable   - start stall accounting now
- *   echo 0 > /proc/pressure/enable   - stop it
- *
- * Enabling clears the psi_disabled branch and kicks the averages work.
- * Disabling raises it again and cancels the work. Disabling is best-effort: a
- * task already inside psi_task_change() may finish its accounting, which is
- * harmless (it only bumps counters) but means the transition is not instantly
- * quiescent.
- */
-static ssize_t psi_enable_read(struct file *file, char __user *buf,
-			       size_t count, loff_t *ppos)
-{
-	char s[2];
-
-	char d[80];
-	int n;
-
-	n = scnprintf(d, sizeof(d), "%d %ld %ld %ld %d %d %d\n",
-		      static_branch_unlikely(&psi_disabled) ? 0 : 1,
-		      atomic_long_read(&psi_dbg_sched),
-		      atomic_long_read(&psi_dbg_runs),
-		      atomic_long_read(&psi_dbg_trigs),
-		      psi_dbg_task_nonnull,
-		      psi_dbg_list_empty,
-		      psi_dbg_curwork_nonnull);
-	(void)s;
-	return simple_read_from_buffer(buf, count, ppos, d, n);
-}
-
-static ssize_t psi_enable_write(struct file *file, const char __user *ubuf,
-				size_t count, loff_t *ppos)
-{
-	char s[2];
-	bool on;
-
-	if (count < 1)
-		return -EINVAL;
-	if (copy_from_user(s, ubuf, 1))
-		return -EFAULT;
-	on = (s[0] == '1');
-	if (s[0] != '0' && s[0] != '1')
-		return -EINVAL;
-
-	if (on) {
-		static_branch_disable(&psi_disabled);
-		/* Start folding per-cpu stall buckets into the averages. */
-		if (!delayed_work_pending(&psi_system.avgs_work))
-			schedule_delayed_work(&psi_system.avgs_work,
-					      PSI_FREQ);
-	} else {
-		static_branch_enable(&psi_disabled);
-		cancel_delayed_work_sync(&psi_system.avgs_work);
-	}
-
-	return count;
-}
-
-static const struct file_operations psi_enable_fops = {
-	.open	= simple_open,
-	.read	= psi_enable_read,
-	.write	= psi_enable_write,
-	.llseek	= noop_llseek,
-};
-
 static int __init psi_proc_init(void)
 {
 	proc_mkdir("pressure", NULL);
 	proc_create("pressure/io", 0, NULL, &psi_io_fops);
 	proc_create("pressure/memory", 0, NULL, &psi_memory_fops);
 	proc_create("pressure/cpu", 0, NULL, &psi_cpu_fops);
-	proc_create("pressure/enable", 0644, NULL, &psi_enable_fops);
 	return 0;
 }
 module_init(psi_proc_init);
