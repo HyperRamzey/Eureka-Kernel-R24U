@@ -497,10 +497,31 @@ int sec_nfc_i2c_probe(struct i2c_client *client)
 			NFC_LOG_ERR("failed to request about pvdd_en pin\n");
 			return -ENODEV;
 		}
+		/*
+		 * Instrumentation only - no behaviour change.
+		 *
+		 * On a faulted boot gpio-105 (nfc_pvdd_en) reads "in lo", and
+		 * in 4.4 gpiolib debugfs "in" means the output direction was
+		 * never set through gpiolib. gpio_request() above demonstrably
+		 * succeeded (the pin carried its nfc_pvdd_en label), so either
+		 * this direction_output was skipped because lpcharge was nonzero,
+		 * or it was called and failed. The old code discarded the return
+		 * value, so the two are indistinguishable after the fact. Log
+		 * lpcharge, the return code and the readback so the next faulted
+		 * boot answers it directly.
+		 *
+		 * Note: lpcharge is a per-boot RAM variable set from the cmdline
+		 * androidboot.mode= (see sec_batt.c sec_bat_is_lpm_check), NOT a
+		 * state inherited across reboots.
+		 */
 		if(!lpcharge) {
-			gpio_direction_output(pdata->pvdd_en, 1);
+			ret = gpio_direction_output(pdata->pvdd_en, 1);
+			NFC_LOG_ERR("nfc pvdd: lpcharge=%d direction_output ret=%d readback=%d\n",
+				lpcharge, ret, gpio_get_value(pdata->pvdd_en));
+		} else {
+			NFC_LOG_ERR("nfc pvdd: lpcharge=%d SKIPPED direction_output readback=%d\n",
+				lpcharge, gpio_get_value(pdata->pvdd_en));
 		}
-		NFC_LOG_INFO("pvdd en: %d\n", gpio_get_value(pdata->pvdd_en));
 	}
 #ifdef CONFIG_SEC_NFC_LDO_CONTROL
 	if (pdata->i2c_1p8 != NULL) {
