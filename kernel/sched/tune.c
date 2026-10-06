@@ -461,14 +461,8 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 {
 	struct schedtune *st = css_st(css);
 
-	if (!strcmp(css->cgroup->kn->name, "top-app"))
-		boost = 1;
-
 	if (boost < -100 || boost > 100)
 		return -EINVAL;
-
-	if (boost <= 10)
-		boost = 0;
 
 	st->boost = boost;
 	if (css == &root_schedtune.css)
