@@ -160,10 +160,10 @@ static struct schedtune *allocated_group[BOOSTGROUPS_COUNT] = {
  */
 struct boost_groups {
 	/* Maximum boost value for all RUNNABLE tasks on a CPU */
-	unsigned boost_max;
+	int boost_max;
 	struct {
 		/* The boost for tasks on that boost group */
-		unsigned boost;
+		int boost;
 		/* Count of RUNNABLE tasks on that boost group */
 		unsigned tasks;
 	} group[BOOSTGROUPS_COUNT];
@@ -176,7 +176,7 @@ static void
 schedtune_cpu_update(int cpu)
 {
 	struct boost_groups *bg;
-	unsigned boost_max;
+	int boost_max;
 	int idx;
 
 	bg = &per_cpu(cpu_boost_groups, cpu);
@@ -434,7 +434,7 @@ schedtune_accept_deltas(int nrg_delta, int cap_delta,
 			perf_boost_idx, perf_constrain_idx);
 }
 
-static u64
+static s64
 boost_read(struct cgroup_subsys_state *css, struct cftype *cft)
 {
 	struct schedtune *st = css_st(css);
@@ -444,7 +444,7 @@ boost_read(struct cgroup_subsys_state *css, struct cftype *cft)
 
 static int
 boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
-	    u64 boost)
+	    s64 boost)
 {
 	struct schedtune *st = css_st(css);
 
@@ -466,7 +466,7 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 	 * boost: one threshold_gains[] bucket per 10% of boost. perf_boost and
 	 * perf_constrain can still be overridden individually afterwards.
 	 */
-	st->perf_boost_idx = min_t(u64, boost, 99) / 10;
+	st->perf_boost_idx = clamp((int)boost, 0, 99) / 10;
 	st->perf_constrain_idx = st->perf_boost_idx;
 
 	/* Update CPU boost */
@@ -556,8 +556,8 @@ perf_constrain_write(struct cgroup_subsys_state *css, struct cftype *cft,
 static struct cftype files[] = {
 	{
 		.name = "boost",
-		.read_u64 = boost_read,
-		.write_u64 = boost_write,
+		.read_s64 = boost_read,
+		.write_s64 = boost_write,
 	},
 	{
 		.name = "prefer_idle",
