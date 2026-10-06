@@ -167,6 +167,9 @@ struct boost_groups {
 		/* Count of RUNNABLE tasks on that boost group */
 		unsigned tasks;
 	} group[BOOSTGROUPS_COUNT];
+
+	/* CPU's boost group locking */
+	raw_spinlock_t lock;
 };
 
 /* Boost groups affecting each CPU in the system */
@@ -200,6 +203,7 @@ static int
 schedtune_boostgroup_update(int idx, int boost)
 {
 	struct boost_groups *bg;
+	unsigned long flags;
 	int cur_boost_max;
 	int old_boost;
 	int cpu;
@@ -207,6 +211,7 @@ schedtune_boostgroup_update(int idx, int boost)
 	/* Update per CPU boost groups */
 	for_each_possible_cpu(cpu) {
 		bg = &per_cpu(cpu_boost_groups, cpu);
+		raw_spin_lock_irqsave(&bg->lock, flags);
 
 		/*
 		 * Keep track of current boost values to compute the per CPU
@@ -222,12 +227,15 @@ schedtune_boostgroup_update(int idx, int boost)
 		/* Check if this update increase current max */
 		if (boost > cur_boost_max && bg->group[idx].tasks) {
 			bg->boost_max = boost;
+			raw_spin_unlock_irqrestore(&bg->lock, flags);
 			continue;
 		}
 
 		/* Check if this update has decreased current max */
 		if (cur_boost_max == old_boost && old_boost > boost)
 			schedtune_cpu_update(cpu);
+
+		raw_spin_unlock_irqrestore(&bg->lock, flags);
 	}
 
 	return 0;
@@ -240,9 +248,11 @@ static inline void
 schedtune_tasks_update(struct task_struct *p, int cpu, int idx, int task_count)
 {
 	struct boost_groups *bg;
+	unsigned long flags;
 	int tasks;
 
 	bg = &per_cpu(cpu_boost_groups, cpu);
+	raw_spin_lock_irqsave(&bg->lock, flags);
 
 	/* Update boosted tasks count while avoiding to make it negative */
 	if (task_count < 0 && bg->group[idx].tasks <= -task_count)
@@ -252,6 +262,9 @@ schedtune_tasks_update(struct task_struct *p, int cpu, int idx, int task_count)
 
 	/* Boost group activation or deactivation on that RQ */
 	tasks = bg->group[idx].tasks;
+
+	raw_spin_unlock_irqrestore(&bg->lock, flags);
+
 	if (tasks == 1 || tasks == 0)
 		schedtune_cpu_update(cpu);
 }
@@ -611,6 +624,7 @@ schedtune_init(void)
 	for_each_possible_cpu(cpu) {
 		bg = &per_cpu(cpu_boost_groups, cpu);
 		memset(bg, 0, sizeof(struct boost_groups));
+		raw_spin_lock_init(&bg->lock);
 	}
 
 	pr_info("  schedtune configured to support %d boost groups\n",
@@ -684,9 +698,106 @@ schedtune_css_free(struct cgroup_subsys_state *css)
 	kfree(st);
 }
 
+/*
+ * Move the per-CPU runnable accounting when a RUNNABLE task changes
+ * boost group. Without this the source group's count is never decremented
+ * (enqueue/dequeue only ever see the task's current group), so a stale
+ * per-CPU boost sticks after the task has moved away.
+ *
+ * Ported from the 4.9 schedtune tree; signatures match, this 4.4 tree
+ * already carries the 4.6+ cgroup API in include/linux/cgroup-defs.h.
+ */
+int schedtune_can_attach(struct cgroup_taskset *tset)
+{
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+	struct boost_groups *bg;
+	struct rq_flags irq_flags;
+	unsigned int cpu;
+	struct rq *rq;
+	int src_bg; /* Source boost group index */
+	int dst_bg; /* Destination boost group index */
+	int src_tasks, dst_tasks;
+
+	if (!unlikely(schedtune_initialized))
+		return 0;
+
+	cgroup_taskset_for_each(task, css, tset) {
+
+		/*
+		 * Lock the CPU's RQ the task is enqueued to avoid race
+		 * conditions with migration code while the task is being
+		 * accounted
+		 */
+		rq = lock_rq_of(task, &irq_flags);
+
+		if (!task->on_rq) {
+			unlock_rq_of(rq, task, &irq_flags);
+			continue;
+		}
+
+		/*
+		 * Boost group accounting is protected by a per-cpu lock
+		 */
+		cpu = cpu_of(rq);
+		bg = &per_cpu(cpu_boost_groups, cpu);
+		raw_spin_lock(&bg->lock);
+
+		dst_bg = css_st(css)->idx;
+		src_bg = task_schedtune(task)->idx;
+
+		/*
+		 * Current task is not changing boostgroup, which can
+		 * happen when the new hierarchy is in use.
+		 */
+		if (unlikely(dst_bg == src_bg)) {
+			raw_spin_unlock(&bg->lock);
+			unlock_rq_of(rq, task, &irq_flags);
+			continue;
+		}
+
+		/*
+		 * This is the case of a RUNNABLE task which is switching its
+		 * current boost group. Move it from src to dst.
+		 */
+		src_tasks = (int)bg->group[src_bg].tasks - 1;
+		bg->group[src_bg].tasks = max(0, src_tasks);
+		bg->group[dst_bg].tasks += 1;
+
+		/*
+		 * Sample the counts while still holding the lock; 4.9 reads
+		 * them back after unlocking, which is a race on the decision
+		 * to recompute.
+		 */
+		src_tasks = (int)bg->group[src_bg].tasks;
+		dst_tasks = (int)bg->group[dst_bg].tasks;
+
+		raw_spin_unlock(&bg->lock);
+		unlock_rq_of(rq, task, &irq_flags);
+
+		/* Update CPU boost group */
+		if (src_tasks == 0 || dst_tasks == 1)
+			schedtune_cpu_update(cpu);
+	}
+
+	return 0;
+}
+
+/*
+ * NOTE: This can happen only if SchedTune is mounted with other
+ * hierarchies and one of them fails. Since SchedTune is mounted on its
+ * own hierarchy here, a proper rollback is not implemented.
+ */
+void schedtune_cancel_attach(struct cgroup_taskset *tset)
+{
+	WARN(1, "SchedTune cancel attach not implemented");
+}
+
 struct cgroup_subsys schedtune_cgrp_subsys = {
 	.css_alloc	= schedtune_css_alloc,
 	.css_free	= schedtune_css_free,
+	.can_attach	= schedtune_can_attach,
+	.cancel_attach	= schedtune_cancel_attach,
 	.legacy_cftypes	= files,
 	.early_init	= 1,
 };
