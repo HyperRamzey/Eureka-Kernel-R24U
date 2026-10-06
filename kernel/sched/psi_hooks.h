@@ -14,11 +14,14 @@
  * order has to change.
  *
  * 4.4 adaptations:
- *  - upstream tests p->flags & PF_MEMSTALL. That bit is unavailable here:
- *    0x01000000 is PF_PERF_CRITICAL in this tree. The same question - "is this
- *    task currently counted as memory-stalled?" - is answered from p->psi_flags,
- *    which psi_memstall_enter/leave maintain, so the test stays consistent with
- *    the count PSI is already tracking.
+ *  - upstream tests p->flags & PF_MEMSTALL for "inside a stall section". That
+ *    bit is unavailable here: 0x01000000 is PF_PERF_CRITICAL in this tree.
+ *    PSI_TSK_IN_MEMSTALL in p->psi_flags is used instead. It has to be a bit
+ *    of its own, NOT TSK_MEMSTALL: psi_task_change() clears TSK_MEMSTALL when
+ *    a task is dequeued for a migration, and psi_enqueue() must still know
+ *    afterwards that the task is in a section so it can count it again on the
+ *    new CPU. Reading TSK_MEMSTALL here loses the stall on every migration
+ *    and underflows the new CPU's counter at psi_memstall_leave().
  *  - 4.4's __task_rq_lock() takes no irqsave flags (only task_rq_lock() does).
  */
 
@@ -37,7 +40,8 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
 		return;
 
 	if (!wakeup || p->sched_psi_wake_requeue) {
-		if (p->psi_flags & TSK_MEMSTALL)
+		/* count it on THIS cpu if it is still inside a stall section */
+		if (p->psi_flags & PSI_TSK_IN_MEMSTALL)
 			set |= TSK_MEMSTALL;
 		if (p->sched_psi_wake_requeue)
 			p->sched_psi_wake_requeue = 0;

@@ -64,6 +64,21 @@ enum psi_task_count {
 #define TSK_MEMSTALL	(1 << NR_MEMSTALL)
 #define TSK_RUNNING	(1 << NR_RUNNING)
 
+/*
+ * Private bit in task->psi_flags, deliberately outside the TSK_* count bits:
+ * set from psi_memstall_enter() to psi_memstall_leave(). It is the 4.4
+ * stand-in for upstream's PF_MEMSTALL (0x01000000 is PF_PERF_CRITICAL in this
+ * tree).
+ *
+ * It must be separate from TSK_MEMSTALL. TSK_MEMSTALL says "this task is
+ * currently counted in its CPU's bucket" and is cleared by psi_task_change()
+ * whenever the task is dequeued for a migration; "inside a stall section" has
+ * to survive that so psi_enqueue() can count the task again on its new CPU.
+ * psi_task_change() only touches the bits it is passed, so this one is
+ * unaffected by it.
+ */
+#define PSI_TSK_IN_MEMSTALL	(1 << NR_PSI_TASK_COUNTS)
+
 /* Resources that workloads could be stalled on */
 enum psi_res {
 	PSI_IO,

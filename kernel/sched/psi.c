@@ -962,7 +962,73 @@ void psi_task_change(struct task_struct *task, int clear, int set)
 	if (state_mask & group->poll_states)
 		psi_schedule_poll_work(group, 1);
 
-	if (wake_clock && !delayed_work_pending(&group->avgs_work))
+	/*
+	 * Do not queue PSI's averaging worker until the workqueue that
+	 * schedule_delayed_work() actually uses exists.
+	 *
+	 * include/linux/workqueue.h:592 makes schedule_delayed_work() call
+	 * queue_delayed_work_on(cpu, system_power_efficient_wq, ...), NOT
+	 * system_wq - this tree redirects the global delayed-work helpers at
+	 * the WQ_POWER_EFFICIENT pool. The pointer that must be non-NULL here
+	 * is therefore system_power_efficient_wq.
+	 *
+	 * There is no workqueue_init_early() here, so all of these are created
+	 * by early_initcall(init_workqueues) (kernel/workqueue.c), which runs
+	 * from do_initcalls() inside kernel_init_freeable() - after rest_init()
+	 * has already forked kernel_init and kthreadd, the first tasks with a
+	 * non-zero ->pid and therefore the first callers of psi_task_change().
+	 *
+	 * init_workqueues() creates them in this order:
+	 *   system_wq                            (non-NULL from here on)
+	 *   system_highpri_wq / system_long_wq / system_unbound_wq
+	 *   system_freezable_wq
+	 *   system_power_efficient_wq            <-- still NULL during the above
+	 *
+	 * Each alloc_workqueue() wakes its own first worker, and that
+	 * kthread_create_on_node() -> try_to_wake_up() -> activate_task() runs
+	 * psi_enqueue() -> psi_task_change() on this very CPU while the pointer
+	 * for the pool being created is not yet assigned. Measured stack from
+	 * the kernel that hung - three boots, byte-identical offsets:
+	 *
+	 *   __queue_delayed_work+0xb8      WARN_ON_ONCE(!wq)
+	 *   psi_task_change+0x380
+	 *   activate_task+0x13c
+	 *   try_to_wake_up+0x348
+	 *   kthread_create_on_node+0xd0
+	 *   create_worker+0xe0
+	 *   apply_wqattrs_prepare+0x28c
+	 *   apply_workqueue_attrs_locked+0x34
+	 *   apply_workqueue_attrs+0x38
+	 *   __alloc_workqueue_key+0x26c
+	 *   init_workqueues+0x30c
+	 *
+	 * queue_delayed_work_on() does not fault there: __queue_delayed_work()
+	 * only WARNs, stores dwork->wq = NULL and arms the timer. That NULL is
+	 * dereferenced PSI_FREQ = 2*HZ+1 = 1001 jiffies (2.002 s at
+	 * CONFIG_HZ=500) later, in delayed_work_timer_fn() -> __queue_work(),
+	 * at wq->flags - which is the actual hang.
+	 *
+	 * NOTE: guarding on system_wq, or on keventd_up(), does NOT work here.
+	 * system_wq is created first, so it is already non-NULL during the
+	 * window that matters, and keventd_up() (workqueue.h:623) reports true
+	 * while system_power_efficient_wq is still NULL. An earlier attempt at
+	 * this fix guarded system_wq, compiled cleanly, and still hung with the
+	 * identical stack: the check was on a different variable from the one
+	 * schedule_delayed_work() passes.
+	 *
+	 * Upstream v5.4 cannot hit any of this: workqueue_init_early() runs in
+	 * start_kernel() right after sched_init(), so the pools exist before any
+	 * task can change scheduler state. It is also why enabling PSI from
+	 * userspace has always worked - by the time /proc/pressure/enable can be
+	 * written, init_workqueues has finished.
+	 *
+	 * Nothing can read /proc/pressure before initcalls, so skipping the kick
+	 * in this window loses no observable behaviour: WORK_STRUCT_PENDING_BIT
+	 * is left clear, so the first task change after the pool exists queues
+	 * the worker normally.
+	 */
+	if (wake_clock && system_power_efficient_wq &&
+	    !delayed_work_pending(&group->avgs_work))
 		schedule_delayed_work(&group->avgs_work, PSI_FREQ);
 }
 
@@ -993,15 +1059,13 @@ void psi_memstall_enter(unsigned long *flags)
 	/*
 	 * Nesting guard.
 	 *
-	 * Upstream tests current->flags & PF_MEMSTALL, but that cannot be
-	 * copied literally: upstream's PF_MEMSTALL is bit 0x01000000, and in
-	 * this 4.4 tree 0x01000000 is already PF_PERF_CRITICAL. The only
-	 * other 4.9 users of PF_MEMSTALL are in kernel/sched/stats.h, which
-	 * this tree does not have, so no PF_ bit needs to be consumed at all.
-	 * task->psi_flags already carries exactly the bit we are about to
-	 * set, so read it instead of inventing a colliding flag.
+	 * Upstream tests current->flags & PF_MEMSTALL, but that bit is
+	 * PF_PERF_CRITICAL in this 4.4 tree. PSI_TSK_IN_MEMSTALL in
+	 * task->psi_flags plays that role. It must not be TSK_MEMSTALL itself:
+	 * that one is the per-CPU "currently counted" state and is cleared on
+	 * every dequeue for migration, see psi_types.h.
 	 */
-	*flags = current->psi_flags & TSK_MEMSTALL;
+	*flags = current->psi_flags & PSI_TSK_IN_MEMSTALL;
 	if (*flags)
 		return;
 
@@ -1017,6 +1081,7 @@ void psi_memstall_enter(unsigned long *flags)
 	rq = task_rq_lock(current, &rf);
 
 	psi_task_change(current, 0, TSK_MEMSTALL);
+	current->psi_flags |= PSI_TSK_IN_MEMSTALL;
 
 	task_rq_unlock(rq, current, &rf);
 }
@@ -1041,6 +1106,7 @@ void psi_memstall_leave(unsigned long *flags)
 	rq = task_rq_lock(current, &rf);
 
 	psi_task_change(current, TSK_MEMSTALL, 0);
+	current->psi_flags &= ~PSI_TSK_IN_MEMSTALL;
 
 	task_rq_unlock(rq, current, &rf);
 }
