@@ -7,6 +7,9 @@
  * it should be helpful in ramdump.
  */
 static unsigned int pmucal_rae_seq_idx;
+#ifdef CONFIG_CP_PMUCAL
+static unsigned int pmucal_rae_cp_seq_idx;
+#endif
 
 /**
  *  pmucal_rae_phy2virt - converts a sequence's PA to VA described in pmucal_p2v_list.
@@ -93,8 +96,23 @@ static int pmucal_rae_wait(struct pmucal_seq *seq)
 		if (timeout > 1000) {
 			u32 reg;
 			reg = __raw_readl(seq->base_va + seq->offset);
+			/*
+			 * Print the index of the sequence actually being
+			 * run. The CP path tracks its own index in
+			 * pmucal_rae_cp_seq_idx; printing the CPU/system
+			 * one here reported indices that do not exist in
+			 * the CP tables (e.g. seq_idx = 9 for cp_init[],
+			 * which has 3 entries), which made the failing
+			 * step impossible to identify.
+			 */
 			pr_err("%s %s:timed out during wait. (value:0x%x, seq_idx = %d)\n",
-						PMUCAL_PREFIX, __func__, reg, pmucal_rae_seq_idx);
+						PMUCAL_PREFIX, __func__, reg,
+#ifdef CONFIG_CP_PMUCAL
+						pmucal_rae_cp_seq_idx
+#else
+						pmucal_rae_seq_idx
+#endif
+						);
 			return -ETIMEDOUT;
 		}
 	}
@@ -266,7 +284,7 @@ int pmucal_rae_handle_seq(struct pmucal_seq *seq, unsigned int seq_size)
  */
 
 #ifdef CONFIG_CP_PMUCAL
-static unsigned int pmucal_rae_cp_seq_idx;
+/* pmucal_rae_cp_seq_idx is defined at the top of this file. */
 int pmucal_rae_handle_cp_seq(struct pmucal_seq *seq, unsigned int seq_size)
 {
 	int ret, i;
