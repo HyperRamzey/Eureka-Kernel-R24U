@@ -514,14 +514,33 @@ int sec_nfc_i2c_probe(struct i2c_client *client)
 		 * androidboot.mode= (see sec_batt.c sec_bat_is_lpm_check), NOT a
 		 * state inherited across reboots.
 		 */
-		if(!lpcharge) {
-			ret = gpio_direction_output(pdata->pvdd_en, 1);
-			NFC_LOG_ERR("nfc pvdd: lpcharge=%d direction_output ret=%d readback=%d\n",
-				lpcharge, ret, gpio_get_value(pdata->pvdd_en));
-		} else {
-			NFC_LOG_ERR("nfc pvdd: lpcharge=%d SKIPPED direction_output readback=%d\n",
-				lpcharge, gpio_get_value(pdata->pvdd_en));
-		}
+		/*
+		 * Fix B: drive the NFC power enable unconditionally.
+		 *
+		 * This gate used to be "if(!lpcharge)", which skipped the power-on
+		 * whenever the bootloader passed androidboot.mode=charger. Measured
+		 * on a faulted boot of this device:
+		 *
+		 *   androidboot.mode=charger  -> lpcharge=1 -> gate skipped
+		 *                                -> gpio-105 reads "in lo"
+		 *                                -> NFC unpowered
+		 *                                -> SDA-not-recovered on i2c-5,
+		 *                                   whose only client is sec-nfc@27
+		 *   no charger token          -> lpcharge=0 -> pin reads "out hi"
+		 *
+		 * An unpowered I2C slave with the bus pull-ups on a live rail clamps
+		 * SDA and SCL through its protection diodes, and after the pads are
+		 * re-muxed to GPIO the master clocks 100 times without SDA releasing.
+		 *
+		 * NFC is unusable in LP-charging mode anyway, so gating its power
+		 * enable bought nothing. Drive it always.
+		 *
+		 * Retain the logging: lpcharge is still recorded so a boot can be
+		 * correlated with the cmdline token in the capture harness.
+		 */
+		ret = gpio_direction_output(pdata->pvdd_en, 1);
+		NFC_LOG_ERR("nfc pvdd: lpcharge=%d unconditional direction_output ret=%d readback=%d\n",
+			lpcharge, ret, gpio_get_value(pdata->pvdd_en));
 	}
 #ifdef CONFIG_SEC_NFC_LDO_CONTROL
 	if (pdata->i2c_1p8 != NULL) {
