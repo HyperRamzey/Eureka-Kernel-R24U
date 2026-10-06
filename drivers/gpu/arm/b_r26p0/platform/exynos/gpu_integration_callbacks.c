@@ -173,7 +173,25 @@ void gpu_destroy_context(void *ctx)
 	mutex_unlock(&platform->gpu_vk_boost_lock);
 #endif
 #ifdef CONFIG_MALI_SEC_CL_BOOST
-    platform->cl_boost_disable = false;
+	/*
+	 * platform is assigned only by the blocks above, and every one of them is
+	 * compiled out in the EAS configuration: SCHED_EMS, SCHED_EHMP and
+	 * SCHED_HMP are all off and MALI_SEC_VK_BOOST is off, so none of the three
+	 * assignment sites survives. This store then dereferenced an uninitialised
+	 * pointer, and clang emitted no epilogue for the function at all - control
+	 * returned from gpu_dvfs_boost_lock() and fell straight through into
+	 * gpu_vendor_dispatch(), whose first instruction is ldr x8,[x0,#8]. With
+	 * x0 left as 0 by gpu_dvfs_boost_lock() that is a NULL+8 dereference and an
+	 * oops on every fd teardown.
+	 *
+	 * Measured on kernel #98 (EAS merged): 4 oops at 38.59/40.15/41.42/61.69s,
+	 * all "PC is at gpu_vendor_dispatch+0x0/0x44", fault address 0x8, all from
+	 * fput -> kbase_release -> kbase_destroy_context -> gpu_destroy_context.
+	 *
+	 * Assign platform here so the store has a real object to write through.
+	 */
+	platform = (struct exynos_context *) kbdev->platform_context;
+	platform->cl_boost_disable = false;
 #endif
 #endif /* MALI_SEC_PROBE_TEST */
 }
