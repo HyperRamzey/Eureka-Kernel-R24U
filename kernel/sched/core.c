@@ -104,6 +104,8 @@
 #endif
 
 #include "sched.h"
+
+#include <linux/sched_energy.h>
 /* PSI accounting hooks: needs struct rq + the rq lock helpers above. */
 #include "psi_hooks.h"
 #include "../workqueue_internal.h"
@@ -6531,6 +6533,9 @@ static int init_rootdomain(struct root_domain *rd)
 
 	if (cpupri_init(&rd->cpupri) != 0)
 		goto free_rto_mask;
+
+	rd->max_cap_orig_cpu = rd->min_cap_orig_cpu = -1;
+
 	return 0;
 
 free_rto_mask:
@@ -6636,11 +6641,16 @@ DEFINE_PER_CPU(int, sd_llc_id);
 DEFINE_PER_CPU(struct sched_domain *, sd_numa);
 DEFINE_PER_CPU(struct sched_domain *, sd_busy);
 DEFINE_PER_CPU(struct sched_domain *, sd_asym);
+DEFINE_PER_CPU(struct sched_domain *, sd_ea);
+DEFINE_PER_CPU(struct sched_domain *, sd_scs);
+
+/* Set when the platform energy model has been bound to a sched group (EAS). */
+bool sched_energy_present;
 
 static void update_top_cache_domain(int cpu)
 {
 	struct sched_domain *sd;
-	struct sched_domain *busy_sd = NULL;
+	struct sched_domain *busy_sd = NULL, *ea_sd = NULL;
 	int id = cpu;
 	int size = 1;
 
@@ -6661,6 +6671,23 @@ static void update_top_cache_domain(int cpu)
 
 	sd = highest_flag_domain(cpu, SD_ASYM_PACKING);
 	rcu_assign_pointer(per_cpu(sd_asym, cpu), sd);
+
+	/*
+	 * EAS: track the highest sched domain that has energy model data
+	 * attached to its groups, and the highest domain whose members share
+	 * capacity (OPP) states. Both stay NULL when the platform provides no
+	 * sched-energy-costs data, which keeps every EAS path inert.
+	 */
+	for_each_domain(cpu, sd) {
+		if (sd->groups->sge)
+			ea_sd = sd;
+		else
+			break;
+	}
+	rcu_assign_pointer(per_cpu(sd_ea, cpu), ea_sd);
+
+	sd = highest_flag_domain(cpu, SD_SHARE_CAP_STATES);
+	rcu_assign_pointer(per_cpu(sd_scs, cpu), sd);
 }
 
 /*
@@ -6966,6 +6993,83 @@ static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
 }
 
 /*
+ * Verify that the energy model data is consistent across all CPUs in a
+ * group before binding it, so the EAS cost model stays coherent (EAS).
+ */
+static void check_sched_energy_data(int cpu, sched_domain_energy_f fn,
+				    const struct cpumask *cpumask)
+{
+	struct sched_group_energy sge_watermark;
+	const struct sched_group_energy *e;
+	int y;
+
+	e = fn(cpu);
+	if (!e)
+		return;
+
+	memcpy(&sge_watermark, e, sizeof(struct sched_group_energy));
+
+	for_each_cpu(cpu, cpumask) {
+		e = fn(cpu);
+		if (!e)
+			goto out;
+
+		if (e->nr_idle_states != sge_watermark.nr_idle_states)
+			goto out;
+
+		for (y = 0; y < (int)e->nr_idle_states; y++) {
+			if (e->idle_states[y].power !=
+					sge_watermark.idle_states[y].power)
+				goto out;
+		}
+
+		if (e->nr_cap_states != sge_watermark.nr_cap_states)
+			goto out;
+
+		for (y = 0; y < (int)e->nr_cap_states; y++) {
+			if (e->cap_states[y].cap !=
+					sge_watermark.cap_states[y].cap)
+				goto out;
+			if (e->cap_states[y].power !=
+					sge_watermark.cap_states[y].power)
+				goto out;
+		}
+	}
+	return;
+out:
+	pr_warn("sched-energy: inconsistent energy model data for CPU%d\n", cpu);
+}
+
+/*
+ * Attach the platform energy model to the balance CPU of each sched group
+ * at domain build time (EAS).
+ */
+static void init_sched_energy(int cpu, struct sched_domain *sd,
+			      sched_domain_energy_f fn)
+{
+	if (!(fn && fn(cpu)))
+		return;
+
+	if (cpu != group_balance_cpu(sd->groups))
+		return;
+
+	if (sd->child && !sd->child->groups->sge) {
+		pr_err("BUG: EAS setup broken for CPU%d\n", cpu);
+#ifdef CONFIG_SCHED_DEBUG
+		pr_err("     energy data on %s but not on %s domain\n",
+			sd->name, sd->child->name);
+#endif
+		return;
+	}
+
+	check_sched_energy_data(cpu, fn, sched_group_cpus(sd->groups));
+
+	sd->groups->sge = (struct sched_group_energy *)fn(cpu);
+
+	sched_energy_present = true;
+}
+
+/*
  * Initializers for schedule domains
  * Non-inlined to reduce accumulated stack pressure in build_sched_domains()
  */
@@ -7083,6 +7187,8 @@ static int sched_domains_curr_level;
 	 SD_SHARE_PKG_RESOURCES |	\
 	 SD_NUMA |			\
 	 SD_ASYM_PACKING |		\
+	 SD_ASYM_CPUCAPACITY |		\
+	 SD_SHARE_CAP_STATES |		\
 	 SD_SHARE_POWERDOMAIN |		\
 	 SD_NO_LOAD_BALANCE)
 
@@ -7681,10 +7787,13 @@ static int build_sched_domains(const struct cpumask *cpu_map,
 
 	/* Calculate CPU capacity for physical packages and nodes */
 	for (i = nr_cpumask_bits-1; i >= 0; i--) {
+		struct sched_domain_topology_level *tl = sched_domain_topology;
+
 		if (!cpumask_test_cpu(i, cpu_map))
 			continue;
 
-		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent, tl++) {
+			init_sched_energy(i, sd, tl->energy);
 			claim_allocations(i, sd);
 			init_sched_groups_capacity(i, sd);
 		}
@@ -7693,6 +7802,17 @@ static int build_sched_domains(const struct cpumask *cpu_map,
 	/* Attach the domains */
 	rcu_read_lock();
 	for_each_cpu(i, cpu_map) {
+		int max_cpu = READ_ONCE(d.rd->max_cap_orig_cpu);
+		int min_cpu = READ_ONCE(d.rd->min_cap_orig_cpu);
+
+		if ((max_cpu < 0) || (cpu_rq(i)->cpu_capacity_orig >
+		    cpu_rq(max_cpu)->cpu_capacity_orig))
+			WRITE_ONCE(d.rd->max_cap_orig_cpu, i);
+
+		if ((min_cpu < 0) || (cpu_rq(i)->cpu_capacity_orig <
+		    cpu_rq(min_cpu)->cpu_capacity_orig))
+			WRITE_ONCE(d.rd->min_cap_orig_cpu, i);
+
 		sd = *per_cpu_ptr(d.sd, i);
 		cpu_attach_domain(sd, d.rd, i);
 	}
@@ -7978,6 +8098,9 @@ void __init sched_init_smp(void)
 	alloc_cpumask_var(&fallback_doms, GFP_KERNEL);
 
 	sched_init_numa();
+
+	/* Populate sge_array[] from the sched-energy-costs DT data (EAS). */
+	init_sched_energy_costs();
 
 	get_online_cpus();
 	mutex_lock(&sched_domains_mutex);

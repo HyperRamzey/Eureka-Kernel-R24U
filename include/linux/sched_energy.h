@@ -33,10 +33,14 @@
 
 extern struct sched_group_energy *sge_array[NR_CPUS][NR_SD_LEVELS];
 
+/* True once the platform energy model has been bound to sched groups. */
+extern bool sched_energy_present;
+
 void init_sched_energy_costs(void);
 
 #else
 
+#define sched_energy_present (false)
 #define init_sched_energy_costs() do { } while (0)
 
 #endif /* CONFIG_SMP */
