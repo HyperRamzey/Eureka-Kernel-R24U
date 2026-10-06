@@ -1649,6 +1649,33 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 
 	p->default_timer_slack_ns = current->timer_slack_ns;
 
+#ifdef CONFIG_PSI
+	/*
+	 * A forked task has never been on a runqueue and has no PSI accounting
+	 * state, but arch_dup_task_struct() does *dst = *src, so it inherits the
+	 * parent's psi_flags verbatim. copy_process() in 4.9 resets this; the 4.4
+	 * backport dropped the line. Without it a child of a runnable parent
+	 * starts life with TSK_RUNNING already set, and the first
+	 * wake_up_new_task() -> activate_task() -> psi_enqueue(p, false) then asks
+	 * psi_task_change() to set a bit that is already set. That trips the
+	 * consistency check and latches psi_bug = 1 for the rest of the boot.
+	 * Measured on kernel #93, three boots, identical:
+	 *
+	 *   psi: inconsistent task state! task=3:kthreadd cpu=0
+	 *        psi_flags=4 clear=0 set=4
+	 *
+	 * psi_flags=4 is TSK_RUNNING (1 << NR_RUNNING), and clear=0 set=4 is
+	 * precisely psi_enqueue()'s "int clear = 0, set = TSK_RUNNING".
+	 *
+	 * sched_psi_wake_requeue is not upstream 4.9 - it is this port's own field
+	 * and needs the same treatment: a new task has never been migrated by a
+	 * wakeup, so it must start at 0 or psi_enqueue() takes the requeue branch
+	 * for a task that was never queued.
+	 */
+	p->psi_flags = 0;
+	p->sched_psi_wake_requeue = 0;
+#endif
+
 	task_io_accounting_init(&p->ioac);
 	acct_clear_integrals(p);
 
