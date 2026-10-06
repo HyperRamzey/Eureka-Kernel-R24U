@@ -461,7 +461,16 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 {
 	struct schedtune *st = css_st(css);
 
-	if (boost < -100 || boost > 100)
+	/*
+	 * Upstream accepts -100..100 and gives a negative boost a meaning in
+	 * schedtune_margin(): a negative boost is applied in proportion to the
+	 * signal instead of its complement. This 4.4 tree has no such case --
+	 * fair.c's schedtune_margin() is entirely unsigned long/unsigned long
+	 * long -- so a negative boost here would wrap and produce a garbage
+	 * margin. Accept 0..100 only. Taking s64 above is still required, so
+	 * that "-1" is parsed as -1 rather than as a huge u64.
+	 */
+	if (boost < 0 || boost > 100)
 		return -EINVAL;
 
 	st->boost = boost;
@@ -706,7 +715,11 @@ int schedtune_can_attach(struct cgroup_taskset *tset)
 	struct task_struct *task;
 	struct cgroup_subsys_state *css;
 	struct boost_groups *bg;
-	struct rq_flags irq_flags;
+	/*
+	 * 4.9's lock_rq_of() takes struct rq_flags *. On 4.4 it takes
+	 * unsigned long *, as schedtune_exit_task() below already does.
+	 */
+	unsigned long irq_flags;
 	unsigned int cpu;
 	struct rq *rq;
 	int src_bg; /* Source boost group index */
