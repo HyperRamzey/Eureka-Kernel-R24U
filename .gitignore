@@ -3,3 +3,6 @@ out/*
 kernel_zip/*
 patches/*
 arch/arm64/configs/merge.config
+
+# build artefacts that a diagnostic commit once tracked
+/kernel/sched/.*.o.cmd
