@@ -273,7 +273,12 @@ static int gpu_dvfs_update_config_data_from_dt(struct kbase_device *kbdev)
 		platform->governor_type = G3D_DVFS_GOVERNOR_DEFAULT;
 	}
 
-	platform->governor_type = G3D_DVFS_GOVERNOR_BOOSTER;
+	/*
+	 * Respect the DT "governor" property ("interactive" on exynos7885).
+	 * The interactive governor jumps straight to highspeed_clock on heavy
+	 * load and is the validated stock configuration; forcing BOOSTER here
+	 * overrode the DT choice unconditionally.
+	 */
 
 	gpu_update_config_data_int(np, "gpu_dvfs_start_clock", &platform->gpu_dvfs_start_clock);
 	gpu_update_config_data_int_array(np, "gpu_dvfs_table_size", of_data_int_array, 2);
@@ -341,6 +346,8 @@ static int gpu_dvfs_update_config_data_from_dt(struct kbase_device *kbdev)
 	gpu_update_config_data_bool(np, "gpu_default_wakeup_lock", &platform->wakeup_lock);
 	gpu_update_config_data_bool(np, "gpu_dynamic_abb", &platform->dynamic_abb_status);
 	gpu_update_config_data_int(np, "gpu_dvfs_polling_time", &platform->polling_speed);
+	gpu_update_config_data_int(np, "gpu_input_boost_freq", &platform->input_boost_freq);
+	gpu_update_config_data_int(np, "gpu_input_boost_duration_ms", &platform->input_boost_duration_ms);
 	gpu_update_config_data_bool(np, "gpu_pmqos_int_disable", &platform->pmqos_int_disable);
 	gpu_update_config_data_int(np, "gpu_pmqos_mif_max_clock", &platform->pmqos_mif_max_clock);
 	gpu_update_config_data_int(np, "gpu_pmqos_mif_max_clock_base", &platform->pmqos_mif_max_clock_base);
