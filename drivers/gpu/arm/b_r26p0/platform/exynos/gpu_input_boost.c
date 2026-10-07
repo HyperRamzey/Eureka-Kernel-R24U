@@ -79,11 +79,18 @@ static void gpu_input_boost_work(struct work_struct *work)
 
 static void gpu_input_unboost_work(struct work_struct *work)
 {
+	/*
+	 * Always clear the active flag, even if the GPU is currently
+	 * powered off: the dvfs lock client table survives power cycles,
+	 * and a stale 'active' flag would suppress re-locking on the next
+	 * touch after the GPU comes back.
+	 */
+	boost_active = false;
+
 	if (!gpu_boost_get_platform())
 		return;
 
 	gpu_dvfs_clock_lock(GPU_DVFS_MIN_UNLOCK, INPUT_BOOST_LOCK, 0);
-	boost_active = false;
 }
 
 static void gpu_input_boost_kick(void)
