@@ -772,7 +772,7 @@ static int channel_init(void)
 	return 0;
 }
 
-static int acpm_ipc_probe(struct platform_device *pdev)
+static int __acpm_ipc_probe(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node;
 	struct resource *res;
@@ -841,6 +841,32 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 	}
 
 	return ret;
+}
+
+/*
+ * Intermittent boot stall: CPU0 - the boot CPU and tick owner - stops taking
+ * interrupts a few ms after this probe finishes its register setup, jiffies
+ * freeze, and the boot never completes (no oops, no watchdog). The probe is
+ * PROBE_PREFER_ASYNCHRONOUS, so which CPU runs it is up to the scheduler.
+ *
+ * Measured over 14 instrumented boots: in every stalled boot the probe ran on
+ * CPU0, in every good boot on CPU1. With the probe pinned to a non-boot CPU,
+ * 30/30 warm reboots and 10/10 low-power-charger boots completed with no
+ * stall (it stalled roughly 1 boot in 8 before). Why running it on CPU0 hangs
+ * CPU0 is not yet understood, so this is a workaround, not a root-cause fix.
+ */
+static long acpm_ipc_probe_on_cpu(void *arg)
+{
+	return __acpm_ipc_probe(arg);
+}
+
+static int acpm_ipc_probe(struct platform_device *pdev)
+{
+	int cpu = cpumask_next(0, cpu_online_mask);
+
+	if (cpu >= nr_cpu_ids)
+		return __acpm_ipc_probe(pdev);
+	return work_on_cpu(cpu, acpm_ipc_probe_on_cpu, pdev);
 }
 
 static int acpm_ipc_remove(struct platform_device *pdev)
