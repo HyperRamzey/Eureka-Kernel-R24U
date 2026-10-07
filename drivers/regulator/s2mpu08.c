@@ -864,12 +864,59 @@ static int s2mpu08_pmic_probe(struct platform_device *pdev)
 	s2mpu08_i2cdata = debugfs_create_file("i2cdata", 0644, s2mpu08_root, NULL, &s2mpu08_i2cdata_fops);
 #endif
 
-	/* Turn off CP regulators for LPM charging: L16 -> L17 -> L15 -> B9 */
+	/*
+	 * CP regulators: L16 -> L17 -> L15 -> B9.
+	 *
+	 * stock Samsung drives these DOWN whenever androidboot.mode=charger,
+	 * because stock charger mode only ever draws the battery animation: it
+	 * never boots Android and never starts the modem.
+	 *
+	 * derp_charger_token.rc turns EVERY charger boot into a full Android
+	 * boot (class_stop charger + trigger late-init), so the CP has to come
+	 * up. With the rails down, RESET_SEQUENCER_STATUS never reaches 0x5 (it
+	 * sticks at 0x3), pmucal_cp_init fails on every retry and
+	 * gsm.version.baseband stays empty. Measured 2026-10-07 on this board:
+	 *   charger boot: LDO16/17/15 = 0x2c/0x28/0x08, Buck9 = 0x18 (bits7:6=00)
+	 *                 183 pmucal_rae_wait timeouts, 171 modem failures,
+	 *                 baseband empty
+	 *   normal boot:  LDO16/17/15 = 0x6c/0x68/0x48, Buck9 = 0x98 (bit6/bit7=1)
+	 *                 0 timeouts, baseband A307FNXXS4CWH1
+	 *   control rails LDO10/LDO11 (0x37/0x38) read 0x4d/0x50 on BOTH boots,
+	 *   so the difference is specific to these four registers.
+	 *
+	 * At probe the bootloader has these rails UP on a charger boot too
+	 * (0xec/0xe8/0xc8/0xd8, bits7:6=11). It is THIS in-tree clear that
+	 * drove them to 00, and nothing ever set them again - so the culprit is
+	 * this block, not the charger-mode bootloader. With the clear removed
+	 * they settle to exactly the normal-boot values (0x6c/0x68/0x48/0x98).
+	 *
+	 * The down-write is inverted into an up-write: only the enable bit that
+	 * differs is SET (never cleared), so this is a no-op when the bootloader
+	 * already left the rails up, and it cannot disturb any other field.
+	 * Both the pre- and post- values are logged unconditionally - a silent
+	 * no-op here would be undiagnosable.
+	 */
 	if (lpcharge) {
-		s2mpu08_update_reg(s2mpu08->i2c, 0x3C, 0x00, 0xC0);	// LDO16
-		s2mpu08_update_reg(s2mpu08->i2c, 0x3D, 0x00, 0xC0);	// LDO17
-		s2mpu08_update_reg(s2mpu08->i2c, 0x3B, 0x00, 0xC0);	// LDO15
-		s2mpu08_update_reg(s2mpu08->i2c, 0x26, 0x00, 0xC0);	// Buck9
+		u8 b16 = 0, b17 = 0, b15 = 0, b9 = 0;
+
+		s2mpu08_read_reg(s2mpu08->i2c, 0x3C, &b16);	// LDO16
+		s2mpu08_read_reg(s2mpu08->i2c, 0x3D, &b17);	// LDO17
+		s2mpu08_read_reg(s2mpu08->i2c, 0x3B, &b15);	// LDO15
+		s2mpu08_read_reg(s2mpu08->i2c, 0x26, &b9);	// Buck9
+		pr_info("%s: CP rails at probe LDO16=0x%02x LDO17=0x%02x LDO15=0x%02x Buck9=0x%02x lpcharge=%d (bootloader left bits7:6=11, i.e. UP)\n",
+			__func__, b16, b17, b15, b9, lpcharge);
+
+		s2mpu08_update_reg(s2mpu08->i2c, 0x3C, 0x40, 0x40);	// LDO16 enable
+		s2mpu08_update_reg(s2mpu08->i2c, 0x3D, 0x40, 0x40);	// LDO17 enable
+		s2mpu08_update_reg(s2mpu08->i2c, 0x3B, 0x40, 0x40);	// LDO15 enable
+		s2mpu08_update_reg(s2mpu08->i2c, 0x26, 0x80, 0x80);	// Buck9 enable
+
+		s2mpu08_read_reg(s2mpu08->i2c, 0x3C, &b16);
+		s2mpu08_read_reg(s2mpu08->i2c, 0x3D, &b17);
+		s2mpu08_read_reg(s2mpu08->i2c, 0x3B, &b15);
+		s2mpu08_read_reg(s2mpu08->i2c, 0x26, &b9);
+		pr_info("%s: CP rails up-write done LDO16=0x%02x LDO17=0x%02x LDO15=0x%02x Buck9=0x%02x (enable bits SET only, never cleared; they settle to the normal-boot 0x6c/0x68/0x48/0x98 once the regulator framework drops LPM)\n",
+			__func__, b16, b17, b15, b9);
 	}
 
 	pr_info("%s s2mpu08 pmic driver Loading end\n", __func__);
