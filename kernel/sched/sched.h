@@ -10,6 +10,7 @@
 #include <linux/irq_work.h>
 #include <linux/tick.h>
 #include <linux/slab.h>
+#include <linux/jump_label.h>
 
 #include "cpupri.h"
 #include "cpudeadline.h"
@@ -621,6 +622,36 @@ extern void rto_push_irq_work_func(struct irq_work *work);
  * (such as the load balancing or the thread migration code), lock
  * acquire operations must be ordered by ascending &runqueue.
  */
+#ifdef CONFIG_UCLAMP_TASK
+/*
+ * struct uclamp_bucket - Utilization clamp bucket
+ * @value: clamp value "assigned" to a bucket
+ * @tasks: number of RUNNABLE tasks currently refcounted
+ *
+ * A bucket tracks the maximum clamp value requested by RUNNABLE tasks
+ * whose clamp maps into it ("local max aggregation"). Backported from v5.4.
+ */
+struct uclamp_bucket {
+	unsigned long value : bits_per(SCHED_CAPACITY_SCALE);
+	unsigned long tasks : BITS_PER_LONG - bits_per(SCHED_CAPACITY_SCALE);
+};
+
+/*
+ * struct uclamp_rq - rq's utilization clamp
+ * @value: currently requested clamp value (max aggregation over buckets)
+ * @bucket: utilization clamp buckets affecting the rq
+ */
+struct uclamp_rq {
+	unsigned int value;
+	struct uclamp_bucket bucket[UCLAMP_BUCKETS];
+};
+
+DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
+
+/* Max-clamp retention on idle rq */
+#define UCLAMP_FLAG_IDLE 0x01
+#endif /* CONFIG_UCLAMP_TASK */
+
 struct rq {
 	/* runqueue lock: */
 	raw_spinlock_t lock;
@@ -652,6 +683,15 @@ struct rq {
 	struct cfs_rq cfs;
 	struct rt_rq rt;
 	struct dl_rq dl;
+
+#ifdef CONFIG_UCLAMP_TASK
+	/*
+	 * Utilization clamp values based on CPU's RUNNABLE tasks:
+	 * cacheline aligned to reduce false sharing with hot fields above.
+	 */
+	struct uclamp_rq	uclamp[UCLAMP_CNT] ____cacheline_aligned;
+	unsigned int		uclamp_flags;
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
@@ -1369,6 +1409,11 @@ struct sched_class {
 
 	void (*update_curr) (struct rq *rq);
 
+#ifdef CONFIG_UCLAMP_TASK
+	/* Tasks of this class are refcounted in the rq's uclamp buckets */
+	int uclamp_enabled;
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	void (*task_move_group) (struct task_struct *p);
 #endif
@@ -2077,3 +2122,98 @@ static inline void sched_irq_work_queue(struct irq_work *work)
 		irq_work_queue_on(work, cpumask_any(cpu_online_mask));
 }
 #endif
+
+#ifdef CONFIG_UCLAMP_TASK
+unsigned int uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id);
+
+/*
+ * uclamp_util_with - clamp @util with @rq and @p effective uclamp values.
+ * @rq:		the runqueue to consider (CPU's aggregated clamps)
+ * @util:	the utilization value to clamp
+ * @p:		the task to consider (its effective clamps), if not NULL
+ *
+ * Clamps the passed @util to the max(@rq, @p) effective uclamp values.
+ * If sched_uclamp_used is disabled, @util is returned unclamped since
+ * uclamp aggregation at the rq level is disabled in the fast path too.
+ *
+ * Adapted from v5.4's uclamp_util_with() (unsigned long variant).
+ */
+static inline unsigned long
+uclamp_util_with(struct rq *rq, unsigned long util, struct task_struct *p)
+{
+	unsigned long min_util;
+	unsigned long max_util;
+
+	if (!static_branch_likely(&sched_uclamp_used))
+		return util;
+
+	min_util = READ_ONCE(rq->uclamp[UCLAMP_MIN].value);
+	max_util = READ_ONCE(rq->uclamp[UCLAMP_MAX].value);
+
+	if (p) {
+		min_util = max(min_util,
+			       (unsigned long)uclamp_eff_value(p, UCLAMP_MIN));
+		max_util = max(max_util,
+			       (unsigned long)uclamp_eff_value(p, UCLAMP_MAX));
+	}
+
+	/*
+	 * CPU's {min,max}_util clamps are MAX aggregated over RUNNABLE
+	 * tasks; combined with the task's clamps (min <= max enforced by
+	 * uclamp_validate()) this keeps min_util <= max_util.
+	 */
+	return clamp_t(unsigned long, util, min_util, max_util);
+}
+
+static inline unsigned long uclamp_util(struct rq *rq, unsigned long util)
+{
+	return uclamp_util_with(rq, util, NULL);
+}
+
+static inline bool uclamp_is_used(void)
+{
+	return static_branch_likely(&sched_uclamp_used);
+}
+
+/*
+ * uclamp_task_util_with - clamp @util with task @p's effective clamps.
+ * @p: task whose effective (requested + sysctl-capped) clamps apply
+ * @util: utilization value to clamp
+ *
+ * Callers compose their signal first (e.g. task util + schedtune
+ * margin) and let uclamp bound the result exactly once. Unchanged
+ * until userspace actually uses uclamp (sched_uclamp_used).
+ */
+static inline unsigned long
+uclamp_task_util_with(struct task_struct *p, unsigned long util)
+{
+	if (!uclamp_is_used())
+		return util;
+
+	return clamp_t(unsigned long, util,
+		       uclamp_eff_value(p, UCLAMP_MIN),
+		       uclamp_eff_value(p, UCLAMP_MAX));
+}
+#else /* !CONFIG_UCLAMP_TASK */
+static inline unsigned long
+uclamp_util_with(struct rq *rq, unsigned long util, struct task_struct *p)
+{
+	return util;
+}
+
+static inline unsigned long uclamp_util(struct rq *rq, unsigned long util)
+{
+	return util;
+}
+
+static inline bool uclamp_is_used(void)
+{
+	return false;
+}
+
+static inline unsigned long
+uclamp_task_util_with(struct task_struct *p, unsigned long util)
+{
+	return util;
+}
+#endif /* CONFIG_UCLAMP_TASK */

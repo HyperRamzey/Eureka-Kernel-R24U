@@ -207,4 +207,30 @@ int __order_base_2(unsigned long n)
 		ilog2((n) - 1) + 1) :		\
 	__order_base_2(n)			\
 )
+
+static inline __attribute__((const))
+int __bits_per(unsigned long n)
+{
+	if (n < 2)
+		return 1;
+	if (is_power_of_2(n))
+		return order_base_2(n) + 1;
+	return order_base_2(n);
+}
+
+/**
+ * bits_per - calculate the number of bits required for the argument
+ * @n: parameter
+ *
+ * This is constant-capable and can be used for compile time
+ * initializations, e.g bitfields. (Backported from v5.4 log2.h)
+ */
+#define bits_per(n)				\
+(						\
+	__builtin_constant_p(n) ? (		\
+		((n) == 0 || (n) == 1)		\
+			? 1 : ilog2(n) + 1	\
+	) :					\
+	__bits_per(n)				\
+)
 #endif /* _LINUX_LOG2_H */

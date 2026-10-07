@@ -1366,6 +1366,42 @@ config SCHED_TUNE
 
 	  If unsure, say N.
 
+config UCLAMP_TASK
+	bool "Utilization clamping for FAIR and RT tasks"
+	depends on CPU_FREQ_GOV_SCHEDUTIL
+	help
+	  This feature enables the scheduler to track the clamped utilization
+	  of each CPU based on RUNNABLE tasks currently scheduled on that CPU.
+
+	  Utilization clamping is a scheduler feature (backported from
+	  Linux v5.3) which allows user-space to bias the placement and the
+	  frequency selection of tasks by enforcing a minimum and/or maximum
+	  utilization via sched_setattr() (SCHED_FLAG_UTIL_CLAMP_MIN/MAX),
+	  or system-wide caps via:
+	    /proc/sys/kernel/sched_util_clamp_min
+	    /proc/sys/kernel/sched_util_clamp_max
+
+	  If unsure, say N.
+
+config UCLAMP_BUCKETS_COUNT
+	int "Number of supported utilization clamp buckets"
+	range 5 20
+	default 5
+	depends on UCLAMP_TASK
+	help
+	  Defines the number of clamp buckets to use. The range of each bucket
+	  will be SCHED_CAPACITY_SCALE/UCLAMP_BUCKETS_COUNT. The higher the
+	  number of buckets the more precise the clamping aggregation and
+	  tracking of RUNNABLE tasks.
+
+	  For example, with the default 5 buckets on a 1024 capacity scale,
+	  there will be 5 buckets each tracking tracks tasks in the
+	  following ranges:
+	    20% bucket: [0..204], 40%: [205..409], 60%: [410..614]
+	    80% bucket: [615..819], 100%: [820..1024]
+
+	  If unsure, keep the default value.
+
 config DEFAULT_USE_ENERGY_AWARE
 	bool "Default to enabling the Energy Aware Scheduler feature"
 	default n
