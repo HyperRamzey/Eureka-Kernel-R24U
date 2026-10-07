@@ -25,6 +25,7 @@
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <linux/slab.h>
+#include <linux/rwsem.h>
 #include <asm/topology.h>
 
 #define BOOST_DURATION_MS	CONFIG_CPU_INPUT_BOOST_DURATION_MS
@@ -35,9 +36,15 @@
 struct boost_drv {
 	struct workqueue_struct *wq;
 	struct work_struct input_boost;
-	struct delayed_work input_unboost;
 	struct work_struct max_boost;
-	struct delayed_work max_unboost;
+	/*
+	 * One unboost timer for both boosts, with a shared absolute
+	 * deadline (unboost_deadline).  With two timers the touch one
+	 * could fire inside the wake window and its handler restored
+	 * both clusters, collapsing the 1000 ms wake boost to 250 ms.
+	 */
+	struct delayed_work unboost;
+	unsigned long unboost_deadline;
 	struct notifier_block fb_notif;
 	struct notifier_block cpu_notif;
 	bool screen_awake;
@@ -75,6 +82,7 @@ static void __cpu_input_boost(struct boost_drv *b, bool wake)
 	unsigned int duration = wake ? WAKE_BOOST_DURATION_MS : BOOST_DURATION_MS;
 	unsigned int cpu;
 	unsigned int big_top = 0;
+	unsigned long new_deadline;
 
 	get_online_cpus();
 	/* Pass 1: the big cluster is the one with the higher top freq. */
@@ -92,6 +100,7 @@ static void __cpu_input_boost(struct boost_drv *b, bool wake)
 	for_each_online_cpu(cpu) {
 		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
 		unsigned int boost_freq;
+		bool changed;
 
 		if (!policy)
 			continue;
@@ -108,49 +117,115 @@ static void __cpu_input_boost(struct boost_drv *b, bool wake)
 		 * discarded synchronously, before the governor sees it.
 		 * Raise the persisted floor instead and let update_policy()
 		 * propagate it; the caller's own floor is remembered for
-		 * unboost.  Nothing to do if it is already high enough.
+		 * unboost.
+		 *
+		 * The read-modify-write is done under the same rwsem the
+		 * sysfs scaling_*_freq writers take (store(), cpufreq.c),
+		 * or a concurrent scaling_min_freq write is overwritten.
+		 * The lock has to be dropped before cpufreq_update_policy(),
+		 * which takes it itself.
 		 */
+		changed = false;
+		down_write(&policy->rwsem);
 		if (policy->user_policy.min < boost_freq) {
 			if (!boosted_min[cpu])
 				saved_user_min[cpu] = policy->user_policy.min;
 			policy->user_policy.min = boost_freq;
 			boosted_min[cpu] = boost_freq;
-			cpufreq_update_policy(policy->cpu);
+			changed = true;
+		}
+		up_write(&policy->rwsem);
+
+		if (changed && cpufreq_update_policy(policy->cpu)) {
+			/*
+			 * The floor did not verify - a thermal CPUFREQ_ADJUST
+			 * can pull max below it, which makes cpufreq_set_policy()
+			 * return -EINVAL.  Undo it, or user_policy.min stays
+			 * above max and every scaling_*_freq write fails until
+			 * unboost runs.
+			 */
+			down_write(&policy->rwsem);
+			if (boosted_min[cpu]) {
+				policy->user_policy.min = saved_user_min[cpu];
+				boosted_min[cpu] = 0;
+			}
+			up_write(&policy->rwsem);
 		}
 		cpufreq_cpu_put(policy);
 	}
 	put_online_cpus();
 
-	mod_delayed_work(b->wq,
-		wake ? &b->max_unboost : &b->input_unboost,
-		msecs_to_jiffies(duration));
+	/*
+	 * One shared deadline for both boosts.  A touch inside the wake
+	 * window must not shorten it: a later touch only ever moves the
+	 * deadline forward, which is what keeps the floor up under
+	 * continuous contact.
+	 */
+	new_deadline = jiffies + msecs_to_jiffies(duration);
+	if (time_after(new_deadline, b->unboost_deadline))
+		b->unboost_deadline = new_deadline;
+	mod_delayed_work(b->wq, &b->unboost,
+			 b->unboost_deadline - jiffies);
 }
 
 static void __cpu_input_unboost(struct boost_drv *b)
 {
 	unsigned int cpu;
 
-	get_online_cpus();
-	for_each_online_cpu(cpu) {
-		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+	/*
+	 * A timer firing while a longer window is still in effect must
+	 * not restore yet, or it would end the wake boost at 250 ms.
+	 * Push it out to the shared deadline instead.
+	 */
+	if (time_before(jiffies, b->unboost_deadline)) {
+		mod_delayed_work(b->wq, &b->unboost,
+				 b->unboost_deadline - jiffies);
+		return;
+	}
 
-		if (!policy)
+	get_online_cpus();
+	/*
+	 * Walk the *possible* CPUs: one that offlined itself inside the
+	 * boost window has no online entry to visit, and its slot would
+	 * stay claimed for the rest of the boot - and a claimed slot is
+	 * what the boost guard looks at, so that cluster would stop
+	 * being raised once the policy is rebuilt from saved_user_min.
+	 */
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *policy;
+		bool restore = false;
+
+		if (!boosted_min[cpu])
 			continue;
 
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy) {
+			/* Policy went with the CPU: nothing to restore. */
+			boosted_min[cpu] = 0;
+			continue;
+		}
+
+		/*
+		 * Same rwsem the sysfs scaling_*_freq writers take, so a
+		 * scaling_min_freq write made during the boost window wins
+		 * the race.  Dropped before cpufreq_update_policy(), which
+		 * takes it itself.
+		 */
+		down_write(&policy->rwsem);
 		if (boosted_min[cpu]) {
 			unsigned int target = boosted_min[cpu];
 
 			boosted_min[cpu] = 0;
-			/*
-			 * Put the caller's floor back, but only while it is
-			 * still ours: a scaling_min_freq write made during the
-			 * boost window wins.
-			 */
+			/* Only while the floor is still ours. */
 			if (policy->user_policy.min == target) {
 				policy->user_policy.min = saved_user_min[cpu];
-				cpufreq_update_policy(policy->cpu);
+				restore = true;
 			}
 		}
+		up_write(&policy->rwsem);
+
+		if (restore)
+			cpufreq_update_policy(policy->cpu);
 		cpufreq_cpu_put(policy);
 	}
 	put_online_cpus();
@@ -163,10 +238,10 @@ static void cpu_input_boost_work(struct work_struct *work)
 	__cpu_input_boost(b, false);
 }
 
-static void cpu_input_unboost_work(struct work_struct *work)
+static void cpu_unboost_work(struct work_struct *work)
 {
 	struct boost_drv *b = container_of(to_delayed_work(work),
-					   typeof(*b), input_unboost);
+					   typeof(*b), unboost);
 
 	__cpu_input_unboost(b);
 }
@@ -176,14 +251,6 @@ static void cpu_max_boost_work(struct work_struct *work)
 	struct boost_drv *b = container_of(work, typeof(*b), max_boost);
 
 	__cpu_input_boost(b, true);
-}
-
-static void cpu_max_unboost_work(struct work_struct *work)
-{
-	struct boost_drv *b = container_of(to_delayed_work(work),
-					   typeof(*b), max_unboost);
-
-	__cpu_input_unboost(b);
 }
 
 static int cpu_boost_fb_cb(struct notifier_block *nb,
@@ -204,9 +271,11 @@ static int cpu_boost_fb_cb(struct notifier_block *nb,
 	} else {
 		/* Drop all boosts when the screen turns off */
 		cancel_work_sync(&b->input_boost);
-		cancel_delayed_work_sync(&b->input_unboost);
 		cancel_work_sync(&b->max_boost);
-		cancel_delayed_work_sync(&b->max_unboost);
+		cancel_delayed_work_sync(&b->unboost);
+		/* Clear the deadline or __cpu_input_unboost() re-arms
+		 * itself instead of dropping the floor here. */
+		b->unboost_deadline = 0;
 		__cpu_input_unboost(b);
 	}
 
@@ -226,14 +295,18 @@ static int cpu_boost_cpu_cb(struct notifier_block *nb,
 	if (action != CPU_ONLINE && action != CPU_ONLINE_FROZEN)
 		return NOTIFY_OK;
 
-	if (!delayed_work_pending(&b->input_unboost) &&
-	    !delayed_work_pending(&b->max_unboost))
+	if (!delayed_work_pending(&b->unboost))
 		return NOTIFY_OK;
 
 	if (!b->screen_awake || is_battery_saver_on())
 		return NOTIFY_OK;
 
-	__cpu_input_boost(b, delayed_work_pending(&b->max_unboost));
+	/*
+	 * Re-apply the floor to the new policy.  wake=false: the shared
+	 * deadline can only be pushed forward, so this cannot trim a
+	 * wake window that is still running.
+	 */
+	__cpu_input_boost(b, false);
 
 	return NOTIFY_OK;
 }
@@ -339,9 +412,8 @@ static int __init cpu_input_boost_init(void)
 	}
 
 	INIT_WORK(&b->input_boost, cpu_input_boost_work);
-	INIT_DELAYED_WORK(&b->input_unboost, cpu_input_unboost_work);
 	INIT_WORK(&b->max_boost, cpu_max_boost_work);
-	INIT_DELAYED_WORK(&b->max_unboost, cpu_max_unboost_work);
+	INIT_DELAYED_WORK(&b->unboost, cpu_unboost_work);
 
 	ret = input_register_handler(&cpu_input_boost_handler);
 	if (ret) {
