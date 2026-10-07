@@ -7,9 +7,11 @@
  * touch input arrives, so schedutil doesn't have to discover the load
  * ramp on its own (which on this platform costs several frames).
  *
- * Boost/unboost is done by temporarily overriding policy->min and
- * re-evaluating with cpufreq_update_policy(); the user's floor is
- * restored from policy->user_policy.min afterwards.
+ * Boost/unboost is done by temporarily raising policy->user_policy.min
+ * and re-evaluating with cpufreq_update_policy(), which propagates it
+ * into policy->min; the caller's own floor is restored on unboost.
+ * Writing policy->min directly does nothing here: cpufreq_update_policy()
+ * rebuilds it from policy->user_policy.min.
  *
  * Copyright (C) 2018-2019 Sultan Alsawaf <sultan@kerneltoast.com>.
  */
@@ -45,15 +47,26 @@ static struct boost_drv *boost_drv_g __read_mostly;
 
 /* Per-policy boosted floors, indexed by policy->cpu */
 static unsigned int boosted_min[NR_CPUS] __read_mostly;
+/* The caller's own floor, captured before we raise it, for unboost */
+static unsigned int saved_user_min[NR_CPUS] __read_mostly;
 
-static unsigned int get_boost_freq(struct cpufreq_policy *policy)
+/*
+ * exynos7885 has two cpufreq policies: cpu0-5 (6x Cortex-A53,
+ * little) and cpu6-7 (2x Cortex-A73, big).  Tell them apart by
+ * their own top frequency -- the big cluster is the faster one --
+ * rather than by cluster_id: topology.h defines
+ * topology_physical_package_id() as cluster_id, and on this DT the
+ * little cluster is package 1 while the big one is package 0, so
+ * `cluster_id ? BIG : LITTLE` picked the constants the wrong way
+ * round (measured: policy0 floored at 1560000, policy6 at 1248000).
+ *
+ * @big_top is the highest cpuinfo.max_freq across the policies, so
+ * exactly the big cluster compares equal to it.
+ */
+static unsigned int get_boost_freq(struct cpufreq_policy *policy,
+				       unsigned int big_top)
 {
-	/*
-	 * exynos7885: cluster 0 = 6x Cortex-A53 (little), cluster 1 = 2x
-	 * Cortex-A73 (big). Pick the floor by cluster id so this survives
-	 * any policy->cpu numbering.
-	 */
-	return cpu_topology[policy->cpu].cluster_id ?
+	return policy->cpuinfo.max_freq >= big_top ?
 		BIG_BOOST_FREQ : LITTLE_BOOST_FREQ;
 }
 
@@ -61,8 +74,21 @@ static void __cpu_input_boost(struct boost_drv *b, bool wake)
 {
 	unsigned int duration = wake ? WAKE_BOOST_DURATION_MS : BOOST_DURATION_MS;
 	unsigned int cpu;
+	unsigned int big_top = 0;
 
 	get_online_cpus();
+	/* Pass 1: the big cluster is the one with the higher top freq. */
+	for_each_online_cpu(cpu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+
+		if (!policy)
+			continue;
+		if (policy->cpuinfo.max_freq > big_top)
+			big_top = policy->cpuinfo.max_freq;
+		cpufreq_cpu_put(policy);
+	}
+
+	/* Pass 2: raise each cluster's floor. */
 	for_each_online_cpu(cpu) {
 		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
 		unsigned int boost_freq;
@@ -70,16 +96,27 @@ static void __cpu_input_boost(struct boost_drv *b, bool wake)
 		if (!policy)
 			continue;
 
-		boost_freq = get_boost_freq(policy);
+		boost_freq = get_boost_freq(policy, big_top);
 		if (!boost_freq || boosted_min[cpu] >= boost_freq) {
 			cpufreq_cpu_put(policy);
 			continue;
 		}
 
-		boosted_min[cpu] = boost_freq;
-		policy->min = max(boost_freq, policy->user_policy.min);
-		policy->min = min(policy->min, policy->max);
-		cpufreq_update_policy(policy->cpu);
+		/*
+		 * cpufreq_update_policy() rebuilds policy->min from
+		 * policy->user_policy.min, so writing policy->min here is
+		 * discarded synchronously, before the governor sees it.
+		 * Raise the persisted floor instead and let update_policy()
+		 * propagate it; the caller's own floor is remembered for
+		 * unboost.  Nothing to do if it is already high enough.
+		 */
+		if (policy->user_policy.min < boost_freq) {
+			if (!boosted_min[cpu])
+				saved_user_min[cpu] = policy->user_policy.min;
+			policy->user_policy.min = boost_freq;
+			boosted_min[cpu] = boost_freq;
+			cpufreq_update_policy(policy->cpu);
+		}
 		cpufreq_cpu_put(policy);
 	}
 	put_online_cpus();
@@ -101,9 +138,18 @@ static void __cpu_input_unboost(struct boost_drv *b)
 			continue;
 
 		if (boosted_min[cpu]) {
+			unsigned int target = boosted_min[cpu];
+
 			boosted_min[cpu] = 0;
-			policy->min = policy->user_policy.min;
-			cpufreq_update_policy(policy->cpu);
+			/*
+			 * Put the caller's floor back, but only while it is
+			 * still ours: a scaling_min_freq write made during the
+			 * boost window wins.
+			 */
+			if (policy->user_policy.min == target) {
+				policy->user_policy.min = saved_user_min[cpu];
+				cpufreq_update_policy(policy->cpu);
+			}
 		}
 		cpufreq_cpu_put(policy);
 	}
