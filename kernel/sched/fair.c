@@ -7565,6 +7565,13 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 	boosted = get_sysctl_sched_cfs_boost() > 0;
 	prefer_idle = 0;
 #endif
+	/*
+	 * A latency-sensitive task (cpu.uclamp.latency_sensitive) gets the
+	 * same placement treatment as a schedtune prefer_idle task: prefer
+	 * an idle CPU. schedtune's own prefer_idle keeps working; this is
+	 * an OR, not a replacement.
+	 */
+	prefer_idle = prefer_idle || uclamp_latency_sensitive(p);
 
 	sd = rcu_dereference(per_cpu(sd_ea, prev_cpu));
 	/* Find a cpu with sufficient capacity */
