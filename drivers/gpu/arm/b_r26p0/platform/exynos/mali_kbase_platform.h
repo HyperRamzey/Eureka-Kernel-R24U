@@ -90,6 +90,7 @@ typedef enum {
 #endif /* CONFIG_CPU_THERMAL_IPA */
 	BOOST_LOCK,
 	PMQOS_LOCK,
+	INPUT_BOOST_LOCK,
 #ifdef CONFIG_MALI_ASV_CALIBRATION_SUPPORT
 	ASV_CALI_LOCK,
 #endif
@@ -240,6 +241,10 @@ struct exynos_context {
 	int gpu_dvfs_config_clock;
 	int user_max_lock_input;
 	int user_min_lock_input;
+
+	/* touch input boost (gpu_input_boost.c) */
+	int input_boost_freq;
+	int input_boost_duration_ms;
 
 	/* eureka custom nodes*/
 	int eureka_gpu_max_clock;

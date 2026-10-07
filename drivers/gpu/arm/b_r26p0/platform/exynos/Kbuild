@@ -32,6 +32,7 @@ obj-y += gpu_utilization.o
 obj-y += gpu_dvfs_handler.o
 obj-y += gpu_dvfs_api.o
 obj-y += gpu_dvfs_governor.o
+obj-$(CONFIG_MALI_EXYNOS_INPUT_BOOST) += gpu_input_boost.o
 obj-y += gpu_job_fence_debug.o
 obj-y += mali_kbase_clk_rate_trace.o
 obj-$(CONFIG_MALI_DEBUG_SYS) += gpu_custom_interface.o
