@@ -60,6 +60,17 @@ config MALI_SEC_CL_BOOST
     help
       Enables open cl dvfs booster.
 
+config MALI_EXYNOS_INPUT_BOOST
+	bool "Boost GPU floor clock on touch input"
+	depends on MALI_DVFS
+	default y
+	help
+	  Raises the Mali DVFS minimum clock (via the INPUT_BOOST_LOCK dvfs
+	  lock client) as soon as touch input arrives, removing the DVFS
+	  polling latency from the touch-to-frame path. Boost frequency and
+	  duration are set with the gpu_input_boost_freq and
+	  gpu_input_boost_duration_ms DT properties of the mali node.
+
 config MALI_PM_QOS
     bool "Enable DVFS with QoS"
     default y
