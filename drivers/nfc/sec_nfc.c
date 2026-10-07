@@ -498,23 +498,6 @@ int sec_nfc_i2c_probe(struct i2c_client *client)
 			return -ENODEV;
 		}
 		/*
-		 * Instrumentation only - no behaviour change.
-		 *
-		 * On a faulted boot gpio-105 (nfc_pvdd_en) reads "in lo", and
-		 * in 4.4 gpiolib debugfs "in" means the output direction was
-		 * never set through gpiolib. gpio_request() above demonstrably
-		 * succeeded (the pin carried its nfc_pvdd_en label), so either
-		 * this direction_output was skipped because lpcharge was nonzero,
-		 * or it was called and failed. The old code discarded the return
-		 * value, so the two are indistinguishable after the fact. Log
-		 * lpcharge, the return code and the readback so the next faulted
-		 * boot answers it directly.
-		 *
-		 * Note: lpcharge is a per-boot RAM variable set from the cmdline
-		 * androidboot.mode= (see sec_batt.c sec_bat_is_lpm_check), NOT a
-		 * state inherited across reboots.
-		 */
-		/*
 		 * Fix B: drive the NFC power enable unconditionally.
 		 *
 		 * This gate used to be "if(!lpcharge)", which skipped the power-on
@@ -534,13 +517,9 @@ int sec_nfc_i2c_probe(struct i2c_client *client)
 		 *
 		 * NFC is unusable in LP-charging mode anyway, so gating its power
 		 * enable bought nothing. Drive it always.
-		 *
-		 * Retain the logging: lpcharge is still recorded so a boot can be
-		 * correlated with the cmdline token in the capture harness.
-		 */
-		ret = gpio_direction_output(pdata->pvdd_en, 1);
-		NFC_LOG_ERR("nfc pvdd: lpcharge=%d unconditional direction_output ret=%d readback=%d\n",
-			lpcharge, ret, gpio_get_value(pdata->pvdd_en));
+		*/
+		gpio_direction_output(pdata->pvdd_en, 1);
+		NFC_LOG_INFO("pvdd en: %d\n", gpio_get_value(pdata->pvdd_en));
 	}
 #ifdef CONFIG_SEC_NFC_LDO_CONTROL
 	if (pdata->i2c_1p8 != NULL) {
