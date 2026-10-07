@@ -62,5 +62,35 @@
 		eureka_gpu_highspeed_clock = <1001000>;
 		eureka_gpu_highspeed_load = <75>;
 		eureka_gpu_temp_throttling = <1200000 1100000 1001000 845000 676000 343000>;
+
+		/*
+		 * DVFS table / governor data. These used to live only in
+		 * exynos7885-mali.dtsi, which is included solely by the
+		 * jackpotlte trees. Every other 7885 device (a30s included,
+		 * via exynos7885.dtsi) booted without a DVFS table, leaving
+		 * the driver's table zeroed, the governor stepping over an
+		 * empty table and every clock change rejected with
+		 * "mismatch clock error" (gpu_dvfs_get_level() always -1).
+		 */
+		interactive_info = <1001000 75 0>; /* highspeed_clock, highspeed_load, highspeed_delay */
+		gpu_dvfs_table_size = <9 7>; /*<row col>*/
+		                /* clk     min  max  down mif_min  lit_min big_max */
+		gpu_dvfs_table = < 1300000 98  100  1    1794000  1586000 0
+		                   1200000 98  100  1    1794000  1586000 0
+		                   1100000 90  100  1    1794000  1586000 0
+		                   1001000 90   95  1    1794000  1586000 0
+		                    845000 90   95  1    1352000   757000 0
+		                    676000 90   95  1     676000   757000 0
+		                    545000 90   95  1     676000   757000 0
+		                    450000 85   95  1     546000   757000 0
+		                    343000 70   90  1     420000   449000 0 >;
+		gpu_max_clock = <1300000>;
+		gpu_max_clock_limit = <1300000>;
+		gpu_temp_throttling_level_num = <6>;
+		gpu_temp_throttling = <1300000 1300000 1200000 845000 676000 450000>;
+
+		/* Touch input boost: GPU floor clock while touching the screen */
+		gpu_input_boost_freq = <845000>;
+		gpu_input_boost_duration_ms = <500>;
 	};
 };
