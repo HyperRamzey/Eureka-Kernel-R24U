@@ -473,6 +473,36 @@ config FINGERPRINT_BOOST
 	help
 	  Boosts available CPUs to max frequency on fingerprint sensor input.
 
+config CPU_INPUT_BOOST
+	bool "CPU input boost"
+	depends on CPU_FREQ
+	default n
+	help
+	  Boosts the cpufreq floor of both clusters on touch input and on
+	  screen wake, so UI threads don't have to wait for schedutil to
+	  ramp the frequency. Restores the user's floor after a short,
+	  re-triggerable window.
+
+if CPU_INPUT_BOOST
+
+config CPU_INPUT_BOOST_DURATION_MS
+	int "Input boost duration (ms)"
+	default "250"
+
+config CPU_INPUT_BOOST_WAKE_DURATION_MS
+	int "Screen-wake boost duration (ms)"
+	default "1000"
+
+config CPU_INPUT_BOOST_LITTLE_FREQ
+	int "Little-cluster boost floor (kHz)"
+	default "1248000"
+
+config CPU_INPUT_BOOST_BIG_FREQ
+	int "Big-cluster boost floor (kHz)"
+	default "1560000"
+
+endif
+
 if X86
 source "drivers/cpufreq/Kconfig.x86"
 endif
