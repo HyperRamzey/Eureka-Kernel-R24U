@@ -1599,6 +1599,13 @@ struct sched_dl_entity {
 	 * @dl_yielded tells if task gave up the cpu before consuming
 	 * all its available runtime during the last job.
 	 *
+	 * @dl_non_contending tells if the task is inactive while still
+	 * contributing to the active utilization. In other words, it
+	 * indicates if the inactive timer has been armed and its handler
+	 * has not been executed yet. This flag is useful to avoid race
+	 * conditions between the inactive timer handler and the wakeup
+	 * code.
+	 *
 	 * @dl_overrun tells if the task asked to be informed about runtime
 	 * overruns (SCHED_FLAG_DL_OVERRUN). It is set when the runtime is
 	 * exhausted, and cleared when the SIGXCPU notification has been
@@ -1606,12 +1613,22 @@ struct sched_dl_entity {
 	 */
 	int dl_throttled, dl_new, dl_boosted, dl_yielded;
 	int dl_overrun;
+	int dl_non_contending;
 
 	/*
 	 * Bandwidth enforcement timer. Each -deadline task has its
 	 * own bandwidth to be enforced, thus we need one timer per task.
 	 */
 	struct hrtimer dl_timer;
+
+	/*
+	 * Inactive timer, responsible for decreasing the active utilization
+	 * at the "0-lag time". When a -deadline task blocks, it contributes
+	 * to GRUB's active utilization until the "0-lag time", hence a
+	 * timer is needed to decrease the active utilization at the correct
+	 * time.
+	 */
+	struct hrtimer inactive_timer;
 };
 
 union rcu_special {
@@ -1771,6 +1788,7 @@ struct task_struct {
 	unsigned sched_reset_on_fork:1;
 	unsigned sched_contributes_to_load:1;
 	unsigned sched_migrated:1;
+	unsigned sched_remote_wakeup:1;
 	unsigned :0; /* force alignment to the next boundary */
 
 	/* unserialized, strictly 'current' */

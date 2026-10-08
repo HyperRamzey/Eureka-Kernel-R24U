@@ -1768,8 +1768,8 @@ static struct rq *move_queued_task(struct rq *rq, struct task_struct *p, int new
 {
 	lockdep_assert_held(&rq->lock);
 
-	dequeue_task(rq, p, 0);
 	p->on_rq = TASK_ON_RQ_MIGRATING;
+	dequeue_task(rq, p, 0);
 	set_task_cpu(p, new_cpu);
 	raw_spin_unlock(&rq->lock);
 
@@ -1777,8 +1777,8 @@ static struct rq *move_queued_task(struct rq *rq, struct task_struct *p, int new
 
 	raw_spin_lock(&rq->lock);
 	BUG_ON(task_cpu(p) != new_cpu);
-	p->on_rq = TASK_ON_RQ_QUEUED;
 	enqueue_task(rq, p, 0);
+	p->on_rq = TASK_ON_RQ_QUEUED;
 	check_preempt_curr(rq, p, 0);
 
 	return rq;
@@ -2593,14 +2593,19 @@ ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
 static void
 ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags)
 {
+	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_WAKING;
+
 	lockdep_assert_held(&rq->lock);
 
 #ifdef CONFIG_SMP
 	if (p->sched_contributes_to_load)
 		rq->nr_uninterruptible--;
+
+	if (wake_flags & WF_MIGRATED)
+		en_flags |= ENQUEUE_MIGRATED;
 #endif
 
-	ttwu_activate(rq, p, ENQUEUE_WAKEUP | ENQUEUE_WAKING);
+	ttwu_activate(rq, p, en_flags);
 	ttwu_do_wakeup(rq, p, wake_flags);
 }
 
@@ -2644,7 +2649,7 @@ void sched_ttwu_pending(void)
 	while (llist) {
 		p = llist_entry(llist, struct task_struct, wake_entry);
 		llist = llist_next(llist);
-		ttwu_do_activate(rq, p, 0);
+		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0);
 	}
 
 	lockdep_unpin_lock(&rq->lock);
@@ -2699,9 +2704,11 @@ void send_call_function_single_ipi(int cpu)
 		trace_sched_wake_idle_without_ipi(cpu);
 }
 
-static void ttwu_queue_remote(struct task_struct *p, int cpu)
+static void ttwu_queue_remote(struct task_struct *p, int cpu, int wake_flags)
 {
 	struct rq *rq = cpu_rq(cpu);
+
+	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
 
 	if (llist_add(&p->wake_entry, &cpu_rq(cpu)->wake_list)) {
 		if (!set_nr_if_polling(rq->idle))
@@ -2744,21 +2751,21 @@ bool cpus_share_cache(int this_cpu, int that_cpu)
 }
 #endif /* CONFIG_SMP */
 
-static void ttwu_queue(struct task_struct *p, int cpu)
+static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 {
 	struct rq *rq = cpu_rq(cpu);
 
 #if defined(CONFIG_SMP)
 	if (sched_feat(TTWU_QUEUE) && !cpus_share_cache(smp_processor_id(), cpu)) {
 		sched_clock_cpu(cpu); /* sync clocks x-cpu */
-		ttwu_queue_remote(p, cpu);
+		ttwu_queue_remote(p, cpu, wake_flags);
 		return;
 	}
 #endif
 
 	raw_spin_lock(&rq->lock);
 	lockdep_pin_lock(&rq->lock);
-	ttwu_do_activate(rq, p, 0);
+	ttwu_do_activate(rq, p, wake_flags);
 	lockdep_unpin_lock(&rq->lock);
 	raw_spin_unlock(&rq->lock);
 }
@@ -2887,7 +2894,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	}
 #endif /* CONFIG_SMP */
 
-	ttwu_queue(p, cpu);
+	ttwu_queue(p, cpu, wake_flags);
 stat:
 	ttwu_stat(p, cpu, wake_flags);
 out:
@@ -2948,6 +2955,7 @@ void __dl_clear_params(struct task_struct *p)
 	dl_se->dl_throttled = 0;
 	dl_se->dl_new = 1;
 	dl_se->dl_yielded = 0;
+	dl_se->dl_non_contending = 0;
 	dl_se->dl_overrun = 0;
 }
 
@@ -2998,6 +3006,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 	RB_CLEAR_NODE(&p->dl.rb_node);
 	init_dl_task_timer(&p->dl);
+	init_dl_inactive_task_timer(&p->dl);
 	__dl_clear_params(p);
 
 	INIT_LIST_HEAD(&p->rt.run_list);
@@ -3175,7 +3184,7 @@ inline struct dl_bw *dl_bw_of(int i)
 	return &cpu_rq(i)->rd->dl_bw;
 }
 
-static inline int dl_bw_cpus(int i)
+inline int dl_bw_cpus(int i)
 {
 	struct root_domain *rd = cpu_rq(i)->rd;
 	int cpus = 0;
@@ -3193,7 +3202,7 @@ inline struct dl_bw *dl_bw_of(int i)
 	return &cpu_rq(i)->dl.dl_bw;
 }
 
-static inline int dl_bw_cpus(int i)
+inline int dl_bw_cpus(int i)
 {
 	return 1;
 }
@@ -3220,7 +3229,8 @@ static int dl_overflow(struct task_struct *p, int policy,
 	u64 new_bw = dl_policy(policy) ? to_ratio(period, runtime) : 0;
 	int cpus, err = -1;
 
-	if (new_bw == p->dl.dl_bw)
+	/* !deadline task may carry old deadline bandwidth */
+	if (new_bw == p->dl.dl_bw && task_has_dl_policy(p))
 		return 0;
 
 	/*
@@ -3232,15 +3242,29 @@ static int dl_overflow(struct task_struct *p, int policy,
 	cpus = dl_bw_cpus(task_cpu(p));
 	if (dl_policy(policy) && !task_has_dl_policy(p) &&
 	    !__dl_overflow(dl_b, cpus, 0, new_bw)) {
-		__dl_add(dl_b, new_bw);
+		if (hrtimer_active(&p->dl.inactive_timer))
+			__dl_sub(dl_b, p->dl.dl_bw, cpus);
+		__dl_add(dl_b, new_bw, cpus);
 		err = 0;
 	} else if (dl_policy(policy) && task_has_dl_policy(p) &&
 		   !__dl_overflow(dl_b, cpus, p->dl.dl_bw, new_bw)) {
-		__dl_clear(dl_b, p->dl.dl_bw);
-		__dl_add(dl_b, new_bw);
+		/*
+		 * XXX this is slightly incorrect: when the task
+		 * utilization decreases, we should delay the total
+		 * utilization change until the task's 0-lag point.
+		 * But this would require to set the task's "inactive
+		 * timer" when the task is not inactive.
+		 */
+		__dl_sub(dl_b, p->dl.dl_bw, cpus);
+		__dl_add(dl_b, new_bw, cpus);
+		dl_change_utilization(p, new_bw);
 		err = 0;
 	} else if (!dl_policy(policy) && task_has_dl_policy(p)) {
-		__dl_clear(dl_b, p->dl.dl_bw);
+		/*
+		 * Do not decrease the total deadline utilization here,
+		 * switched_from_dl() will take care to do it at the correct
+		 * (0-lag) time.
+		 */
 		err = 0;
 	}
 	raw_spin_unlock(&dl_b->lock);
@@ -6331,7 +6355,7 @@ int task_can_attach(struct task_struct *p,
 			 * We will free resources in the source root_domain
 			 * later on (see set_cpus_allowed_dl()).
 			 */
-			__dl_add(dl_b, p->dl.dl_bw);
+			__dl_add(dl_b, p->dl.dl_bw, cpus);
 		}
 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
 		rcu_read_unlock_sched();
@@ -9550,6 +9574,7 @@ static void sched_dl_do_global(void)
 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
 
 		rcu_read_unlock_sched();
+		init_dl_rq_bw_ratio(&cpu_rq(cpu)->dl);
 	}
 }
 

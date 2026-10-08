@@ -186,22 +186,27 @@ static inline int dl_bandwidth_enabled(void)
 }
 
 extern struct dl_bw *dl_bw_of(int i);
+extern int dl_bw_cpus(int i);
 
 struct dl_bw {
 	raw_spinlock_t lock;
 	u64 bw, total_bw;
 };
 
+static inline void __dl_update(struct dl_bw *dl_b, s64 bw);
+
 static inline
-void __dl_clear(struct dl_bw *dl_b, u64 tsk_bw)
+void __dl_sub(struct dl_bw *dl_b, u64 tsk_bw, int cpus)
 {
 	dl_b->total_bw -= tsk_bw;
+	__dl_update(dl_b, (s32)tsk_bw / cpus);
 }
 
 static inline
-void __dl_add(struct dl_bw *dl_b, u64 tsk_bw)
+void __dl_add(struct dl_bw *dl_b, u64 tsk_bw, int cpus)
 {
 	dl_b->total_bw += tsk_bw;
+	__dl_update(dl_b, -((s32)tsk_bw / cpus));
 }
 
 static inline
@@ -210,6 +215,8 @@ bool __dl_overflow(struct dl_bw *dl_b, int cpus, u64 old_bw, u64 new_bw)
 	return dl_b->bw != -1 &&
 	       dl_b->bw * cpus < dl_b->total_bw - old_bw + new_bw;
 }
+
+extern void dl_change_utilization(struct task_struct *p, u64 new_bw);
 
 extern struct mutex sched_domains_mutex;
 
@@ -555,6 +562,31 @@ struct dl_rq {
 #endif
 	/* This is the "average utilization" for this runqueue */
 	s64 avg_bw;
+
+	/*
+	 * "Active utilization" for this runqueue: increased when a
+	 * task wakes up (becomes TASK_RUNNING) and decreased when a
+	 * task blocks
+	 */
+	u64 running_bw;
+
+	/*
+	 * Utilization of the tasks "assigned" to this runqueue (including
+	 * the tasks that are in runqueue and the tasks that executed on this
+	 * CPU and blocked). Increased when a task moves to this runqueue, and
+	 * decreased when the task moves away (migrates, changes scheduling
+	 * policy, or terminates).
+	 * This is needed to compute the "inactive utilization" for the
+	 * runqueue (inactive utilization = this_bw - running_bw).
+	 */
+	u64 this_bw;
+	u64 extra_bw;
+
+	/*
+	 * Inverse of the fraction of CPU utilization that can be reclaimed
+	 * by the GRUB algorithm.
+	 */
+	u64 bw_ratio;
 };
 
 #ifdef CONFIG_SMP
@@ -1358,6 +1390,11 @@ static const u32 prio_to_wmult[40] = {
 #endif
 #define ENQUEUE_REPLENISH	0x08
 #define ENQUEUE_RESTORE	0x10
+#ifdef CONFIG_SMP
+#define ENQUEUE_MIGRATED	0x40
+#else
+#define ENQUEUE_MIGRATED	0x00
+#endif
 
 #define DEQUEUE_SLEEP		0x01
 #define DEQUEUE_SAVE		0x02
@@ -1535,6 +1572,12 @@ extern void init_rt_schedtune_timer(struct sched_rt_entity *rt_se);
 extern struct dl_bandwidth def_dl_bandwidth;
 extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
 extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
+extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
+extern void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
+
+#define BW_SHIFT		20
+#define BW_UNIT			(1 << BW_SHIFT)
+#define RATIO_SHIFT		8
 
 unsigned long to_ratio(u64 period, u64 runtime);
 
@@ -1948,6 +1991,31 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 	unsigned long tpf, unsigned long gsf, unsigned long gpf);
 #endif /* CONFIG_NUMA_BALANCING */
 #endif /* CONFIG_SCHED_DEBUG */
+
+#ifdef CONFIG_SMP
+static inline
+void __dl_update(struct dl_bw *dl_b, s64 bw)
+{
+	struct root_domain *rd = container_of(dl_b, struct root_domain, dl_bw);
+	int i;
+
+	RCU_LOCKDEP_WARN(!rcu_read_lock_sched_held(),
+			 "sched RCU must be held");
+	for_each_cpu_and(i, rd->span, cpu_active_mask) {
+		struct rq *rq = cpu_rq(i);
+
+		rq->dl.extra_bw += bw;
+	}
+}
+#else
+static inline
+void __dl_update(struct dl_bw *dl_b, s64 bw)
+{
+	struct dl_rq *dl = container_of(dl_b, struct dl_rq, dl_bw);
+
+	dl->extra_bw += bw;
+}
+#endif
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq);
