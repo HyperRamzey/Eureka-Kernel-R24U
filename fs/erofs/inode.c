@@ -364,6 +364,7 @@ const struct inode_operations erofs_generic_iops = {
 
 const struct inode_operations erofs_symlink_iops = {
 	.follow_link = page_follow_link_light,
+	.readlink = generic_readlink,
 	.put_link = page_put_link,
 	.getattr = erofs_getattr,
 	.getxattr = generic_getxattr,
@@ -373,6 +374,7 @@ const struct inode_operations erofs_symlink_iops = {
 
 const struct inode_operations erofs_fast_symlink_iops = {
 	.follow_link = simple_follow_link,
+	.readlink = generic_readlink,
 	.getattr = erofs_getattr,
 	.getxattr = generic_getxattr,
 	.listxattr = erofs_listxattr,
