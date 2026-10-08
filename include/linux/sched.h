@@ -1598,8 +1598,14 @@ struct sched_dl_entity {
 	 *
 	 * @dl_yielded tells if task gave up the cpu before consuming
 	 * all its available runtime during the last job.
+	 *
+	 * @dl_overrun tells if the task asked to be informed about runtime
+	 * overruns (SCHED_FLAG_DL_OVERRUN). It is set when the runtime is
+	 * exhausted, and cleared when the SIGXCPU notification has been
+	 * delivered by the POSIX CPU timers code.
 	 */
 	int dl_throttled, dl_new, dl_boosted, dl_yielded;
+	int dl_overrun;
 
 	/*
 	 * Bandwidth enforcement timer. Each -deadline task has its
