@@ -331,6 +331,15 @@ struct tcp_sock {
 				 * receiver in Recovery. */
 	u32	prr_out;	/* Total number of pkts sent during Recovery. */
 	u32	delivered;	/* Total data packets delivered incl. rexmits */
+	u32	lost;		/* Total data packets lost incl. rexmits */
+	u32	app_limited;	/* limited until "delivered" reaches this val */
+	struct skb_mstamp first_tx_mstamp;  /* start of window send phase */
+	struct skb_mstamp delivered_mstamp; /* time we reached "delivered" */
+	u32	rate_delivered;    /* saved rate sample: packets delivered */
+	u32	rate_interval_us;  /* saved rate sample: time elapsed */
+	u8	rate_app_limited:1,  /* rate_{delivered,interval_us} limited? */
+		is_sack_reneg:1,    /* in recovery from loss with SACK reneg? */
+		unused_rate:6;
 
  	u32	rcv_wnd;	/* Current receiver window		*/
 	u32	write_seq;	/* Tail(+1) of data held in tcp send buffer */
