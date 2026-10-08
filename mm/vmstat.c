@@ -1219,11 +1219,43 @@ static const struct file_operations pagetypeinfo_file_ops = {
 	.release	= seq_release,
 };
 
+static bool is_zone_first_populated(pg_data_t *pgdat, struct zone *zone)
+{
+	int zid;
+
+	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
+		struct zone *compare = &pgdat->node_zones[zid];
+
+		if (populated_zone(compare))
+			return zone == compare;
+	}
+
+	return false;
+}
+
 static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 							struct zone *zone)
 {
 	int i;
 	seq_printf(m, "Node %d, zone %8s", pgdat->node_id, zone->name);
+	/*
+	 * AOSP lmkd requires "  per-node stats" as the line right after the
+	 * zone header of a node's first populated zone, with nr_inactive_file
+	 * and nr_active_file before any per-zone field: it derives the
+	 * watermarks every kill decision is gated on from this block and
+	 * returns from the whole memory-pressure cycle when it is missing.
+	 * Without it lmkd logged the pressure event and then did nothing.
+	 * The per-zone fields printed below are unchanged and are still
+	 * parsed afterwards.
+	 */
+	if (is_zone_first_populated(pgdat, zone)) {
+		seq_printf(m, "\n  per-node stats");
+		seq_printf(m, "\n      %-12s %lu",
+			vmstat_text[NR_INACTIVE_FILE],
+			node_page_state(pgdat->node_id, NR_INACTIVE_FILE));
+		seq_printf(m, "\n      %-12s %lu", vmstat_text[NR_ACTIVE_FILE],
+			node_page_state(pgdat->node_id, NR_ACTIVE_FILE));
+	}
 	seq_printf(m,
 		   "\n  pages free     %lu"
 		   "\n        min      %lu"
