@@ -1025,6 +1025,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	struct tcp_skb_cb *tcb;
 	struct tcp_out_options opts;
 	unsigned int tcp_options_size, tcp_header_size;
+	struct sk_buff *oskb = NULL;
 	struct tcp_md5sig_key *md5;
 	struct tcphdr *th;
 	int err;
@@ -1032,6 +1033,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
 
 	if (clone_it) {
+		oskb = skb;
 		skb_mstamp_get(&skb->skb_mstamp);
 
 		if (unlikely(skb_cloned(skb)))
@@ -1045,6 +1047,8 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	inet = inet_sk(sk);
 	tp = tcp_sk(sk);
 	tcb = TCP_SKB_CB(skb);
+	if (clone_it)
+		tcb->tx.in_flight = tcb->end_seq - tp->snd_una;
 	memset(&opts, 0, sizeof(opts));
 
 	if (unlikely(tcb->tcp_flags & TCPHDR_SYN))
@@ -1151,12 +1155,14 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 
 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
 
-	if (likely(err <= 0))
-		return err;
+	if (unlikely(err > 0)) {
+		tcp_enter_cwr(sk);
+		err = net_xmit_eval(err);
+	}
+	if (!err && oskb)
+		tcp_rate_skb_sent(sk, oskb);
 
-	tcp_enter_cwr(sk);
-
-	return net_xmit_eval(err);
+	return err;
 }
 
 #ifndef CONFIG_MPTCP
@@ -1710,7 +1716,8 @@ static bool tcp_nagle_check(bool partial, const struct tcp_sock *tp,
 /* Return how many segs we'd like on a TSO packet,
  * to send one TSO packet per ms
  */
-static u32 tcp_tso_autosize(const struct sock *sk, unsigned int mss_now)
+u32 tcp_tso_autosize(const struct sock *sk, unsigned int mss_now,
+		     int min_tso_segs)
 {
 	u32 bytes, segs;
 
@@ -1722,9 +1729,24 @@ static u32 tcp_tso_autosize(const struct sock *sk, unsigned int mss_now)
 	 * This preserves ACK clocking and is consistent
 	 * with tcp_tso_should_defer() heuristic.
 	 */
-	segs = max_t(u32, bytes / mss_now, sysctl_tcp_min_tso_segs);
+	segs = max_t(u32, bytes / mss_now, min_tso_segs);
 
 	return min_t(u32, segs, sk->sk_gso_max_segs);
+}
+EXPORT_SYMBOL(tcp_tso_autosize);
+
+/* Return the number of segments we want in the skb we are transmitting.
+ * See if congestion control module wants to decide; otherwise, autosize.
+ */
+static u32 tcp_tso_segs(struct sock *sk, unsigned int mss_now)
+{
+	const struct tcp_congestion_ops *ca_ops = inet_csk(sk)->icsk_ca_ops;
+	u32 tso_segs = ca_ops->tso_segs_goal ? ca_ops->tso_segs_goal(sk) : 0;
+
+	if (!tso_segs)
+		tso_segs = tcp_tso_autosize(sk, mss_now,
+					    sysctl_tcp_min_tso_segs);
+	return min_t(u32, tso_segs, sk->sk_gso_max_segs);
 }
 
 /* Returns the portion of skb which can be sent right away */
@@ -2261,7 +2283,7 @@ bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 	}
 
-	max_segs = tcp_tso_autosize(sk, mss_now);
+	max_segs = tcp_tso_segs(sk, mss_now);
 	while ((skb = tcp_send_head(sk))) {
 		unsigned int limit;
 

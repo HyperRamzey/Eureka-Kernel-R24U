@@ -718,6 +718,8 @@ int tcp_fragment(struct sock *, struct sk_buff *, u32, unsigned int, gfp_t);
 void tcp_send_probe0(struct sock *);
 void tcp_send_partial(struct sock *);
 int tcp_write_wakeup(struct sock *, int mib);
+u32 tcp_tso_autosize(const struct sock *sk, unsigned int mss_now,
+		     int min_tso_segs);
 void tcp_send_fin(struct sock *sk);
 void tcp_send_active_reset(struct sock *sk, gfp_t priority);
 int tcp_send_synack(struct sock *);
@@ -957,6 +959,15 @@ struct tcp_skb_cb {
 	union {
 		struct {
 			/* There is space for up to 20 bytes */
+			__u32 in_flight:30,/* Bytes in flight at transmit */
+			      is_app_limited:1, /* cwnd not fully used? */
+			      unused:1;
+			/* pkts S/ACKed so far upon tx of skb, incl retrans: */
+			__u32 delivered;
+			/* start of send pipeline phase */
+			struct skb_mstamp first_tx_mstamp;
+			/* when we reached the "delivered" count */
+			struct skb_mstamp delivered_mstamp;
 		} tx;   /* only used for outgoing skbs */
 		union {
 			struct inet_skb_parm	h4;
@@ -970,7 +981,37 @@ struct tcp_skb_cb {
 			struct bpf_map *map;
 		} bpf;
 	};
+
 };
+
+/*
+ * The tcp_rate.c code fills in the rate sample, and passes it back to the
+ * congestion control module that generated the send (via the
+ * tcp_congestion_ops "cong_control" hook).
+ */
+struct rate_sample {
+	struct skb_mstamp prior_mstamp; /* starting timestamp for interval */
+	u32  prior_delivered;	/* tp->delivered at "prior_mstamp" */
+	s32  delivered;		/* number of packets delivered over interval */
+	long interval_us;	/* time for tp->delivered to incr "delivered" */
+	long rtt_us;		/* RTT of last (S)ACKed packet (or -1) */
+	int  losses;		/* number of packets marked lost upon ACK */
+	u32  acked_sacked;	/* number of packets newly (S)ACKed upon ACK */
+	u32  prior_in_flight;	/* in flight before this ACK */
+	bool is_app_limited;	/* is sample from packet with bubble in pipe? */
+	bool is_retrans;	/* is sample from retransmission? */
+};
+
+/* From tcp_rate.c */
+void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb);
+void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
+			    struct rate_sample *rs);
+void tcp_rate_gen(struct sock *sk, u32 delivered, u32 lost,
+		  bool is_sack_reneg, struct skb_mstamp *now,
+		  struct rate_sample *rs);
+void tcp_rate_check_app_limited(struct sock *sk);
+
+
 
 #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
 
@@ -1066,6 +1107,14 @@ struct tcp_congestion_ops {
 	u32  (*undo_cwnd)(struct sock *sk);
 	/* hook for packet ack accounting (optional) */
 	void (*pkts_acked)(struct sock *sk, u32 num_acked, s32 rtt_us);
+	/* suggest number of segments for each skb to transmit (optional) */
+	u32 (*tso_segs_goal)(struct sock *sk);
+	/* returns the multiplier used in tcp_sndbuf_expand (optional) */
+	u32 (*sndbuf_expand)(struct sock *sk);
+	/* call when packets are delivered to update cwnd and pacing rate,
+	 * after all the ca_state processing. (optional)
+	 */
+	void (*cong_control)(struct sock *sk, const struct rate_sample *rs);
 	/* get info for inet_diag (optional) */
 	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
 			   union tcp_cc_info *info);

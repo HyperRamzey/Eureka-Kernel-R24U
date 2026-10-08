@@ -408,6 +408,7 @@ static bool tcp_ecn_rcv_ecn_echo(const struct tcp_sock *tp, const struct tcphdr 
 static void tcp_sndbuf_expand(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
+	const struct tcp_congestion_ops *ca_ops = inet_csk(sk)->icsk_ca_ops;
 	int sndmem, per_mss;
 	u32 nr_segs;
 
@@ -437,6 +438,9 @@ static void tcp_sndbuf_expand(struct sock *sk)
 	 * extra cushion (application might react slowly to POLLOUT)
 	 */
 	sndmem = 2 * nr_segs * per_mss;
+
+	if (ca_ops->sndbuf_expand)
+		sndmem *= ca_ops->sndbuf_expand(sk);
 
 	/* MPTCP: after this sndmem is the new contribution of the
 	 * current subflow to the aggregated sndbuf */
@@ -1287,12 +1291,23 @@ static void tcp_verify_retransmit_hint(struct tcp_sock *tp, struct sk_buff *skb)
 		tp->retransmit_high = TCP_SKB_CB(skb)->end_seq;
 }
 
+/* Count a packet as lost for rate-sampling (upstream tcp_sum_lost). */
+static void tcp_sum_lost(struct tcp_sock *tp, struct sk_buff *skb)
+{
+	__u8 sacked = TCP_SKB_CB(skb)->sacked;
+
+	if (!(sacked & TCPCB_LOST) ||
+	    ((sacked & TCPCB_LOST) && (sacked & TCPCB_SACKED_RETRANS)))
+		tp->lost += tcp_skb_pcount(skb);
+}
+
 static void tcp_skb_mark_lost(struct tcp_sock *tp, struct sk_buff *skb)
 {
 	if (!(TCP_SKB_CB(skb)->sacked & (TCPCB_LOST|TCPCB_SACKED_ACKED))) {
 		tcp_verify_retransmit_hint(tp, skb);
 
 		tp->lost_out += tcp_skb_pcount(skb);
+		tcp_sum_lost(tp, skb);
 		TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
 	}
 }
@@ -1301,6 +1316,7 @@ void tcp_skb_mark_lost_uncond_verify(struct tcp_sock *tp, struct sk_buff *skb)
 {
 	tcp_verify_retransmit_hint(tp, skb);
 
+	tcp_sum_lost(tp, skb);
 	if (!(TCP_SKB_CB(skb)->sacked & (TCPCB_LOST|TCPCB_SACKED_ACKED))) {
 		tp->lost_out += tcp_skb_pcount(skb);
 		TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
@@ -1482,6 +1498,7 @@ struct tcp_sacktag_state {
 	 */
 	struct skb_mstamp first_sackt;
 	struct skb_mstamp last_sackt;
+	struct rate_sample *rate;
 	int	flag;
 };
 
@@ -1650,6 +1667,7 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
 	tcp_sacktag_one(sk, state, TCP_SKB_CB(skb)->sacked,
 			start_seq, end_seq, dup_sack, pcount,
 			&skb->skb_mstamp);
+	tcp_rate_skb_delivered(sk, skb, state->rate);
 
 	if (skb == tp->lost_skb_hint)
 		tp->lost_cnt_hint += pcount;
@@ -1948,6 +1966,7 @@ static struct sk_buff *tcp_sacktag_walk(struct sk_buff *skb, struct sock *sk,
 						dup_sack,
 						tcp_skb_pcount(skb),
 						&skb->skb_mstamp);
+			tcp_rate_skb_delivered(sk, skb, state->rate);
 
 			if (!before(TCP_SKB_CB(skb)->seq,
 				    tcp_highest_sack_seq(tp)))
@@ -2326,6 +2345,8 @@ void tcp_enter_loss(struct sock *sk)
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPSACKRENEGING);
 		tp->sacked_out = 0;
 		tp->fackets_out = 0;
+		/* Mark SACK reneging until we recover from this loss event. */
+		tp->is_sack_reneg = 1;
 	}
 	tcp_clear_all_retrans_hints(tp);
 
@@ -2333,6 +2354,8 @@ void tcp_enter_loss(struct sock *sk)
 		if (skb == tcp_send_head(sk))
 			break;
 
+		if (!(TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED) || is_reneg)
+			tcp_sum_lost(tp, skb);
 		TCP_SKB_CB(skb)->sacked &= (~TCPCB_TAGBITS)|TCPCB_SACKED_ACKED;
 		if (!(TCP_SKB_CB(skb)->sacked&TCPCB_SACKED_ACKED) || is_reneg) {
 			TCP_SKB_CB(skb)->sacked &= ~TCPCB_SACKED_ACKED;
@@ -2861,8 +2884,10 @@ static bool tcp_try_undo_loss(struct sock *sk, bool frto_undo)
 			NET_INC_STATS_BH(sock_net(sk),
 					 LINUX_MIB_TCPSPURIOUSRTOS);
 		inet_csk(sk)->icsk_retransmits = 0;
-		if (frto_undo || tcp_is_sack(tp))
+		if (frto_undo || tcp_is_sack(tp)) {
 			tcp_set_ca_state(sk, TCP_CA_Open);
+			tp->is_sack_reneg = 0;
+		}
 		return true;
 	}
 	return false;
@@ -2957,6 +2982,8 @@ static void tcp_try_keep_open(struct sock *sk)
 	if (inet_csk(sk)->icsk_ca_state != state) {
 		tcp_set_ca_state(sk, state);
 		tp->high_seq = tp->snd_nxt;
+		if (state == TCP_CA_Open)
+			tp->is_sack_reneg = 0;
 	}
 }
 
@@ -3600,6 +3627,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 
 		tp->packets_out -= acked_pcount;
 		pkts_acked += acked_pcount;
+		tcp_rate_skb_delivered(sk, skb, sack->rate);
 
 		/* Initial outgoing SYN's get put onto the write_queue
 		 * just like anything else we transmit.  It is not
@@ -3771,8 +3799,15 @@ static inline bool tcp_may_raise_cwnd(const struct sock *sk, const int flag)
  * information. All transmission or retransmission are delayed afterwards.
  */
 static void tcp_cong_control(struct sock *sk, u32 ack, u32 acked_sacked,
-			     int flag)
+			     int flag, const struct rate_sample *rs)
 {
+	const struct inet_connection_sock *icsk = inet_csk(sk);
+
+	if (icsk->icsk_ca_ops->cong_control) {
+		icsk->icsk_ca_ops->cong_control(sk, rs);
+		return;
+	}
+
 	if (tcp_in_cwnd_reduction(sk)) {
 		/* Reduce cwnd if state mandates */
 		tcp_cwnd_reduction(sk, acked_sacked, flag);
@@ -4028,17 +4063,22 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_sacktag_state sack_state;
+	struct rate_sample rs = { .prior_delivered = 0 };
 	u32 prior_snd_una = tp->snd_una;
+	bool is_sack_reneg = tp->is_sack_reneg;
 	u32 ack_seq = TCP_SKB_CB(skb)->seq;
 	u32 ack = TCP_SKB_CB(skb)->ack_seq;
 	bool is_dupack = false;
 	u32 prior_fackets;
 	int prior_packets = tp->packets_out;
 	u32 prior_delivered = tp->delivered;
+	u32 prior_lost = tp->lost;
+	struct skb_mstamp now;
 	int acked = 0; /* Number of packets newly acked */
 	int rexmit = REXMIT_NONE; /* Flag to (re)transmit to recover losses */
 
 	sack_state.first_sackt.v64 = 0;
+	sack_state.rate = &rs;
 
 	/* We very likely will need to access write queue head. */
 	prefetchw(sk->sk_write_queue.next);
@@ -4065,6 +4105,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	 */
 	if (after(ack, tp->snd_nxt))
 		goto invalid_ack;
+
+	skb_mstamp_get(&now);
 
 	if (icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
 	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE)
@@ -4159,7 +4201,9 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 
 	if (icsk->icsk_pending == ICSK_TIME_RETRANS)
 		tcp_schedule_loss_probe(sk);
-	tcp_cong_control(sk, ack, tp->delivered - prior_delivered, flag);
+	tcp_rate_gen(sk, tp->delivered - prior_delivered,
+		     tp->lost - prior_lost, is_sack_reneg, &now, &rs);
+	tcp_cong_control(sk, ack, tp->delivered - prior_delivered, flag, &rs);
 	tcp_xmit_recovery(sk, rexmit);
 	return 1;
 

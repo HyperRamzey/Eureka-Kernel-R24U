@@ -425,6 +425,7 @@ void tcp_init_sock(struct sock *sk)
 	 */
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 	tp->snd_cwnd_clamp = ~0;
+	tp->app_limited = ~0U;
 	tp->mss_cache = TCP_MSS_DEFAULT;
 	u64_stats_init(&tp->syncp);
 
@@ -1119,6 +1120,7 @@ int tcp_sendpage(struct sock *sk, struct page *page, int offset,
 	int ret;
 
 	lock_sock(sk);
+	tcp_rate_check_app_limited(sk);  /* is sending application-limited? */
 	ret = tcp_sendpage_locked(sk, page, offset, size, flags);
 	release_sock(sk);
 
@@ -1451,6 +1453,7 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	int ret;
 
 	lock_sock(sk);
+	tcp_rate_check_app_limited(sk);  /* is sending application-limited? */
 	ret = tcp_sendmsg_locked(sk, msg, size);
 	release_sock(sk);
 
