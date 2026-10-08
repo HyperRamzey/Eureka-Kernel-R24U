@@ -100,6 +100,48 @@ ATOMIC_OP(xor, eor)
 #undef ATOMIC_OP_RETURN
 #undef ATOMIC_OP
 
+/*
+ * Fetch operations, backported from upstream v5.4 (ll/sc variant).
+ * Return the value held by @v before the operation.
+ */
+#define ATOMIC_FETCH_OP(name, mb, acq, rel, cl, op, asm_op, constraint)	\
+__LL_SC_INLINE int							\
+__LL_SC_PREFIX(atomic_fetch_##op##name(int i, atomic_t *v))		\
+{									\
+	int result, val;						\
+	unsigned long tmp;						\
+									\
+	asm volatile("// atomic_fetch_" #op #name "\n"			\
+"	prfm	pstl1strm, %3\n"					\
+"1:	ld" #acq "xr	%w0, %3\n"					\
+"	" #asm_op "	%w1, %w0, %w4\n"				\
+"	st" #rel "xr	%w2, %w1, %3\n"					\
+"	cbnz	%w2, 1b\n"						\
+"	" #mb								\
+	: "=&r" (result), "=&r" (val), "=&r" (tmp), "+Q" (v->counter)	\
+	: constraint (i)						\
+	: cl);								\
+									\
+	return result;							\
+}									\
+__LL_SC_EXPORT(atomic_fetch_##op##name);
+
+#define ATOMIC_FETCH_OPS(...)						\
+	ATOMIC_FETCH_OP(         , dmb ish,  , l, "memory", __VA_ARGS__)	\
+	ATOMIC_FETCH_OP(_relaxed,         ,  ,  ,         , __VA_ARGS__)	\
+	ATOMIC_FETCH_OP(_acquire,         , a,  , "memory", __VA_ARGS__)	\
+	ATOMIC_FETCH_OP(_release,         ,  , l, "memory", __VA_ARGS__)
+
+ATOMIC_FETCH_OPS(add, add, "Ir")
+ATOMIC_FETCH_OPS(sub, sub, "Jr")
+ATOMIC_FETCH_OPS(and, and, "Kr")
+ATOMIC_FETCH_OPS(or, orr, "Kr")
+ATOMIC_FETCH_OPS(xor, eor, "Kr")
+ATOMIC_FETCH_OPS(andnot, bic, "r")
+
+#undef ATOMIC_FETCH_OPS
+#undef ATOMIC_FETCH_OP
+
 #define ATOMIC64_OP(op, asm_op)						\
 __LL_SC_INLINE void							\
 __LL_SC_PREFIX(atomic64_##op(long i, atomic64_t *v))			\
@@ -162,6 +204,47 @@ ATOMIC64_OP(xor, eor)
 #undef ATOMIC64_OPS
 #undef ATOMIC64_OP_RETURN
 #undef ATOMIC64_OP
+
+/*
+ * 64-bit fetch operations (see ATOMIC_FETCH_OP above).
+ */
+#define ATOMIC64_FETCH_OP(name, mb, acq, rel, cl, op, asm_op, constraint)	\
+__LL_SC_INLINE long							\
+__LL_SC_PREFIX(atomic64_fetch_##op##name(long i, atomic64_t *v))		\
+{									\
+	long result, val;						\
+	unsigned long tmp;						\
+									\
+	asm volatile("// atomic64_fetch_" #op #name "\n"		\
+"	prfm	pstl1strm, %3\n"					\
+"1:	ld" #acq "xr	%0, %3\n"					\
+"	" #asm_op "	%1, %0, %4\n"					\
+"	st" #rel "xr	%w2, %1, %3\n"					\
+"	cbnz	%w2, 1b\n"						\
+"	" #mb								\
+	: "=&r" (result), "=&r" (val), "=&r" (tmp), "+Q" (v->counter)	\
+	: constraint (i)						\
+	: cl);								\
+									\
+	return result;							\
+}									\
+__LL_SC_EXPORT(atomic64_fetch_##op##name);
+
+#define ATOMIC64_FETCH_OPS(...)						\
+	ATOMIC64_FETCH_OP(         , dmb ish,  , l, "memory", __VA_ARGS__)\
+	ATOMIC64_FETCH_OP(_relaxed,         ,  ,  ,         , __VA_ARGS__)\
+	ATOMIC64_FETCH_OP(_acquire,         , a,  , "memory", __VA_ARGS__)\
+	ATOMIC64_FETCH_OP(_release,         ,  , l, "memory", __VA_ARGS__)
+
+ATOMIC64_FETCH_OPS(add, add, "Ir")
+ATOMIC64_FETCH_OPS(sub, sub, "Jr")
+ATOMIC64_FETCH_OPS(and, and, "Lr")
+ATOMIC64_FETCH_OPS(or, orr, "Lr")
+ATOMIC64_FETCH_OPS(xor, eor, "Lr")
+ATOMIC64_FETCH_OPS(andnot, bic, "r")
+
+#undef ATOMIC64_FETCH_OPS
+#undef ATOMIC64_FETCH_OP
 
 __LL_SC_INLINE long
 __LL_SC_PREFIX(atomic64_dec_if_positive(atomic64_t *v))
