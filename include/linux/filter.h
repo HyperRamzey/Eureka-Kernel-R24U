@@ -560,11 +560,7 @@ struct bpf_skb_data_end {
 	void *data_end;
 };
 
-struct xdp_buff {
-	void *data;
-	void *data_end;
-	void *data_hard_start;
-};
+struct xdp_buff;
 
 /* compute the linear packet data range [data, data_end) which
  * will be accessed by cls_bpf, act_bpf and lwt programs
@@ -775,6 +771,8 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 int xdp_do_redirect(struct net_device *dev,
 		    struct xdp_buff *xdp,
 		    struct bpf_prog *prog);
+int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
+		    struct xdp_buff *xdp, struct bpf_prog *xdp_prog);
 void xdp_do_flush_map(void);
 
 void bpf_warn_invalid_xdp_action(u32 act);

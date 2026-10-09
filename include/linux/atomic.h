@@ -594,7 +594,63 @@ static inline int atomic_dec_if_positive(atomic_t *v)
 }
 #endif
 
+/*
+ * Fetch operations, backported from v5.4.  The arch provides
+ * atomic_fetch_{add,sub,and,or,xor,andnot} and their ordering variants
+ * natively (asm/atomic.h); the increment/decrement and unless helpers
+ * are layered on top of them here.
+ */
+#ifndef atomic_fetch_inc
+#define atomic_fetch_inc(v)		atomic_fetch_add(1, (v))
+#endif
+#ifndef atomic_fetch_inc_relaxed
+#define atomic_fetch_inc_relaxed(v)	atomic_fetch_add_relaxed(1, (v))
+#endif
+#ifndef atomic_fetch_inc_acquire
+#define atomic_fetch_inc_acquire(v)	atomic_fetch_add_acquire(1, (v))
+#endif
+#ifndef atomic_fetch_inc_release
+#define atomic_fetch_inc_release(v)	atomic_fetch_add_release(1, (v))
+#endif
+#ifndef atomic_fetch_dec
+#define atomic_fetch_dec(v)		atomic_fetch_sub(1, (v))
+#endif
+#ifndef atomic_fetch_dec_relaxed
+#define atomic_fetch_dec_relaxed(v)	atomic_fetch_sub_relaxed(1, (v))
+#endif
+#ifndef atomic_fetch_dec_acquire
+#define atomic_fetch_dec_acquire(v)	atomic_fetch_sub_acquire(1, (v))
+#endif
+#ifndef atomic_fetch_dec_release
+#define atomic_fetch_dec_release(v)	atomic_fetch_sub_release(1, (v))
+#endif
+
+/**
+ * atomic_fetch_add_unless - add unless the number is already a given value
+ * @v: pointer of type atomic_t
+ * @a: the amount to add to v...
+ * @u: ...unless v is equal to u.
+ *
+ * Atomically adds @a to @v, so long as @v was not already @u.
+ * Returns the original value of @v.
+ */
+#ifndef atomic_fetch_add_unless
+static inline int
+atomic_fetch_add_unless(atomic_t *v, int a, int u)
+{
+	int c = atomic_read(v);
+
+	do {
+		if (unlikely(c == u))
+			break;
+	} while (!atomic_try_cmpxchg(v, &c, c + a));
+
+	return c;
+}
+#endif
+
 #define atomic_cond_read_acquire(v, c)	smp_cond_load_acquire(&(v)->counter, (c))
+#define atomic_cond_read_relaxed(v, c)	smp_cond_load_relaxed(&(v)->counter, (c))
 
 #ifdef CONFIG_GENERIC_ATOMIC64
 #include <asm-generic/atomic64.h>
@@ -607,7 +663,85 @@ static inline void atomic64_andnot(long long i, atomic64_t *v)
 }
 #endif
 
+/*
+ * atomic64 fetch helpers (see the atomic_t block above).
+ */
+#ifndef atomic64_fetch_inc
+#define atomic64_fetch_inc(v)		atomic64_fetch_add(1, (v))
+#endif
+#ifndef atomic64_fetch_inc_relaxed
+#define atomic64_fetch_inc_relaxed(v)	atomic64_fetch_add_relaxed(1, (v))
+#endif
+#ifndef atomic64_fetch_inc_acquire
+#define atomic64_fetch_inc_acquire(v)	atomic64_fetch_add_acquire(1, (v))
+#endif
+#ifndef atomic64_fetch_inc_release
+#define atomic64_fetch_inc_release(v)	atomic64_fetch_add_release(1, (v))
+#endif
+#ifndef atomic64_fetch_dec
+#define atomic64_fetch_dec(v)		atomic64_fetch_sub(1, (v))
+#endif
+#ifndef atomic64_fetch_dec_relaxed
+#define atomic64_fetch_dec_relaxed(v)	atomic64_fetch_sub_relaxed(1, (v))
+#endif
+#ifndef atomic64_fetch_dec_acquire
+#define atomic64_fetch_dec_acquire(v)	atomic64_fetch_sub_acquire(1, (v))
+#endif
+#ifndef atomic64_fetch_dec_release
+#define atomic64_fetch_dec_release(v)	atomic64_fetch_sub_release(1, (v))
+#endif
+
+/**
+ * atomic64_fetch_add_unless - add unless the number is already a given
+ * value.  Returns the original value of @v.
+ */
+#ifndef atomic64_fetch_add_unless
+static inline long long
+atomic64_fetch_add_unless(atomic64_t *v, long long a, long long u)
+{
+	long long c = atomic64_read(v);
+
+	do {
+		if (unlikely(c == u))
+			break;
+	} while (!atomic64_try_cmpxchg(v, &c, c + a));
+
+	return c;
+}
+#endif
+
+#ifndef atomic64_inc_unless_negative
+static inline int
+atomic64_inc_unless_negative(atomic64_t *p)
+{
+	long long c = atomic64_read(p);
+
+	do {
+		if (unlikely(c < 0))
+			return 0;
+	} while (!atomic64_try_cmpxchg(p, &c, c + 1));
+
+	return 1;
+}
+#endif
+
+#ifndef atomic64_dec_unless_positive
+static inline int
+atomic64_dec_unless_positive(atomic64_t *p)
+{
+	long long c = atomic64_read(p);
+
+	do {
+		if (unlikely(c > 0))
+			return 0;
+	} while (!atomic64_try_cmpxchg(p, &c, c - 1));
+
+	return 1;
+}
+#endif
+
 #define atomic64_cond_read_acquire(v, c)	smp_cond_load_acquire(&(v)->counter, (c))
+#define atomic64_cond_read_relaxed(v, c)	smp_cond_load_relaxed(&(v)->counter, (c))
 
 #include <asm-generic/atomic-long.h>
 
