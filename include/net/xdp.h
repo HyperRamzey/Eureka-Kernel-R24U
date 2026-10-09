@@ -41,6 +41,17 @@ enum xdp_mem_type {
 	MEM_TYPE_MAX,
 };
 
+#define __MEM_TYPE_SYM_MAP(FN)		\
+	FN(MEM_TYPE_PAGE_SHARED)	\
+	FN(MEM_TYPE_PAGE_ORDER0)	\
+	FN(MEM_TYPE_PAGE_POOL)		\
+	FN(MEM_TYPE_ZERO_COPY)
+
+#define __MEM_TYPE_SYM_FN(x)	\
+	{ x, #x },
+#define __MEM_TYPE_SYM_TAB	\
+	__MEM_TYPE_SYM_MAP(__MEM_TYPE_SYM_FN) { -1, 0 }
+
 /* XDP flags for ndo_xdp_xmit */
 #define XDP_XMIT_FLUSH		(1U << 0)	/* doorbell signal consumer */
 #define XDP_XMIT_FLAGS_MASK	XDP_XMIT_FLUSH

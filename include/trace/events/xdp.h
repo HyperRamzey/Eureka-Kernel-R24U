@@ -7,6 +7,8 @@
 #include <linux/netdevice.h>
 #include <linux/filter.h>
 #include <linux/tracepoint.h>
+/* struct xdp_mem_allocator (mem_connect/mem_disconnect TP_fast_assign deref it) */
+#include <net/xdp_priv.h>
 
 #define __XDP_ACT_MAP(FN)	\
 	FN(ABORTED)		\

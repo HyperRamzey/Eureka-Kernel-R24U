@@ -32,7 +32,7 @@
 #include <trace/events/sock.h>
 #include <trace/events/udp.h>
 #include <trace/events/fib.h>
-#include <trace/events/xdp.h>
+#include <trace/events/page_pool.h>
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(kfree_skb);
 
