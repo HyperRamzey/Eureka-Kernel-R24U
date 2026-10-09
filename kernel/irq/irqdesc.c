@@ -47,14 +47,11 @@ __setup("irqaffinity=", irq_affinity_setup);
 static void __init init_irq_default_affinity(void)
 {
 #ifdef CONFIG_CPUMASK_OFFSTACK
-#ifdef CONFIG_SCHED_HMP
-	if (!irq_default_affinity)
+	if (!cpumask_available(irq_default_affinity))
 		zalloc_cpumask_var(&irq_default_affinity, GFP_NOWAIT);
-#else
+#endif
 	if (cpumask_empty(irq_default_affinity))
-		cpumask_set_cpu(0, irq_default_affinity);
-#endif
-#endif
+		cpumask_setall(irq_default_affinity);
 }
 #else
 static void __init init_irq_default_affinity(void)

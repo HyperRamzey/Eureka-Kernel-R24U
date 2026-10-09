@@ -2803,6 +2803,7 @@ static inline struct hmp_domain *hmp_faster_domain(int cpu);
 #endif
 
 static inline unsigned long task_util(struct task_struct *p);
+static inline unsigned long uclamp_task_util(struct task_struct *p);
 #ifdef CONFIG_SCHED_TUNE
 static unsigned long
 schedtune_margin(unsigned long signal, unsigned long boost)
@@ -2895,7 +2896,13 @@ boosted_cpu_util(unsigned long util, int cpu)
 
 	trace_sched_boost_cpu(cpu, util, margin);
 
-	return util + margin;
+	/*
+	 * Compose on the RAW signal and enforce uclamp exactly once, on
+	 * the result: a margin computed on an already clamped signal
+	 * double-counts the boost, and a margin added after clamping can
+	 * push freq util above a requested UCLAMP_MAX.
+	 */
+	return uclamp_util(cpu_rq(cpu), util + margin);
 }
 
 static inline unsigned long
@@ -2904,7 +2911,7 @@ boosted_task_util(struct task_struct *task)
 	unsigned long util = task_util(task);
 	unsigned long margin = schedtune_task_margin(task);
 
-	return util + margin;
+	return uclamp_task_util_with(task, util + margin);
 }
 
 /*
@@ -5441,6 +5448,17 @@ static inline unsigned long task_util(struct task_struct *p)
 }
 
 /*
+ * uclamp-aware task utilization: the workload signal clamped to the task's
+ * effective utilization clamps (backported from v5.3+ uclamp). Without
+ * CONFIG_UCLAMP_TASK, or while userspace never sets a clamp, this is
+ * identical to task_util().
+ */
+static inline unsigned long uclamp_task_util(struct task_struct *p)
+{
+	return uclamp_task_util_with(p, task_util(p));
+}
+
+/*
  * Capacity headroom required before a CPU counts as having spare
  * capacity. 1280/1024 == ~20% margin, matching upstream's
  * fits_capacity() (5.4: (cap) * 1280 < (max) * 1024).
@@ -7277,8 +7295,14 @@ static inline int normalize_energy(int energy_diff)
 	 * During early setup the extents are not yet known:
 	 * schedtune_initialized is set when the first schedtune cgroup is
 	 * allocated, but the constants are only computed at late_initcall.
+	 * With CGROUP_SCHEDTUNE=n (SCHED_TUNE=y) the variable does not
+	 * exist at all; only the energy constants gate normalization then.
 	 */
+#ifdef CONFIG_CGROUP_SCHEDTUNE
 	if (unlikely(!schedtune_initialized || !schedtune_target_nrg.max_power))
+#else
+	if (unlikely(!schedtune_target_nrg.max_power))
+#endif
 		return energy_diff < 0 ? -1 : 1 ;
 
 	/* Do the scaling using positive numbers to increase the range */
@@ -7418,7 +7442,7 @@ static inline int find_best_target(struct task_struct *p, bool boosted, bool pre
 			 * accounting. The blocked utilisation may be zero.
 			 */
 			wake_util = cpu_util_wake(i, p);
-			new_util = wake_util + task_util(p);
+			new_util = wake_util + uclamp_task_util(p);
 
 			/*
 			 * Ensure the minimum capacity needed to grant the
@@ -7507,7 +7531,7 @@ static int wake_cap(struct task_struct *p, int cpu, int prev_cpu)
 	/* Bring task utilisation in sync with prev_cpu */
 	sync_entity_load_avg(&p->se);
 
-	return min_cap * 1024 < task_util(p) * capacity_margin;
+	return min_cap * 1024 < uclamp_task_util(p) * capacity_margin;
 }
 
 /*
@@ -7541,6 +7565,13 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 	boosted = get_sysctl_sched_cfs_boost() > 0;
 	prefer_idle = 0;
 #endif
+	/*
+	 * A latency-sensitive task (cpu.uclamp.latency_sensitive) gets the
+	 * same placement treatment as a schedtune prefer_idle task: prefer
+	 * an idle CPU. schedtune's own prefer_idle keeps working; this is
+	 * an OR, not a replacement.
+	 */
+	prefer_idle = prefer_idle || uclamp_latency_sensitive(p);
 
 	sd = rcu_dereference(per_cpu(sd_ea, prev_cpu));
 	/* Find a cpu with sufficient capacity */
@@ -7559,7 +7590,7 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 
 	if (target_cpu != prev_cpu) {
 		struct energy_env eenv = {
-			.util_delta     = task_util(p),
+			.util_delta     = uclamp_task_util(p),
 			.src_cpu        = prev_cpu,
 			.dst_cpu        = target_cpu,
 			.task           = p,
@@ -12044,6 +12075,10 @@ static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task
  */
 const struct sched_class fair_sched_class = {
 	.next			= &idle_sched_class,
+
+#ifdef CONFIG_UCLAMP_TASK
+	.uclamp_enabled		= 1,
+#endif
 	.enqueue_task		= enqueue_task_fair,
 	.dequeue_task		= dequeue_task_fair,
 	.yield_task		= yield_task_fair,

@@ -10,6 +10,7 @@
 #include <linux/irq_work.h>
 #include <linux/tick.h>
 #include <linux/slab.h>
+#include <linux/jump_label.h>
 
 #include "cpupri.h"
 #include "cpudeadline.h"
@@ -185,22 +186,27 @@ static inline int dl_bandwidth_enabled(void)
 }
 
 extern struct dl_bw *dl_bw_of(int i);
+extern int dl_bw_cpus(int i);
 
 struct dl_bw {
 	raw_spinlock_t lock;
 	u64 bw, total_bw;
 };
 
+static inline void __dl_update(struct dl_bw *dl_b, s64 bw);
+
 static inline
-void __dl_clear(struct dl_bw *dl_b, u64 tsk_bw)
+void __dl_sub(struct dl_bw *dl_b, u64 tsk_bw, int cpus)
 {
 	dl_b->total_bw -= tsk_bw;
+	__dl_update(dl_b, (s32)tsk_bw / cpus);
 }
 
 static inline
-void __dl_add(struct dl_bw *dl_b, u64 tsk_bw)
+void __dl_add(struct dl_bw *dl_b, u64 tsk_bw, int cpus)
 {
 	dl_b->total_bw += tsk_bw;
+	__dl_update(dl_b, -((s32)tsk_bw / cpus));
 }
 
 static inline
@@ -209,6 +215,8 @@ bool __dl_overflow(struct dl_bw *dl_b, int cpus, u64 old_bw, u64 new_bw)
 	return dl_b->bw != -1 &&
 	       dl_b->bw * cpus < dl_b->total_bw - old_bw + new_bw;
 }
+
+extern void dl_change_utilization(struct task_struct *p, u64 new_bw);
 
 extern struct mutex sched_domains_mutex;
 
@@ -281,6 +289,17 @@ struct task_group {
 #endif
 
 	struct cfs_bandwidth cfs_bandwidth;
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	/* The two decimal precision [%] value requested from user-space */
+	unsigned int		uclamp_pct[UCLAMP_CNT];
+	/* Clamp values requested for a task group */
+	struct uclamp_se	uclamp_req[UCLAMP_CNT];
+	/* Effective clamp values used for a task group */
+	struct uclamp_se	uclamp[UCLAMP_CNT];
+	/* Latency-sensitive flag used for a task group */
+	unsigned int		latency_sensitive;
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -543,6 +562,31 @@ struct dl_rq {
 #endif
 	/* This is the "average utilization" for this runqueue */
 	s64 avg_bw;
+
+	/*
+	 * "Active utilization" for this runqueue: increased when a
+	 * task wakes up (becomes TASK_RUNNING) and decreased when a
+	 * task blocks
+	 */
+	u64 running_bw;
+
+	/*
+	 * Utilization of the tasks "assigned" to this runqueue (including
+	 * the tasks that are in runqueue and the tasks that executed on this
+	 * CPU and blocked). Increased when a task moves to this runqueue, and
+	 * decreased when the task moves away (migrates, changes scheduling
+	 * policy, or terminates).
+	 * This is needed to compute the "inactive utilization" for the
+	 * runqueue (inactive utilization = this_bw - running_bw).
+	 */
+	u64 this_bw;
+	u64 extra_bw;
+
+	/*
+	 * Inverse of the fraction of CPU utilization that can be reclaimed
+	 * by the GRUB algorithm.
+	 */
+	u64 bw_ratio;
 };
 
 #ifdef CONFIG_SMP
@@ -621,6 +665,36 @@ extern void rto_push_irq_work_func(struct irq_work *work);
  * (such as the load balancing or the thread migration code), lock
  * acquire operations must be ordered by ascending &runqueue.
  */
+#ifdef CONFIG_UCLAMP_TASK
+/*
+ * struct uclamp_bucket - Utilization clamp bucket
+ * @value: clamp value "assigned" to a bucket
+ * @tasks: number of RUNNABLE tasks currently refcounted
+ *
+ * A bucket tracks the maximum clamp value requested by RUNNABLE tasks
+ * whose clamp maps into it ("local max aggregation"). Backported from v5.4.
+ */
+struct uclamp_bucket {
+	unsigned long value : bits_per(SCHED_CAPACITY_SCALE);
+	unsigned long tasks : BITS_PER_LONG - bits_per(SCHED_CAPACITY_SCALE);
+};
+
+/*
+ * struct uclamp_rq - rq's utilization clamp
+ * @value: currently requested clamp value (max aggregation over buckets)
+ * @bucket: utilization clamp buckets affecting the rq
+ */
+struct uclamp_rq {
+	unsigned int value;
+	struct uclamp_bucket bucket[UCLAMP_BUCKETS];
+};
+
+DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
+
+/* Max-clamp retention on idle rq */
+#define UCLAMP_FLAG_IDLE 0x01
+#endif /* CONFIG_UCLAMP_TASK */
+
 struct rq {
 	/* runqueue lock: */
 	raw_spinlock_t lock;
@@ -652,6 +726,15 @@ struct rq {
 	struct cfs_rq cfs;
 	struct rt_rq rt;
 	struct dl_rq dl;
+
+#ifdef CONFIG_UCLAMP_TASK
+	/*
+	 * Utilization clamp values based on CPU's RUNNABLE tasks:
+	 * cacheline aligned to reduce false sharing with hot fields above.
+	 */
+	struct uclamp_rq	uclamp[UCLAMP_CNT] ____cacheline_aligned;
+	unsigned int		uclamp_flags;
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
@@ -1307,6 +1390,11 @@ static const u32 prio_to_wmult[40] = {
 #endif
 #define ENQUEUE_REPLENISH	0x08
 #define ENQUEUE_RESTORE	0x10
+#ifdef CONFIG_SMP
+#define ENQUEUE_MIGRATED	0x40
+#else
+#define ENQUEUE_MIGRATED	0x00
+#endif
 
 #define DEQUEUE_SLEEP		0x01
 #define DEQUEUE_SAVE		0x02
@@ -1368,6 +1456,11 @@ struct sched_class {
 					 struct task_struct *task);
 
 	void (*update_curr) (struct rq *rq);
+
+#ifdef CONFIG_UCLAMP_TASK
+	/* Tasks of this class are refcounted in the rq's uclamp buckets */
+	int uclamp_enabled;
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	void (*task_move_group) (struct task_struct *p);
@@ -1479,6 +1572,12 @@ extern void init_rt_schedtune_timer(struct sched_rt_entity *rt_se);
 extern struct dl_bandwidth def_dl_bandwidth;
 extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
 extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
+extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
+extern void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
+
+#define BW_SHIFT		20
+#define BW_UNIT			(1 << BW_SHIFT)
+#define RATIO_SHIFT		8
 
 unsigned long to_ratio(u64 period, u64 runtime);
 
@@ -1893,6 +1992,31 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 #endif /* CONFIG_NUMA_BALANCING */
 #endif /* CONFIG_SCHED_DEBUG */
 
+#ifdef CONFIG_SMP
+static inline
+void __dl_update(struct dl_bw *dl_b, s64 bw)
+{
+	struct root_domain *rd = container_of(dl_b, struct root_domain, dl_bw);
+	int i;
+
+	RCU_LOCKDEP_WARN(!rcu_read_lock_sched_held(),
+			 "sched RCU must be held");
+	for_each_cpu_and(i, rd->span, cpu_active_mask) {
+		struct rq *rq = cpu_rq(i);
+
+		rq->dl.extra_bw += bw;
+	}
+}
+#else
+static inline
+void __dl_update(struct dl_bw *dl_b, s64 bw)
+{
+	struct dl_rq *dl = container_of(dl_b, struct dl_rq, dl_bw);
+
+	dl->extra_bw += bw;
+}
+#endif
+
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq);
 extern void init_dl_rq(struct dl_rq *dl_rq);
@@ -2077,3 +2201,117 @@ static inline void sched_irq_work_queue(struct irq_work *work)
 		irq_work_queue_on(work, cpumask_any(cpu_online_mask));
 }
 #endif
+
+#ifdef CONFIG_UCLAMP_TASK
+unsigned int uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id);
+
+/*
+ * uclamp_util_with - clamp @util with @rq and @p effective uclamp values.
+ * @rq:		the runqueue to consider (CPU's aggregated clamps)
+ * @util:	the utilization value to clamp
+ * @p:		the task to consider (its effective clamps), if not NULL
+ *
+ * Clamps the passed @util to the max(@rq, @p) effective uclamp values.
+ * If sched_uclamp_used is disabled, @util is returned unclamped since
+ * uclamp aggregation at the rq level is disabled in the fast path too.
+ *
+ * Adapted from v5.4's uclamp_util_with() (unsigned long variant).
+ */
+static inline unsigned long
+uclamp_util_with(struct rq *rq, unsigned long util, struct task_struct *p)
+{
+	unsigned long min_util;
+	unsigned long max_util;
+
+	if (!static_branch_likely(&sched_uclamp_used))
+		return util;
+
+	min_util = READ_ONCE(rq->uclamp[UCLAMP_MIN].value);
+	max_util = READ_ONCE(rq->uclamp[UCLAMP_MAX].value);
+
+	if (p) {
+		min_util = max(min_util,
+			       (unsigned long)uclamp_eff_value(p, UCLAMP_MIN));
+		max_util = max(max_util,
+			       (unsigned long)uclamp_eff_value(p, UCLAMP_MAX));
+	}
+
+	/*
+	 * CPU's {min,max}_util clamps are MAX aggregated over RUNNABLE
+	 * tasks; combined with the task's clamps (min <= max enforced by
+	 * uclamp_validate()) this keeps min_util <= max_util.
+	 */
+	return clamp_t(unsigned long, util, min_util, max_util);
+}
+
+static inline unsigned long uclamp_util(struct rq *rq, unsigned long util)
+{
+	return uclamp_util_with(rq, util, NULL);
+}
+
+static inline bool uclamp_is_used(void)
+{
+	return static_branch_likely(&sched_uclamp_used);
+}
+
+/*
+ * uclamp_task_util_with - clamp @util with task @p's effective clamps.
+ * @p: task whose effective (requested + sysctl-capped) clamps apply
+ * @util: utilization value to clamp
+ *
+ * Callers compose their signal first (e.g. task util + schedtune
+ * margin) and let uclamp bound the result exactly once. Unchanged
+ * until userspace actually uses uclamp (sched_uclamp_used).
+ */
+static inline unsigned long
+uclamp_task_util_with(struct task_struct *p, unsigned long util)
+{
+	if (!uclamp_is_used())
+		return util;
+
+	return clamp_t(unsigned long, util,
+		       uclamp_eff_value(p, UCLAMP_MIN),
+		       uclamp_eff_value(p, UCLAMP_MAX));
+}
+#else /* !CONFIG_UCLAMP_TASK */
+static inline unsigned long
+uclamp_util_with(struct rq *rq, unsigned long util, struct task_struct *p)
+{
+	return util;
+}
+
+static inline unsigned long uclamp_util(struct rq *rq, unsigned long util)
+{
+	return util;
+}
+
+static inline bool uclamp_is_used(void)
+{
+	return false;
+}
+
+static inline unsigned long
+uclamp_task_util_with(struct task_struct *p, unsigned long util)
+{
+	return util;
+}
+#endif /* CONFIG_UCLAMP_TASK */
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+static inline bool uclamp_latency_sensitive(struct task_struct *p)
+{
+	struct cgroup_subsys_state *css = task_css(p, cpu_cgrp_id);
+	struct task_group *tg;
+
+	if (!css)
+		return false;
+	tg = container_of(css, struct task_group, css);
+
+	return tg->latency_sensitive;
+}
+#else
+static inline bool uclamp_latency_sensitive(struct task_struct *p)
+{
+	return false;
+}
+#endif /* CONFIG_UCLAMP_TASK_GROUP */

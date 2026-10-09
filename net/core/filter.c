@@ -29,6 +29,7 @@
 #include <linux/sock_diag.h>
 #include <linux/in.h>
 #include <linux/inet.h>
+#include <trace/events/xdp.h>
 #include <linux/netdevice.h>
 #include <linux/if_packet.h>
 #include <linux/gfp.h>
@@ -2608,6 +2609,66 @@ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
 	return __bpf_tx_xdp(fwd, NULL, xdp, 0);
 }
 EXPORT_SYMBOL_GPL(xdp_do_redirect);
+
+/* Generic XDP redirect: unlike native XDP the packet is still an sk_buff, so
+ * redirecting means switching skb->dev and re-transmitting it through
+ * generic_xdp_tx().  Adapted to this tree's 4.4-style redirect_info.
+ */
+static int xdp_do_generic_redirect_map(struct net_device *dev,
+			       struct sk_buff *skb,
+			       struct xdp_buff *xdp,
+			       struct bpf_prog *xdp_prog,
+			       struct bpf_map *map)
+{
+	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
+	u32 index = ri->ifindex;
+	struct net_device *fwd;
+	int err = -EINVAL;
+
+	ri->ifindex = 0;
+	ri->map = NULL;
+
+	fwd = __dev_map_lookup_elem(map, index);
+	if (!fwd)
+		goto err;
+
+	skb->dev = fwd;
+	trace_xdp_redirect(dev, fwd, xdp_prog, XDP_REDIRECT);
+	generic_xdp_tx(skb, xdp_prog);
+	return 0;
+err:
+	bpf_warn_invalid_xdp_redirect(index);
+	return err;
+}
+
+int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
+		    struct xdp_buff *xdp, struct bpf_prog *xdp_prog)
+{
+	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
+	struct net_device *fwd;
+	u32 index;
+
+	if (ri->map)
+		return xdp_do_generic_redirect_map(dev, skb, xdp, xdp_prog,
+					   ri->map);
+
+	index = ri->ifindex;
+	ri->ifindex = 0;
+	ri->map = NULL;
+
+	fwd = dev_get_by_index_rcu(dev_net(dev), index);
+	if (unlikely(!fwd)) {
+		bpf_warn_invalid_xdp_redirect(index);
+		return -EINVAL;
+	}
+
+	skb->dev = fwd;
+	trace_xdp_redirect(dev, fwd, xdp_prog, XDP_REDIRECT);
+	generic_xdp_tx(skb, xdp_prog);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(xdp_do_generic_redirect);
+
 
 BPF_CALL_2(bpf_xdp_redirect, u32, ifindex, u64, flags)
 {
