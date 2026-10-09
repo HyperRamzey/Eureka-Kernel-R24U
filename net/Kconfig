@@ -260,6 +260,9 @@ config XPS
 	depends on SMP
 	default y
 
+config PAGE_POOL
+	bool "Page pool allocator for networking drivers"
+
 config CGROUP_NET_PRIO
 	bool "Network priority cgroup"
 	depends on CGROUPS
