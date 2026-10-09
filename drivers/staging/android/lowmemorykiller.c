@@ -105,7 +105,54 @@ void handle_lmk_event(struct task_struct *selected, short min_score_adj)
 	int res;
 	long rss_in_pages = -1;
 	char taskname[MAX_TASKNAME];
-	struct mm_struct *mm = get_task_mm(selected);
+	struct mm_struct *mm;
+	kuid_t kuid;
+	pid_t pid;
+	pid_t group_leader_pid;
+	unsigned long min_flt;
+	unsigned long maj_flt;
+	short oom_score_adj;
+	unsigned long long start_time;
+
+	/*
+	 * Snapshot everything we need from `selected` up front, under
+	 * rcu_read_lock(), before anything below can sleep.
+	 *
+	 * lowmem_scan() has already dropped its own rcu_read_lock() before
+	 * calling us, and get_cmdline() below blocks on mmap_sem and on page
+	 * faults.  Either of those is an RCU quiescent state, so during that
+	 * call `selected` can run do_exit() -> exit_creds(), which sets
+	 * selected->cred = NULL (kernel/cred.c), and can then be reaped and
+	 * RCU-freed.  Reading selected->cred afterwards compiles to
+	 * `ldr wN, [xM, #4]` on cred->uid (via task_uid()) and dereferences
+	 * NULL: that is the oops that wedged the device, at
+	 * handle_lmk_event+0xd8.
+	 *
+	 * exit_state is written by exit_notify(), which runs before
+	 * exit_creds() and long before release_task() kfree()s signal_struct,
+	 * so exit_state == 0 guarantees both pointers below are live.  A
+	 * victim that has already started exiting keeps the task_struct fields
+	 * (safe: the caller holds a reference) and gets honest fallbacks for
+	 * the rest rather than a NULL dereference.
+	 */
+	rcu_read_lock();
+	pid = selected->pid;
+	min_flt = selected->min_flt;
+	maj_flt = selected->maj_flt;
+	start_time = nsec_to_clock_t(selected->real_start_time);
+	group_leader_pid = selected->group_leader ?
+			selected->group_leader->pid : -1;
+	if (!selected->exit_state) {
+		kuid = __task_cred(selected)->uid;
+		oom_score_adj = selected->signal->oom_score_adj;
+	} else {
+		kuid = INVALID_UID;
+		oom_score_adj = min_score_adj;
+	}
+	strlcpy(taskname, selected->comm, MAX_TASKNAME);
+	rcu_read_unlock();
+
+	mm = get_task_mm(selected);
 
 	if (mm) {
 		rss_in_pages = get_mm_rss(mm);
@@ -139,16 +186,13 @@ void handle_lmk_event(struct task_struct *selected, short min_score_adj)
 
 	memcpy(event->taskname, taskname, res + 1);
 
-	event->pid = selected->pid;
-	event->uid = from_kuid_munged(current_user_ns(), task_uid(selected));
-	if (selected->group_leader)
-		event->group_leader_pid = selected->group_leader->pid;
-	else
-		event->group_leader_pid = -1;
-	event->min_flt = selected->min_flt;
-	event->maj_flt = selected->maj_flt;
-	event->oom_score_adj = selected->signal->oom_score_adj;
-	event->start_time = nsec_to_clock_t(selected->real_start_time);
+	event->pid = pid;
+	event->uid = from_kuid_munged(current_user_ns(), kuid);
+	event->group_leader_pid = group_leader_pid;
+	event->min_flt = min_flt;
+	event->maj_flt = maj_flt;
+	event->oom_score_adj = oom_score_adj;
+	event->start_time = start_time;
 	event->rss_in_pages = rss_in_pages;
 	event->min_score_adj = min_score_adj;
 
@@ -492,10 +536,26 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 
 	lowmem_print(4, "lowmem_scan %lu, %x, return %lu\n",
 		     sc->nr_to_scan, sc->gfp_mask, rem);
+
+	/*
+	 * Take a reference on the victim BEFORE dropping rcu_read_lock().
+	 * handle_lmk_event() can sleep (get_cmdline() blocks on mmap_sem and
+	 * on page faults), so it runs with no RCU protection of its own; with
+	 * this reference `selected` cannot be reaped and RCU-freed out from
+	 * under it.  The reference also keeps task_struct itself valid, which
+	 * is what makes the RCU-protected snapshot in handle_lmk_event()
+	 * meaningful.  cred, signal and group_leader are NOT covered by it -
+	 * exit_creds() nulls cred and release_task() frees signal_struct
+	 * independently - so handle_lmk_event() must still read those itself.
+	 */
+	if (selected)
+		get_task_struct(selected);
 	rcu_read_unlock();
 
-	if (selected)
+	if (selected) {
 		handle_lmk_event(selected, min_score_adj);
+		put_task_struct(selected);
+	}
 
 	if (!rem)
 		rem = SHRINK_STOP;
