@@ -12,6 +12,13 @@
 #include <linux/slab.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
+#include <net/xdp.h>
+#include <linux/printk.h>
+#include <linux/skbuff.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <net/page_pool.h>
+#include <trace/events/xdp.h>
 #include <linux/u64_stats_sync.h>
 
 #include <net/rtnetlink.h>
@@ -32,9 +39,24 @@ struct pcpu_vstats {
 	struct u64_stats_sync	syncp;
 };
 
+#define VETH_XDP_HEADROOM	256	/* v5.4 value: room for an xdp_frame */
+
+/* One rxq per veth side.  4.4 veth is single-queue, and the XDP
+ * path is synchronous (upstream defers through a ptr_ring + NAPI),
+ * so the upstream veth_rq keeps only its file-local state here.
+ */
+struct veth_rq {
+	struct page_pool	*pool;		/* page_pool consumer */
+	struct xdp_rxq_info	xdp_rxq;
+	struct xdp_mem_info	xdp_mem;	/* registered mem id+type */
+	struct bpf_prog __rcu	*xdp_prog;
+};
+
 struct veth_priv {
 	struct net_device __rcu	*peer;
 	atomic64_t		dropped;
+	struct bpf_prog		*_xdp_prog;
+	struct veth_rq		rq;
 };
 
 /*
@@ -105,8 +127,317 @@ static const struct ethtool_ops veth_ethtool_ops = {
 	.get_ethtool_stats	= veth_get_ethtool_stats,
 };
 
+static struct sk_buff *veth_build_skb(void *head, int headroom, int len,
+				      int buflen)
+{
+	struct sk_buff *skb;
+
+	if (!buflen) {
+		buflen = SKB_DATA_ALIGN(headroom + len) +
+			 SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	}
+	skb = build_skb(head, buflen);
+	if (!skb)
+		return NULL;
+
+	skb_reserve(skb, headroom);
+	skb_put(skb, len);
+
+	return skb;
+}
+
+/* Run the receiving device's XDP program on a forwarded skb.
+ *
+ * Ported from v5.4's veth_xdp_rcv_skb() minus its ptr_ring/NAPI batching:
+ * the packet is processed inline, in the transmitter's xmit context.
+ * 4.4 adaptations are marked inline.
+ */
+static int veth_xdp_rcv_skb(struct net_device *dev, struct veth_rq *rq,
+		    struct sk_buff *skb)
+{
+	u32 pktlen, headroom, act;
+	void *orig_data, *orig_data_end;
+	struct bpf_prog *xdp_prog;
+	int mac_len, delta, off;
+	struct xdp_buff xdp;
+
+	skb_orphan(skb);
+
+	rcu_read_lock();
+	xdp_prog = rcu_dereference(rq->xdp_prog);
+	if (unlikely(!xdp_prog)) {
+		rcu_read_unlock();
+		return dev_forward_skb(dev, skb);
+	}
+
+	mac_len = skb->data - skb_mac_header(skb);
+	pktlen = skb->len + mac_len;
+	headroom = skb_headroom(skb) - mac_len;
+
+	if (skb_shared(skb) || skb_head_is_locked(skb) ||
+	    skb_is_nonlinear(skb) || headroom < XDP_PACKET_HEADROOM) {
+		struct sk_buff *nskb;
+		struct page *page;
+		void *head, *start;
+
+		if (pktlen > PAGE_SIZE - VETH_XDP_HEADROOM -
+			      SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+			goto drop;
+
+		/* page_pool consumer: v5.4 takes this page from alloc_page();
+		 * here it comes from (and on failure returns to) the per-rq
+		 * page_pool registered at attach time.
+		 */
+		page = page_pool_alloc_pages(rq->pool, GFP_ATOMIC | __GFP_NOWARN);
+		if (!page)
+			goto drop;
+
+		head = page_address(page);
+		start = head + VETH_XDP_HEADROOM;
+		if (skb_copy_bits(skb, -mac_len, start, pktlen)) {
+			page_pool_put_page(rq->pool, page, false);
+			goto drop;
+		}
+
+		nskb = veth_build_skb(head, VETH_XDP_HEADROOM + mac_len,
+				      skb->len, PAGE_SIZE);
+		if (!nskb) {
+			page_pool_put_page(rq->pool, page, false);
+			goto drop;
+		}
+
+		/* 4.4 has no skb_copy_header()/skb_headers_offset_update() -
+		 * carry the metadata the stack cares about explicitly.
+		 */
+		nskb->priority = skb->priority;
+		nskb->mark = skb->mark;
+		skb_copy_hash(nskb, skb);
+		consume_skb(skb);
+		skb = nskb;
+	}
+
+	xdp.data_hard_start = skb->head;
+	xdp.data = skb_mac_header(skb);
+	xdp.data_end = xdp.data + pktlen;
+	xdp.data_meta = xdp.data;
+	xdp.rxq = &rq->xdp_rxq;
+	orig_data = xdp.data;
+	orig_data_end = xdp.data_end;
+
+	act = bpf_prog_run_xdp(xdp_prog, &xdp);
+
+	switch (act) {
+	case XDP_PASS:
+		break;
+	case XDP_TX:
+		/* skb-based TX, same helper as the generic-XDP path */
+		generic_xdp_tx(skb, xdp_prog);
+		goto consumed;
+	case XDP_REDIRECT:
+		if (xdp_do_generic_redirect(dev, skb, &xdp, xdp_prog)) {
+			/* redirect failed: the helper only reports it */
+			kfree_skb(skb);
+		}
+		goto consumed;
+	default:
+		bpf_warn_invalid_xdp_action(act);
+		/* fall through */
+	case XDP_ABORTED:
+		trace_xdp_exception(dev, xdp_prog, act);
+		/* fall through */
+	case XDP_DROP:
+		goto drop;
+	}
+	rcu_read_unlock();
+
+	delta = orig_data - xdp.data;
+	off = mac_len + delta;
+	if (off > 0)
+		__skb_push(skb, off);
+	else if (off < 0)
+		__skb_pull(skb, -off);
+	skb->mac_header -= delta;
+	off = xdp.data_end - orig_data_end;
+	if (off != 0)
+		__skb_put(skb, off);
+	skb->protocol = eth_type_trans(skb, dev);
+	/* 4.4 adaptation: no skb_metadata_set()/meta_len, so data_meta is not
+	 * propagated on PASS (same as the generic-XDP commit).
+	 *
+	 * Upstream returns the skb to its NAPI; this synchronous graft owns
+	 * delivery, so deliver here.  Returning NET_RX_SUCCESS without
+	 * delivering silently ate packets (seen on device).
+	 */
+	return dev_forward_skb(dev, skb);
+drop:
+	rcu_read_unlock();
+	kfree_skb(skb);
+	return NET_RX_DROP;
+consumed:
+	rcu_read_unlock();
+	return NET_RX_DROP;
+}
+
+static int veth_xdp_rcv(struct net_device *dev, struct veth_rq *rq,
+		    struct sk_buff *skb)
+{
+	if (!rcu_access_pointer(rq->xdp_prog))
+		return dev_forward_skb(dev, skb);
+
+	return veth_xdp_rcv_skb(dev, rq, skb);
+}
+
+static int veth_enable_xdp(struct net_device *dev)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	struct veth_rq *rq = &priv->rq;
+	static const struct page_pool_params pp_params = {
+		.pool_size = 256,
+		.nid = NUMA_NO_NODE,
+	};
+	int err;
+
+	if (rq->pool)
+		return 0;
+
+	/* page_pool consumer: one order-0 pool per rxq, registered as the
+	 * rxq's XDP memory allocator (fires trace_mem_connect).
+	 */
+	rq->pool = page_pool_create(&pp_params);
+	if (IS_ERR(rq->pool))
+		return PTR_ERR(rq->pool);
+
+	err = xdp_rxq_info_reg(&rq->xdp_rxq, dev, 0);
+	if (err)
+		goto err_pool;
+
+	err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq, MEM_TYPE_PAGE_POOL,
+				       rq->pool);
+	if (err)
+		goto err_rxq;
+
+	/* Cache the registered mem info so the rx path can stamp it onto
+	 * frames and xdp_return_buff()/xdp_return_frame() recycle into this
+
+	 * pool instead of freeing to the buddy allocator.
+	 */
+	rq->xdp_mem = rq->xdp_rxq.mem;
+	pr_info("veth: XDP attached on %s: page_pool=%p mem_id=%u "
+		"type=%d (pool-backed copy path + frame recycling)\n",
+		dev->name, rq->pool, rq->xdp_rxq.mem.id,
+		rq->xdp_rxq.mem.type);
+
+	rcu_assign_pointer(rq->xdp_prog, priv->_xdp_prog);
+	return 0;
+
+err_rxq:
+	xdp_rxq_info_unreg(&rq->xdp_rxq);
+err_pool:
+	page_pool_free(rq->pool);
+	rq->pool = NULL;
+	return err;
+}
+
+static void veth_disable_xdp(struct net_device *dev)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	struct veth_rq *rq = &priv->rq;
+
+	rcu_assign_pointer(rq->xdp_prog, NULL);
+	/* wait for in-flight RX to stop touching the pool before teardown */
+	synchronize_rcu();
+	pr_info("veth: XDP detached on %s: page_pool torn down\n",
+		dev->name);
+
+	xdp_rxq_info_unreg_mem_model(&rq->xdp_rxq);	/* fires mem_disconnect */
+	xdp_rxq_info_unreg(&rq->xdp_rxq);
+	page_pool_free(rq->pool);
+	rq->pool = NULL;
+}
+
+static int veth_xdp_set(struct net_device *dev, struct bpf_prog *prog)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	struct bpf_prog *old_prog;
+	struct net_device *peer;
+	unsigned int max_mtu;
+	int err;
+
+	old_prog = priv->_xdp_prog;
+	priv->_xdp_prog = prog;
+	peer = rtnl_dereference(priv->peer);
+
+	if (prog) {
+		if (!peer) {
+			err = -ENOTCONN;
+			goto err;
+		}
+
+		max_mtu = PAGE_SIZE - VETH_XDP_HEADROOM -
+			  peer->hard_header_len -	
+			  SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+		if (peer->mtu > max_mtu) {			err = -ERANGE;
+			goto err;
+		}
+
+		err = veth_enable_xdp(dev);
+		if (err)
+			goto err;
+
+		if (!old_prog)
+			peer->hw_features &= ~NETIF_F_GSO_SOFTWARE;
+	}
+
+	if (old_prog) {
+		if (!prog)
+			veth_disable_xdp(dev);
+
+		if (peer)
+			peer->hw_features |= NETIF_F_GSO_SOFTWARE;
+
+		bpf_prog_put(old_prog);
+	}
+
+	if ((!!old_prog ^ !!prog) && peer)
+		netdev_update_features(peer);
+
+	return 0;
+err:
+	priv->_xdp_prog = old_prog;
+
+	return err;
+}
+
+static u32 veth_xdp_query(struct net_device *dev)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	const struct bpf_prog *xdp_prog;
+
+	xdp_prog = priv->_xdp_prog;
+	if (xdp_prog)
+		return xdp_prog->aux->id;
+
+	return 0;
+}
+
+static int veth_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+{
+	switch (xdp->command) {
+	case XDP_SETUP_PROG:
+		return veth_xdp_set(dev, xdp->prog);
+	case XDP_QUERY_PROG:
+		xdp->prog_id = veth_xdp_query(dev);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+	struct veth_priv *rcv_priv;
+	int rc;
+
 	struct veth_priv *priv = netdev_priv(dev);
 	struct net_device *rcv;
 	int length = skb->len;
@@ -118,7 +449,19 @@ static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto drop;
 	}
 
-	if (likely(dev_forward_skb(rcv, skb) == NET_RX_SUCCESS)) {
+	rcv_priv = netdev_priv(rcv);
+	if (rcu_access_pointer(rcv_priv->rq.xdp_prog)) {
+		/* Native XDP on the receiving veth: hand it the packet with
+		 * skb->dev already the receiver, exactly what
+		 * dev_forward_skb() sets before netif_rx().
+		 */
+		skb->dev = rcv;
+		rc = veth_xdp_rcv(rcv, &rcv_priv->rq, skb);
+	} else {
+		rc = dev_forward_skb(rcv, skb);
+	}
+
+	if (likely(rc == NET_RX_SUCCESS)) {
 		struct pcpu_vstats *stats = this_cpu_ptr(dev->vstats);
 
 		u64_stats_update_begin(&stats->syncp);
@@ -285,6 +628,7 @@ static const struct net_device_ops veth_netdev_ops = {
 #endif
 	.ndo_get_iflink		= veth_get_iflink,
 	.ndo_features_check	= passthru_features_check,
+	.ndo_bpf		= veth_xdp,
 };
 
 #define VETH_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_ALL_TSO |    \
