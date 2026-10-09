@@ -6649,7 +6649,7 @@ static int generic_xdp_install(struct net_device *dev, struct netdev_bpf *xdp)
 		break;
 
 	case XDP_QUERY_PROG:
-		xdp->prog_attached = old != NULL;
+		xdp->prog_id = old ? old->aux->id : 0;
 		break;
 
 	default:
@@ -6674,7 +6674,7 @@ u32 __dev_xdp_query(struct net_device *dev, bpf_op_t bpf_op,
 	/* Query must always succeed. */
 	WARN_ON(bpf_op(dev, &xdp) < 0 && cmd == XDP_QUERY_PROG);
 
-	return xdp.prog_attached ? 1 : 0;
+	return xdp.prog_id;
 }
 
 static int dev_xdp_install(struct net_device *dev, bpf_op_t bpf_op,
@@ -6705,7 +6705,7 @@ static void dev_xdp_uninstall(struct net_device *dev)
 	memset(&xdp, 0, sizeof(xdp));
 	xdp.command = XDP_QUERY_PROG;
 	WARN_ON(ndo_bpf(dev, &xdp));
-	if (xdp.prog_attached)
+	if (xdp.prog_id)
 		WARN_ON(dev_xdp_install(dev, ndo_bpf, NULL));
 }
 

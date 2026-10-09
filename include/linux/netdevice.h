@@ -838,6 +838,14 @@ struct netdev_bpf {
 			struct bpf_prog *prog;
 		} offload;
 	};
+
+	/* v5.4 query-path fields (prog_attached above is kept for
+	 * 4.4 driver-era callers).  extack is deliberately absent:
+	 * 4.4 has no netlink_ext_ack. */
+	u32 prog_id;
+	u32 prog_flags;
+	u32 flags;
+
 };
 
 /*
