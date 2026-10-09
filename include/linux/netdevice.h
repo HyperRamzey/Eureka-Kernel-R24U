@@ -40,6 +40,7 @@
 #include <linux/dynamic_queue_limits.h>
 
 #include <linux/ethtool.h>
+#include <net/xdp.h>
 #include <net/net_namespace.h>
 #include <net/dsa.h>
 #ifdef CONFIG_DCB
@@ -711,6 +712,7 @@ struct netdev_rx_queue {
 #endif
 	struct kobject			kobj;
 	struct net_device		*dev;
+	struct xdp_rxq_info		xdp_rxq;
 } ____cacheline_aligned_in_smp;
 
 /*
@@ -1764,6 +1766,8 @@ struct net_device {
 	unsigned int		real_num_rx_queues;
 
 #endif
+
+	struct bpf_prog __rcu	*xdp_prog;
 
 	unsigned long		gro_flush_timeout;
 	rx_handler_func_t __rcu	*rx_handler;
@@ -3220,7 +3224,10 @@ int dev_get_phys_port_id(struct net_device *dev,
 int dev_get_phys_port_name(struct net_device *dev,
 			   char *name, size_t len);
 int dev_change_proto_down(struct net_device *dev, bool proto_down);
-int dev_change_xdp_fd(struct net_device *dev, int fd);
+typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
+int dev_change_xdp_fd(struct net_device *dev, int fd, u32 flags);
+void generic_xdp_tx(struct sk_buff *skb, struct bpf_prog *xdp_prog);
+int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb);
 struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev);
 struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 				    struct netdev_queue *txq, int *ret);
