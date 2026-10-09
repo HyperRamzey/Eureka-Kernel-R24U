@@ -343,7 +343,6 @@ int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
 	struct xdp_mem_allocator *xdp_alloc;
 	gfp_t gfp = GFP_KERNEL;
 	int id, errno, ret;
-	void *ptr;
 
 	if (xdp_rxq->reg_state != REG_STATE_REGISTERED) {
 		WARN(1, "Missing register, driver bug");
@@ -386,13 +385,30 @@ int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
 	xdp_alloc->mem  = xdp_rxq->mem;
 	xdp_alloc->allocator = allocator;
 
-	/* Insert allocator into ID lookup table */
-	ptr = rhashtable_insert_slow(mem_id_ht, &id, &xdp_alloc->node,
-				   NULL, NULL);
-	if (IS_ERR(ptr)) {
+	/* Insert allocator into ID lookup table.
+	 *
+	 * 4.4 BACKPORT FIX.  The pre-fix code called the internal
+	 * rhashtable_insert_slow() directly with a NULL bucket table, which
+	 * v5.4 tolerates only because its rhashtable_last_table() falls back to
+	 * ht->tbl.  This tree still has the older rhashtable_last_table(), which
+	 * dereferences tbl->future_tbl unconditionally, so the first XDP
+	 * mem-model registration oopses with NULL->future_tbl at offset 0x38:
+	 *
+	 *   rhashtable_insert_slow+0x44        ldr x3, [x3, #0x38]
+	 *   xdp_rxq_info_reg_mem_model+0x18c
+	 *   veth_xdp+0x19c -> dev_change_xdp_fd -> SyS_sendto
+	 *
+	 * Seen on device as a hard freeze, pstore dmesg-ramoops process "xdpt".
+	 * Use the public insert API instead: it resolves ht->tbl itself, it is
+	 * what upstream v5.4 uses at this site, and it is what the rest of this
+	 * file already uses for lookup and removal.
+	 */
+	ret = rhashtable_insert_fast(mem_id_ht, &xdp_alloc->node,
+				     mem_id_rht_params);
+	if (ret) {
 		ida_simple_remove(&mem_id_pool, xdp_rxq->mem.id);
 		xdp_rxq->mem.id = 0;
-		errno = PTR_ERR(ptr);
+		errno = ret;
 		goto err;
 	}
 
