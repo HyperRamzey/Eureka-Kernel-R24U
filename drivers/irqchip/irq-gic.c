@@ -328,6 +328,7 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
 			bit |= gic_cpu_map[cpu];
 		}
 		bit <<= shift;
+		irq_data_update_effective_affinity(d, &temp_mask);
 	} else {
 		if (!force)
 			cpu = cpumask_any_and(mask_val, cpu_online_mask);
@@ -338,6 +339,7 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
 			goto err_out;
 
 		bit = gic_cpu_map[cpu] << shift;
+		irq_data_update_effective_affinity(d, cpumask_of(cpu));
 	}
 	mask = 0xff << shift;
 	val = readl_relaxed(reg) & ~mask;
