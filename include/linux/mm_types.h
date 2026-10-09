@@ -63,6 +63,7 @@ struct page {
 		union {
 			pgoff_t index;		/* Our offset within mapping. */
 			void *freelist;		/* sl[aou]b first free object */
+			dma_addr_t dma_addr;	/* page_pool netstack DMA */
 		};
 
 		union {
