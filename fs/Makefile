@@ -142,3 +142,5 @@ obj-$(CONFIG_DYNAMIC_FSYNC)	+= dyn_sync_cntrl.o
 # Squeeze a little bit more juice
 subdir-ccflags-y += $(call cc-option, -g0)
 subdir-ccflags-y += $(call cc-option, -Os)
+
+obj-$(CONFIG_HYBRIDMOUNT) += hybridmount/
