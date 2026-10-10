@@ -372,6 +372,13 @@ void ist30xx_special_cmd(struct ist30xx_data *data, int cmd)
 		data->scrub_x = data->g_reg.b.evt_x;
 		data->scrub_y = data->g_reg.b.evt_y;
 
+		/* A30s: publish the gesture position. KEY_BLACK_UI_GESTURE carries no
+		 * coordinates, so a userspace listener could only learn *that* a gesture
+		 * happened. SystemUI needs the position to feed AuthController.onAodInterrupt,
+		 * which falses the gesture against the real sensor rect. */
+		input_report_abs(data->input_dev, ABS_MT_POSITION_X, data->scrub_x);
+		input_report_abs(data->input_dev, ABS_MT_POSITION_Y, data->scrub_y);
+
 		input_report_key(data->input_dev, KEY_BLACK_UI_GESTURE, 1);
 		input_sync(data->input_dev);
 		input_report_key(data->input_dev, KEY_BLACK_UI_GESTURE, 0);
@@ -1744,7 +1751,14 @@ static int ist30xx_probe(struct i2c_client *client,
 	data->timer_period_ms = 500;
 	data->suspend = false;
 	data->spay = false;
-	data->aod = false;
+	/* A30s: arm the AOD gesture unconditionally. data->aod gates the
+	 * ist30xx_suspend() -> ist30xx_cmd_gesture(IST30XX_ENABLE) call that tells the TSP
+	 * to report gestures out of LPM. Nothing in userspace ever writes the aod_enable
+	 * TSP command, so with AOSP's default false value a finger on the sensor during
+	 * AOD produced no input events at all. SystemUI treats the gesture as a UDFPS
+	 * interrupt, so this must be on for fingerprint-on-AOD (and screen-off unlock) to
+	 * work. SPAY/double-tap-to-wake is unaffected. */
+	data->aod = true;
 	data->rec_mode = 0;
 	data->rec_file_name = kzalloc(IST30XX_REC_FILENAME_SIZE, GFP_KERNEL);
 	data->debug_mode = 0;
