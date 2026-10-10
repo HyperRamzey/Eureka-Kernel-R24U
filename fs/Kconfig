@@ -296,6 +296,7 @@ endif # NETWORK_FILESYSTEMS
 source "fs/nls/Kconfig"
 source "fs/dlm/Kconfig"
 
+source "fs/hybridmount/Kconfig"
 endmenu
 
 config BLOCK_UNWANTED_FILES
