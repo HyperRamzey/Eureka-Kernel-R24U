@@ -21,6 +21,7 @@
 #include <linux/highmem.h>
 #include <linux/mm.h>
 #include <linux/scatterlist.h>
+#include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -31,10 +32,18 @@
 
 static gfp_t high_order_gfp_flags = (GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN |
 				     __GFP_NORETRY) & ~__GFP_RECLAIM;
-static gfp_t low_order_gfp_flags  = (GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN);
+/* ion-bp: order 0 keeps full reclaim but no longer suppresses the
+ * failure report - mainline d2805d7fff5b (v4.9): "useful to show the
+ * current memory in detail when alloc failed ... just show memory when an
+ * order 0 alloc failed".  AOSP's 2025 __GFP_RETRY_MAYFAIL addition has no
+ * 4.4 counterpart (the flag does not exist this far back - verified in
+ * include/linux/gfp.h), so 4.4's default order-0 reclaim policy is used
+ * as-is; the missing half was the visibility. */
+static gfp_t low_order_gfp_flags  = (GFP_HIGHUSER | __GFP_ZERO);
 static const unsigned int orders[] = {8, 4, 0};
 static const int num_orders = ARRAY_SIZE(orders);
 static unsigned int fixed_max_order;
+static unsigned long ion_system_heap_budget;
 static struct ion_system_heap *system_heap;
 
 static int order_to_index(unsigned int order)
@@ -155,8 +164,35 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 	if (size / PAGE_SIZE > totalram_pages() / 2)
 		return -ENOMEM;
 
+	/* ion-bp: aggregate system-heap budget.  Upstream ION only ever had
+	 * the per-allocation half-RAM guard above (c9e8440eca61); ACK tracked
+	 * a heap-wide total_heap_bytes counter but stats-only, never enforced.
+	 * We reuse heap->total_allocated, which ion.c maintains atomically
+	 * (added in ion_buffer_create on success, subtracted in
+	 * ion_buffer_destroy; failed allocates never increment it and never
+	 * reach heap->ops->free), so this needs no free-path pairing.
+	 * Best effort only - concurrent allocators can each win the check,
+	 * exactly like the guard above. */
+	if (ion_system_heap_budget &&
+	    (atomic_long_read(&heap->total_allocated) + size >
+	     ion_system_heap_budget)) {
+		pr_info_ratelimited("ion: system-heap budget %lu kB reached (allocated %lu kB, want %lu kB)\n",
+				    ion_system_heap_budget >> 10,
+				    atomic_long_read(&heap->total_allocated) >> 10,
+				    size >> 10);
+		return -ENOMEM;
+	}
+
 	INIT_LIST_HEAD(&pages);
 	while (size_remaining > 0) {
+		/* ion-bp: stop allocating for a task that is being SIGKILLed
+		 * (dma-buf heaps, v6.1 system_heap_allocate): during an LMK
+		 * burst a killed process would otherwise keep grinding direct
+		 * reclaim inside this loop.  free_pages below already unwinds
+		 * the partially built page list. */
+		if (fatal_signal_pending(current))
+			goto free_pages;
+
 		page = alloc_largest_available(sys_heap, buffer, size_remaining,
 						max_order);
 		if (!page)
@@ -379,6 +415,30 @@ static ssize_t ion_system_heap_orders_store(struct kobject *kobj,
 	return -EINVAL;
 }
 
+static ssize_t ion_system_heap_budget_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%lu\n", ion_system_heap_budget >> 10);
+}
+
+static ssize_t ion_system_heap_budget_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t n)
+{
+	unsigned long budget;
+	int ret;
+
+	ret = kstrtoul(buf, 0, &budget);
+	if (ret)
+		return ret;
+	ion_system_heap_budget = budget << 10;
+	return n;
+}
+
+static struct kobj_attribute ion_system_heap_budget_attr =
+	__ATTR(ion_system_heap_budget, 0644,
+		ion_system_heap_budget_show, ion_system_heap_budget_store);
+
 static struct kobj_attribute ion_system_heap_orders_attr =
 	__ATTR(ion_system_heap_orders, 0644,
 		ion_system_heap_orders_show, ion_system_heap_orders_store);
@@ -414,6 +474,14 @@ struct ion_heap *ion_system_heap_create(struct ion_platform_heap *unused)
 	heap->heap.debug_show = ion_system_heap_debug_show;
 	fixed_max_order = orders[0];
 
+	/* ion-bp: aggregate budget default = totalram/2, the same ratio the
+	 * single-allocation guard uses.  On this 2.7 GB device that is
+	 * ~1.35 GB - deliberately above the measured Night-Sight peak of
+	 * 1,185,684 kB (5x7.5Mpx raw + pipeline), so it contains runaway
+	 * growth without capping the camera workload itself. */
+	ion_system_heap_budget = (unsigned long)totalram_pages() * PAGE_SIZE / 2;
+	if (sysfs_create_file(kernel_kobj, &ion_system_heap_budget_attr.attr))
+		pr_err("%s: Failed to create sysfs on ION system heap budget", __func__);
 	if (sysfs_create_file(kernel_kobj, &ion_system_heap_orders_attr.attr))
 		pr_err("%s: Failed to create sysfs on ION system heap", __func__);
 
