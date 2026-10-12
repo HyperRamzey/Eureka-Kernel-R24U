@@ -238,15 +238,14 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		set_page_writeback(page);
 		unlock_page(page);
 		end_page_writeback(page);
+		/* vnswap-study: zswap took the page, count it as a swap-out. */
+		count_vm_event(PSWPOUT);
 		goto out;
 	}
-#ifdef CONFIG_VNSWAP
-	set_page_dirty(page);
-	ClearPageReclaim(page);
-	unlock_page(page);
-#else
+	/* vnswap-study: the CONFIG_VNSWAP branch dropped the write entirely,
+	 * so /dev/block/zram0 never received swap traffic.  Fall back to the
+	 * upstream path. */
 	ret = __swap_writepage(page, wbc, end_swap_bio_write);
-#endif
 out:
 	return ret;
 }
@@ -335,6 +334,8 @@ int swap_readpage(struct page *page)
 	if (frontswap_load(page) == 0) {
 		SetPageUptodate(page);
 		unlock_page(page);
+		/* vnswap-study: zswap brought the page back, count it as a swap-in. */
+		count_vm_event(PSWPIN);
 		goto out;
 	}
 
