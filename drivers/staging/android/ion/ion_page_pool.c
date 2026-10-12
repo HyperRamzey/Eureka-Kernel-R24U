@@ -21,12 +21,25 @@
 #include <linux/list.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
 #include <linux/swap.h>
 #include "ion_priv.h"
 
 void *ion_page_pool_alloc_pages(struct ion_page_pool *pool)
 {
-	struct page *page = alloc_pages(pool->gfp_mask, pool->order);
+	struct page *page;
+
+	/* ion-bp: do not drive reclaim for a task that is being SIGKILLed
+	 * (backport of mainline 8f9e86ee7959, v5.3).  Without this a process
+	 * killed during an LMK burst keeps spinning inside alloc_pages()
+	 * until it finally exits - observed on this device as multi-kill-per-ms
+	 * shrinker bursts with allocstall climbing while dead procs still
+	 * reclaimed.  The per-chunk check in ion_system_heap_allocate()
+	 * covers large buffers; this one covers the pool path. */
+	if (fatal_signal_pending(current))
+		return NULL;
+
+	page = alloc_pages(pool->gfp_mask, pool->order);
 
 	if (!page)
 		return NULL;
