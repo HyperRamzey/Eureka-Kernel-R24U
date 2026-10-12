@@ -75,6 +75,10 @@ static int lowmem_minfree_size = 4;
 static uint32_t lowmem_lmkcount = 0;
 static int lmkd_count;
 static int lmkd_cricount;
+/* lmk-bp: minimum spacing between consecutive kills.  Matches Android's
+ * ro.lmk.kill_timeout_ms default (100 ms); the pacing only takes effect
+ * together with the TASK_PFA_LMK_WAITING fix in lowmem_scan(). */
+static int lowmem_kill_interval_ms = 100;
 
 static DECLARE_WAIT_QUEUE_HEAD(event_wait);
 static DEFINE_SPINLOCK(lmk_event_lock);
@@ -424,7 +428,12 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 		if (!p)
 			continue;
 
-		if (test_tsk_thread_flag(p, TIF_MEMDIE)) {
+		/* lmk-bp: the death-pending gate above only ever matched OOM
+		 * victims (TIF_MEMDIE comes from mark_oom_victim() alone) while
+		 * this driver's own victims only carry TASK_PFA_LMK_WAITING -
+		 * so the pacing never fired and kills burst: ~20 in 1.6 s during
+		 * the camera-launch cascade.  Recognise our own victims too. */
+		if (test_tsk_thread_flag(p, TIF_MEMDIE) || task_lmk_waiting(p)) {
 			task_unlock(p);
 
 		    if (time_before_eq(jiffies, lowmem_deathpending_timeout)) {
@@ -527,7 +536,8 @@ static unsigned long lowmem_scan(struct shrinker *s, struct shrink_control *sc)
 			     sc->gfp_mask, &sc->gfp_mask);
 		show_mem_extra_call_notifiers();
 		show_memory();
-		lowmem_deathpending_timeout = jiffies + HZ;
+		lowmem_deathpending_timeout =
+			jiffies + msecs_to_jiffies(lowmem_kill_interval_ms);
 		rem += selected_tasksize;
 		lowmem_lmkcount++;
 		if ((selected_oom_score_adj <= 100) && (__ratelimit(&lmk_rs)))
@@ -678,5 +688,6 @@ module_param_array_named(minfree, lowmem_minfree, uint, &lowmem_minfree_size,
 			 S_IRUGO | S_IWUSR);
 module_param_named(debug_level, lowmem_debug_level, uint, S_IRUGO | S_IWUSR);
 module_param_named(lmkcount, lowmem_lmkcount, uint, S_IRUGO);
+module_param_named(kill_interval_ms, lowmem_kill_interval_ms, int, 0644);
 module_param_named(lmkd_count, lmkd_count, int, 0644);
 module_param_named(lmkd_cricount, lmkd_cricount, int, 0644);
