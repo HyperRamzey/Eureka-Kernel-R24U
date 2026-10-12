@@ -1032,8 +1032,9 @@ void *kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
 EXPORT_SYMBOL(kmalloc_order_trace);
 #endif
 
-#ifdef CONFIG_SLABINFO
-
+/* vnswap-study: opened, so /proc/slabinfo exists on SLUB.
+ * Upstream made this unconditional in v4.19.  memcontrol.c keeps its own
+ * #ifdef CONFIG_SLABINFO for memory.kmem.slabinfo and that stays as-is. */
 #ifdef CONFIG_SLAB
 #define SLABINFO_RIGHTS (S_IWUSR | S_IRUSR)
 #else
@@ -1184,7 +1185,6 @@ static int __init slab_proc_init(void)
 	return 0;
 }
 module_init(slab_proc_init);
-#endif /* CONFIG_SLABINFO */
 
 static __always_inline void *__do_krealloc(const void *p, size_t new_size,
 					   gfp_t flags)
