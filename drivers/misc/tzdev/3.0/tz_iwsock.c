@@ -49,7 +49,7 @@
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);				\
 	add_wait_queue(&wq, &wait);						\
 	while (!(condition))							\
-		wait_woken(&wait, TASK_UNINTERRUPTIBLE,				\
+		wait_woken(&wait, TASK_IDLE,					\
 			MAX_SCHEDULE_TIMEOUT);					\
 	remove_wait_queue(&wq, &wait);						\
 })
@@ -1257,7 +1257,7 @@ static int tz_iwsock_kthread(void *data)
 	(void)data;
 
 	while (!kthread_should_stop()) {
-		wait_event(tz_iwsock_wq,
+		tz_iwsock_wait_event(tz_iwsock_wq,
 				!circ_buf_is_empty(&swd_sock_events) ||
 				!circ_buf_is_empty(&internal_events_out) ||
 				kthread_should_stop());

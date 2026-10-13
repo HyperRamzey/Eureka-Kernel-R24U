@@ -344,6 +344,15 @@ static int devfreq_simple_interactive_register_notifier(struct devfreq *df)
 	}
 #else
 	kthread_bind(data->change_freq_task, BOUND_CPU_NUM);
+	/*
+	 * Without CONFIG_EXYNOS_WD_DVFS nothing else ever starts this thread:
+	 * it would sit forever in kthread()'s TASK_UNINTERRUPTIBLE creation
+	 * handshake (D state) and inflate /proc/loadavg. Start it now so it
+	 * enters devfreq_change_freq_task(), whose wait is TASK_INTERRUPTIBLE
+	 * (S state, not counted by loadavg); the freq_timer wakeup path is
+	 * unchanged.
+	 */
+	wake_up_process(data->change_freq_task);
 #endif
 
 	return 0;
