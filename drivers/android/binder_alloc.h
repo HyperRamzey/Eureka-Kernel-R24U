@@ -53,7 +53,8 @@ struct binder_buffer {
 	unsigned clear_on_free:1;
 	unsigned allow_user_free:1;
 	unsigned async_transaction:1;
-	unsigned debug_id:28;
+	unsigned oneway_spam_suspect:1;
+	unsigned debug_id:27;
 
 	struct binder_transaction *transaction;
 
@@ -115,6 +116,7 @@ struct binder_alloc {
 	uint32_t buffer_free;
 	int pid;
 	size_t pages_high;
+	bool oneway_spam_detected;
 };
 
 #ifdef CONFIG_ANDROID_BINDER_IPC_SELFTEST
@@ -129,7 +131,8 @@ extern struct binder_buffer *binder_alloc_new_buf(struct binder_alloc *alloc,
 						  size_t data_size,
 						  size_t offsets_size,
 						  size_t extra_buffers_size,
-						  int is_async);
+						  int is_async,
+						  int pid);
 extern void binder_alloc_init(struct binder_alloc *alloc);
 extern int binder_alloc_shrinker_init(void);
 extern void binder_alloc_vma_close(struct binder_alloc *alloc);
