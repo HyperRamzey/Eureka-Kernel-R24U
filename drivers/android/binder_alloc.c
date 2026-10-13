@@ -806,11 +806,19 @@ int binder_alloc_mmap_handler(struct binder_alloc *alloc,
 	alloc->buffer = (void __user *)vma->vm_start;
 	mutex_unlock(&binder_alloc_mmap_lock);
 
-	// Pad +16K for no reason
-	alloc->buffer_size = vma->vm_end - vma->vm_start + 16 * SZ_1K;
-	alloc->pages = kcalloc(alloc->buffer_size / PAGE_SIZE,
-			       sizeof(alloc->pages[0]),
-			       GFP_KERNEL);
+	/* Avoid high-order contiguous kcalloc of the page-metadata array:
+	 * under camera/memory-pressure bursts the Normal zone has space but
+	 * no >=order-3 contiguous blocks, so kcalloc(, ~4MB/4KB) returns
+	 * -ENOMEM, causing mmap() to fail -> ProcessState fatal (where apps die).
+	 * Cap + use vmalloc (page-granular allocator, no contiguity req). */
+	alloc->buffer_size = min_t(unsigned long,
+				  vma->vm_end - vma->vm_start, (unsigned long)SZ_4M);
+	alloc->pages = vmalloc(alloc->buffer_size / PAGE_SIZE *
+			       sizeof(alloc->pages[0]));
+	if (alloc->pages) {
+		memset(alloc->pages, 0,
+		       alloc->buffer_size / PAGE_SIZE * sizeof(alloc->pages[0]));
+	}
 	if (alloc->pages == NULL) {
 		ret = -ENOMEM;
 		failure_string = "alloc page array";
@@ -835,7 +843,7 @@ int binder_alloc_mmap_handler(struct binder_alloc *alloc,
 	return 0;
 
 err_alloc_buf_struct_failed:
-	kfree(alloc->pages);
+	vfree(alloc->pages);
 	alloc->pages = NULL;
 err_alloc_pages_failed:
 	mutex_lock(&binder_alloc_mmap_lock);
@@ -905,7 +913,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 			__free_page(alloc->pages[i].page_ptr);
 			page_count++;
 		}
-		kfree(alloc->pages);
+		vfree(alloc->pages);
 	}
 	mutex_unlock(&alloc->mutex);
 	if (alloc->vma_vm_mm)
