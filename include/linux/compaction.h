@@ -44,7 +44,6 @@ extern int fragmentation_index(struct zone *zone, unsigned int order);
 extern unsigned long try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 			int alloc_flags, const struct alloc_context *ac,
 			enum migrate_mode mode, int *contended);
-extern void compact_pgdat(pg_data_t *pgdat, int order);
 extern void reset_isolation_suitable(pg_data_t *pgdat);
 extern unsigned long compaction_suitable(struct zone *zone, int order,
 					int alloc_flags, int classzone_idx);
@@ -79,10 +78,6 @@ static inline unsigned long try_to_compact_pages(gfp_t gfp_mask,
 			enum migrate_mode mode, int *contended)
 {
 	return COMPACT_CONTINUE;
-}
-
-static inline void compact_pgdat(pg_data_t *pgdat, int order)
-{
 }
 
 static inline void reset_isolation_suitable(pg_data_t *pgdat)
