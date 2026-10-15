@@ -5456,6 +5456,9 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 #endif
 	init_waitqueue_head(&pgdat->kswapd_wait);
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
+#ifdef CONFIG_COMPACTION
+	init_waitqueue_head(&pgdat->kcompactd_wait);
+#endif
 	pgdat_page_ext_init(pgdat);
 	pgdat->kswapd_waiters = (atomic_t)ATOMIC_INIT(0);
 
