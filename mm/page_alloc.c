@@ -6461,8 +6461,9 @@ int __meminit init_per_zone_wmark_min(void)
 
 	if (new_min_free_kbytes > user_min_free_kbytes) {
 		min_free_kbytes = new_min_free_kbytes;
-		if (min_free_kbytes < 32768)
-			min_free_kbytes = 32768;
+		/* exynos7885/A30s: raise the floor to 49152 kB (1.5x reserve). */
+		if (min_free_kbytes < 49152)
+			min_free_kbytes = 49152;
 		if (min_free_kbytes > 262144)
 			min_free_kbytes = 262144;
 	} else {
