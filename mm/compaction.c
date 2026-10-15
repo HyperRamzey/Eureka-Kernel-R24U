@@ -1801,26 +1801,6 @@ static inline bool kcompactd_work_requested(pg_data_t *pgdat)
 	return pgdat->kcompactd_max_order > 0 || kthread_should_stop();
 }
 
-static bool kcompactd_node_suitable(pg_data_t *pgdat)
-{
-	int zoneid;
-	struct zone *zone;
-	enum zone_type classzone_idx = pgdat->kcompactd_classzone_idx;
-
-	for (zoneid = 0; zoneid <= classzone_idx; zoneid++) {
-		zone = &pgdat->node_zones[zoneid];
-
-		if (!populated_zone(zone))
-			continue;
-
-		if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
-					classzone_idx) == COMPACT_CONTINUE)
-			return true;
-	}
-
-	return false;
-}
-
 static void kcompactd_do_work(pg_data_t *pgdat)
 {
 	/*
@@ -1911,9 +1891,6 @@ void wakeup_kcompactd(pg_data_t *pgdat, int order, int classzone_idx)
 		pgdat->kcompactd_classzone_idx = classzone_idx;
 
 	if (!waitqueue_active(&pgdat->kcompactd_wait))
-		return;
-
-	if (!kcompactd_node_suitable(pgdat))
 		return;
 
 	trace_mm_compaction_wakeup_kcompactd(pgdat->node_id, order,
