@@ -7,6 +7,7 @@
 
 #include <linux/mman.h>
 #include <linux/pagemap.h>
+#include <linux/pagewalk.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
 #include <linux/page-isolation.h>
@@ -183,16 +184,15 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 	return 0;
 }
 
+static const struct mm_walk_ops swapin_walk_ops = {
+	.pmd_entry = swapin_walk_pmd_entry,
+};
+
 static void force_swapin_readahead(struct vm_area_struct *vma,
 		unsigned long start, unsigned long end)
 {
-	struct mm_walk walk = {
-		.mm = vma->vm_mm,
-		.pmd_entry = swapin_walk_pmd_entry,
-		.private = vma,
-	};
 
-	walk_page_range(start, end, &walk);
+	walk_page_range(vma->vm_mm, start, end, &swapin_walk_ops, vma);
 
 	lru_add_drain();	/* Push any new pages onto the LRU now */
 }
