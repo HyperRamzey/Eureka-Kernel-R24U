@@ -348,6 +348,7 @@ static int create_cache(struct zs_pool *pool)
 
 static void destroy_cache(struct zs_pool *pool)
 {
+	kmem_cache_destroy(pool->handle_cachep);
 	kmem_cache_destroy(pool->zspage_cachep);
 }
 
