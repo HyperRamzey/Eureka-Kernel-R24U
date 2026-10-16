@@ -108,6 +108,7 @@ enum pageflags {
 	PG_young,
 	PG_idle,
 #endif
+	PG_workingset,
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */
@@ -217,6 +218,8 @@ PAGEFLAG(Dirty, dirty) TESTSCFLAG(Dirty, dirty) __CLEARPAGEFLAG(Dirty, dirty)
 PAGEFLAG(LRU, lru) __CLEARPAGEFLAG(LRU, lru)
 PAGEFLAG(Active, active) __CLEARPAGEFLAG(Active, active)
 	TESTCLEARFLAG(Active, active)
+TESTPAGEFLAG(Workingset, workingset)
+SETPAGEFLAG(Workingset, workingset)
 __PAGEFLAG(Slab, slab)
 PAGEFLAG(Checked, checked)		/* Used by some filesystems */
 PAGEFLAG(Pinned, pinned) TESTSCFLAG(Pinned, pinned)	/* Xen */

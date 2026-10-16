@@ -132,6 +132,7 @@ struct bio {
 #define BIO_QUIET	6	/* Make BIO Quiet */
 #define BIO_CHAIN	7	/* chained bio, ->bi_remaining in effect */
 #define BIO_REFFED	8	/* bio has elevated ->bi_cnt */
+#define BIO_WORKINGSET		9	/* contains userspace workingset pages */
 
 #ifdef CONFIG_JOURNAL_DATA_TAG
 /* XXX Be carefull not to touch BIO_RESET_BITS */

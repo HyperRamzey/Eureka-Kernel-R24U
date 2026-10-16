@@ -722,6 +722,7 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 		 */
 		if (shadow && workingset_refault(shadow)) {
 			SetPageActive(page);
+			SetPageWorkingset(page);
 			workingset_activation(page);
 		} else
 			ClearPageActive(page);
