@@ -3605,8 +3605,10 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		next->active_mm = oldmm;
 		atomic_inc(&oldmm->mm_count);
 		enter_lazy_tlb(oldmm, next);
-	} else
+	} else {
 		switch_mm(oldmm, mm, next);
+		lru_gen_use_mm(next->mm);
+	}
 
 	if (!prev->mm) {
 		prev->active_mm = NULL;

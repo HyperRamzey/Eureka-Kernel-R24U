@@ -228,7 +228,7 @@ void *workingset_eviction(struct address_space *mapping, struct page *page)
  *
  * Returns %true if the page should be activated, %false otherwise.
  */
-bool workingset_refault(void *shadow)
+bool workingset_refault(struct page *page, void *shadow)
 {
 	unsigned long refault_distance;
 	struct zone *zone;
@@ -238,6 +238,7 @@ bool workingset_refault(void *shadow)
 
 	if (refault_distance <= zone_page_state(zone, NR_ACTIVE_FILE)) {
 		inc_zone_state(zone, WORKINGSET_ACTIVATE);
+		SetPageWorkingset(page);
 		return true;
 	}
 	return false;

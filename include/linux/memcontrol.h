@@ -318,6 +318,9 @@ void mem_cgroup_uncharge_list(struct list_head *page_list);
 void mem_cgroup_replace_page(struct page *oldpage, struct page *newpage);
 
 struct lruvec *mem_cgroup_zone_lruvec(struct zone *, struct mem_cgroup *);
+
+struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
+void mem_cgroup_put(struct mem_cgroup *memcg);
 struct lruvec *mem_cgroup_page_lruvec(struct page *, struct zone *);
 
 bool task_in_mem_cgroup(struct task_struct *task, struct mem_cgroup *memcg);
@@ -332,6 +335,9 @@ struct mem_cgroup *parent_mem_cgroup(struct mem_cgroup *memcg);
  * (root = its parent); protection recalculation is a no-op.
  */
 unsigned short mem_cgroup_id(struct mem_cgroup *memcg);
+
+/* 4.4 MGLRU: mm/memcontrol.c already defines this */
+struct mem_cgroup *mem_cgroup_from_id(unsigned short id);
 
 static inline bool mem_cgroup_below_min(struct mem_cgroup *memcg)
 {
@@ -396,6 +402,23 @@ ino_t page_cgroup_ino(struct page *page);
 static inline bool mem_cgroup_disabled(void)
 {
 	return !cgroup_subsys_enabled(memory_cgrp_subsys);
+}
+
+/* 4.4 MGLRU: 5.15's mem_cgroup_trylock_pages()/unlock_pages(), verbatim. */
+static inline bool mem_cgroup_trylock_pages(struct mem_cgroup *memcg)
+{
+	rcu_read_lock();
+
+	if (mem_cgroup_disabled() || !atomic_read(&memcg->moving_account))
+		return true;
+
+	rcu_read_unlock();
+	return false;
+}
+
+static inline void mem_cgroup_unlock_pages(void)
+{
+	rcu_read_unlock();
 }
 
 /*
@@ -562,6 +585,11 @@ static inline unsigned short mem_cgroup_id(struct mem_cgroup *memcg)
 	return 0;
 }
 
+static inline struct mem_cgroup *mem_cgroup_from_id(unsigned short id)
+{
+	return NULL;
+}
+
 static inline bool mem_cgroup_below_min(struct mem_cgroup *memcg)
 {
 	return false;
@@ -617,6 +645,24 @@ static inline struct lruvec *mem_cgroup_zone_lruvec(struct zone *zone,
 						    struct mem_cgroup *memcg)
 {
 	return &zone->lruvec;
+}
+
+static inline struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm)
+{
+	return NULL;
+}
+
+static inline void mem_cgroup_put(struct mem_cgroup *memcg)
+{
+}
+
+static inline bool mem_cgroup_trylock_pages(struct mem_cgroup *memcg)
+{
+	return true;
+}
+
+static inline void mem_cgroup_unlock_pages(void)
+{
 }
 
 static inline struct lruvec *mem_cgroup_page_lruvec(struct page *page,

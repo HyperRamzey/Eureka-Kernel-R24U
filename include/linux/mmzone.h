@@ -380,14 +380,10 @@ struct lru_gen_mm_state {
 	struct list_head *head;
 	/* where the last iteration ended before */
 	struct list_head *tail;
-	/* Unused - keep for ABI compatiiblity */
-	struct wait_queue_head wait;
 	/* Bloom filters flip after each iteration */
 	unsigned long *filters[NR_BLOOM_FILTERS];
 	/* the mm stats for debugging */
 	unsigned long stats[NR_HIST_GENS][NR_MM_STATS];
-	/* Unused - keep for ABI compatiiblity */
-	int nr_walkers;
 };
 
 struct lru_gen_mm_walk {
@@ -934,6 +930,11 @@ typedef struct pglist_data {
 	/* Number of non-deferred pages */
 	unsigned long static_init_pgcnt;
 #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+
+#ifdef CONFIG_LRU_GEN
+	/* 4.4 MGLRU: kswapd's mm walker (5.15's pglist_data.mm_walk) */
+	struct lru_gen_mm_walk mm_walk;
+#endif /* CONFIG_LRU_GEN */
 } pg_data_t;
 
 #define node_present_pages(nid)	(NODE_DATA(nid)->node_present_pages)
@@ -1042,6 +1043,11 @@ unsigned long __init node_memmap_size_bytes(int, unsigned long, unsigned long);
 static inline int populated_zone(struct zone *zone)
 {
 	return (!!zone->present_pages);
+}
+
+static inline bool managed_zone(struct zone *zone)
+{
+	return zone->managed_pages != 0;
 }
 
 extern int movable_zone;

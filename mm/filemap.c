@@ -720,7 +720,7 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 		 * recently, in which case it should be activated like
 		 * any other repeatedly accessed page.
 		 */
-		if (shadow && workingset_refault(shadow)) {
+		if (shadow && workingset_refault(page, shadow)) {
 			SetPageActive(page);
 			SetPageWorkingset(page);
 			workingset_activation(page);

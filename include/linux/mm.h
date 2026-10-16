@@ -1387,6 +1387,11 @@ static inline bool vma_is_anonymous(struct vm_area_struct *vma)
 	return !vma->vm_ops;
 }
 
+static inline bool vma_is_accessible(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC);
+}
+
 /*
  * i_mmap_writable only counts mappings that could actually be written, i.e.
  * VM_SHARED ones that also carry VM_MAYWRITE. Testing for VM_SHARED alone
