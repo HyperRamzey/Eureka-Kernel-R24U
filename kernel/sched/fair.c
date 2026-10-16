@@ -3198,7 +3198,23 @@ static inline void cfs_rq_util_change(struct cfs_rq *cfs_rq)
 
 	if (cpu == smp_processor_id() && &rq->cfs == cfs_rq) {
 		unsigned long max = rq->cpu_capacity_orig;
-		unsigned long req_cap = boosted_cpu_util(cfs_rq->avg.util_avg, cpu);
+		unsigned long util = READ_ONCE(cfs_rq->avg.util_avg);
+		unsigned long req_cap;
+
+		/*
+		 * Integrate the estimated utilization, mirroring upstream
+		 * cpu_util_cfs(): a task waking up after a long sleep has
+		 * its PELT utilization decayed, while its util_est still
+		 * represents the utilization it is expected to generate.
+		 * This allows the governor to pick the right OPP as soon
+		 * as the task is enqueued.
+		 */
+		if (sched_feat(UTIL_EST)) {
+			util = max_t(unsigned long, util,
+				     READ_ONCE(cfs_rq->avg.util_est.enqueued));
+		}
+
+		req_cap = boosted_cpu_util(util, cpu);
 
 		/*
 		 * There are a few boundary cases this might miss but it should
