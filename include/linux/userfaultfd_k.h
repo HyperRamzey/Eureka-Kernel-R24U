@@ -80,6 +80,13 @@ static inline bool userfaultfd_armed(struct vm_area_struct *vma)
 	return false;
 }
 
+static inline bool userfaultfd_remove(struct vm_area_struct *vma,
+				      unsigned long start,
+				      unsigned long end)
+{
+	return true;
+}
+
 #endif /* CONFIG_USERFAULTFD */
 
 #endif /* _LINUX_USERFAULTFD_K_H */

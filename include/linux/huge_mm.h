@@ -181,6 +181,10 @@ static inline struct page *compound_trans_head(struct page *page)
 	}
 	return page;
 }
+extern bool madvise_free_huge_pmd(struct mmu_gather *tlb,
+			struct vm_area_struct *vma,
+			pmd_t *pmd, unsigned long addr, unsigned long next);
+
 #else /* CONFIG_TRANSPARENT_HUGEPAGE */
 #define HPAGE_PMD_SHIFT ({ BUILD_BUG(); 0; })
 #define HPAGE_PMD_MASK ({ BUILD_BUG(); 0; })
@@ -223,6 +227,14 @@ static inline int pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma,
 		spinlock_t **ptl)
 {
 	return 0;
+}
+
+static inline bool madvise_free_huge_pmd(struct mmu_gather *tlb,
+					 struct vm_area_struct *vma,
+					 pmd_t *pmd, unsigned long addr,
+					 unsigned long next)
+{
+	return false;
 }
 
 static inline int do_huge_pmd_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,

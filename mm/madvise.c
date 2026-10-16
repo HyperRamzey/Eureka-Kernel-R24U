@@ -11,6 +11,7 @@
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
 #include <linux/page-isolation.h>
+#include <linux/userfaultfd_k.h>
 #include <linux/hugetlb.h>
 #include <linux/falloc.h>
 #include <linux/sched.h>
@@ -21,6 +22,9 @@
 #include <linux/backing-dev.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#include <linux/mmu_notifier.h>
+
+#include <asm/tlb.h>
 
 /*
  * Any behaviour which results in changes to the vma->vm_flags needs to
@@ -33,6 +37,7 @@ static int madvise_need_mmap_write(int behavior)
 	case MADV_REMOVE:
 	case MADV_WILLNEED:
 	case MADV_DONTNEED:
+	case MADV_FREE:
 		return 0;
 	default:
 		/* be safe, default to 1. list exceptions explicitly */
@@ -265,6 +270,180 @@ static long madvise_willneed(struct vm_area_struct *vma,
 	return 0;
 }
 
+static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+				unsigned long end, struct mm_walk *walk)
+
+{
+	struct mmu_gather *tlb = walk->private;
+	struct mm_struct *mm = tlb->mm;
+	struct vm_area_struct *vma = walk->vma;
+	spinlock_t *ptl;
+	pte_t *orig_pte, *pte, ptent;
+	struct page *page;
+	int nr_swap = 0;
+	unsigned long next;
+
+	next = pmd_addr_end(addr, end);
+	if (pmd_trans_huge(*pmd))
+		if (madvise_free_huge_pmd(tlb, vma, pmd, addr, next))
+			goto next;
+
+	if (pmd_trans_unstable(pmd))
+		return 0;
+
+	orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	arch_enter_lazy_mmu_mode();
+	for (; addr != end; pte++, addr += PAGE_SIZE) {
+		ptent = *pte;
+
+		if (pte_none(ptent))
+			continue;
+		/*
+		 * If the pte has swp_entry, just clear page table to
+		 * prevent swap-in which is more expensive rather than
+		 * (page allocation + zeroing).
+		 */
+		if (!pte_present(ptent)) {
+			swp_entry_t entry;
+
+			entry = pte_to_swp_entry(ptent);
+			if (non_swap_entry(entry))
+				continue;
+			nr_swap--;
+			free_swap_and_cache(entry);
+			pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+			continue;
+		}
+
+		page = vm_normal_page(vma, addr, ptent);
+		if (!page)
+			continue;
+
+		/*
+		 * If pmd isn't transhuge but the page is THP and
+		 * is owned by only this process, split it and
+		 * deactivate all pages.
+		 */
+		if (PageTransCompound(page)) {
+			if (page_mapcount(page) != 1)
+				goto out;
+			get_page(page);
+			if (!trylock_page(page)) {
+				put_page(page);
+				goto out;
+			}
+			pte_unmap_unlock(orig_pte, ptl);
+			if (split_huge_page(page)) {
+				unlock_page(page);
+				put_page(page);
+				pte_offset_map_lock(mm, pmd, addr, &ptl);
+				goto out;
+			}
+			unlock_page(page);
+			put_page(page);
+			pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+			pte--;
+			addr -= PAGE_SIZE;
+			continue;
+		}
+
+		VM_BUG_ON_PAGE(PageTransCompound(page), page);
+
+		if (PageSwapCache(page) || PageDirty(page)) {
+			if (!trylock_page(page))
+				continue;
+			/*
+			 * If page is shared with others, we couldn't clear
+			 * PG_dirty of the page.
+			 */
+			if (page_mapcount(page) != 1) {
+				unlock_page(page);
+				continue;
+			}
+
+			if (PageSwapCache(page) && !try_to_free_swap(page)) {
+				unlock_page(page);
+				continue;
+			}
+
+			ClearPageDirty(page);
+			unlock_page(page);
+		}
+
+		if (pte_young(ptent) || pte_dirty(ptent)) {
+			/*
+			 * Some of architecture(ex, PPC) don't update TLB
+			 * with set_pte_at and tlb_remove_tlb_entry so for
+			 * the portability, remap the pte with old|clean
+			 * after pte clearing.
+			 */
+			ptent = ptep_get_and_clear_full(mm, addr, pte,
+							tlb->fullmm);
+
+			ptent = pte_mkold(ptent);
+			ptent = pte_mkclean(ptent);
+			set_pte_at(mm, addr, pte, ptent);
+			tlb_remove_tlb_entry(tlb, pte, addr);
+		}
+		mark_page_lazyfree(page);
+	}
+out:
+	if (nr_swap) {
+		if (current->mm == mm)
+			sync_mm_rss(mm);
+
+		add_mm_counter(mm, MM_SWAPENTS, nr_swap);
+	}
+	arch_leave_lazy_mmu_mode();
+	pte_unmap_unlock(orig_pte, ptl);
+	cond_resched();
+next:
+	return 0;
+}
+
+static const struct mm_walk_ops madvise_free_walk_ops = {
+	.pmd_entry		= madvise_free_pte_range,
+};
+
+static void madvise_free_page_range(struct mmu_gather *tlb,
+			     struct vm_area_struct *vma,
+			     unsigned long addr, unsigned long end)
+{
+	tlb_start_vma(tlb, vma);
+	walk_page_range(vma->vm_mm, addr, end, &madvise_free_walk_ops, tlb);
+	tlb_end_vma(tlb, vma);
+}
+
+static int madvise_free_single_vma(struct vm_area_struct *vma,
+			unsigned long start_addr, unsigned long end_addr)
+{
+	unsigned long start, end;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mmu_gather tlb;
+
+	/* MADV_FREE works for only anon vma at the moment */
+	if (!vma_is_anonymous(vma))
+		return -EINVAL;
+
+	start = max(vma->vm_start, start_addr);
+	if (start >= vma->vm_end)
+		return -EINVAL;
+	end = min(vma->vm_end, end_addr);
+	if (end <= vma->vm_start)
+		return -EINVAL;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm, start, end);
+	update_hiwater_rss(mm);
+
+	mmu_notifier_invalidate_range_start(mm, start, end);
+	madvise_free_page_range(&tlb, vma, start, end);
+	mmu_notifier_invalidate_range_end(mm, start, end);
+	tlb_finish_mmu(&tlb, start, end);
+
+	return 0;
+}
+
 /*
  * Application no longer needs these pages.  If the pages are dirty,
  * it's OK to just throw them away.  The app will be more careful about
@@ -284,16 +463,72 @@ static long madvise_willneed(struct vm_area_struct *vma,
  * An interface that causes the system to free clean pages and flush
  * dirty pages is already available as msync(MS_INVALIDATE).
  */
-static long madvise_dontneed(struct vm_area_struct *vma,
-			     struct vm_area_struct **prev,
-			     unsigned long start, unsigned long end)
+static long madvise_dontneed_single_vma(struct vm_area_struct *vma,
+					unsigned long start, unsigned long end)
 {
-	*prev = vma;
-	if (vma->vm_flags & (VM_LOCKED|VM_HUGETLB|VM_PFNMAP))
-		return -EINVAL;
-
 	zap_page_range(vma, start, end - start, NULL);
 	return 0;
+}
+
+static bool can_madv_dontneed_vma(struct vm_area_struct *vma)
+{
+	return !(vma->vm_flags & (VM_LOCKED|VM_HUGETLB|VM_PFNMAP));
+}
+
+static long madvise_dontneed_free(struct vm_area_struct *vma,
+				  struct vm_area_struct **prev,
+				  unsigned long start, unsigned long end,
+				  int behavior)
+{
+	*prev = vma;
+	if (!can_madv_dontneed_vma(vma))
+		return -EINVAL;
+
+	if (!userfaultfd_remove(vma, start, end)) {
+		*prev = NULL; /* mmap_sem has been dropped, prev is stale */
+
+		down_read(&current->mm->mmap_sem);
+		vma = find_vma(current->mm, start);
+		if (!vma)
+			return -ENOMEM;
+		if (start < vma->vm_start) {
+			/*
+			 * This "vma" under revalidation is the one
+			 * with the lowest vma->vm_start where start
+			 * is also < vma->vm_end. If start <
+			 * vma->vm_start it means an hole materialized
+			 * in the user address space within the
+			 * virtual range passed to MADV_DONTNEED
+			 * or MADV_FREE.
+			 */
+			return -ENOMEM;
+		}
+		if (!can_madv_dontneed_vma(vma))
+			return -EINVAL;
+		if (end > vma->vm_end) {
+			/*
+			 * Don't fail if end > vma->vm_end. If the old
+			 * vma was splitted while the mmap_sem was
+			 * released the effect of the concurrent
+			 * operation may not cause madvise() to
+			 * have an undefined result. There may be an
+			 * adjacent next vma that we'll walk
+			 * next. userfaultfd_remove() will generate an
+			 * UFFD_EVENT_REMOVE repetition on the
+			 * end-vma->vm_end range, but the manager can
+			 * handle a repetition fine.
+			 */
+			end = vma->vm_end;
+		}
+		VM_WARN_ON(start >= end);
+	}
+
+	if (behavior == MADV_DONTNEED)
+		return madvise_dontneed_single_vma(vma, start, end);
+	else if (behavior == MADV_FREE)
+		return madvise_free_single_vma(vma, start, end);
+	else
+		return -EINVAL;
 }
 
 /*
@@ -388,8 +623,9 @@ madvise_vma(struct vm_area_struct *vma, struct vm_area_struct **prev,
 		return madvise_remove(vma, prev, start, end);
 	case MADV_WILLNEED:
 		return madvise_willneed(vma, prev, start, end);
+	case MADV_FREE:
 	case MADV_DONTNEED:
-		return madvise_dontneed(vma, prev, start, end);
+		return madvise_dontneed_free(vma, prev, start, end, behavior);
 	default:
 		return madvise_behavior(vma, prev, start, end, behavior);
 	}
@@ -407,6 +643,7 @@ madvise_behavior_valid(int behavior)
 	case MADV_REMOVE:
 	case MADV_WILLNEED:
 	case MADV_DONTNEED:
+	case MADV_FREE:
 #ifdef CONFIG_KSM
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
