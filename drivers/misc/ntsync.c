@@ -266,6 +266,7 @@ static struct miscdevice ntsync_misc = {
 	.minor		= MISC_DYNAMIC_MINOR,
 	.name		= NTSYNC_NAME,
 	.fops		= &ntsync_fops,
+	.mode		= 0666,
 };
 
 module_driver(ntsync_misc, misc_register, misc_deregister);
