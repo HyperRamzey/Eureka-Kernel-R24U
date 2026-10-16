@@ -761,7 +761,18 @@ static inline void crypto_xor_cpy(u8 *dst, const u8 *src1, const u8 *src2,
 #define hlist_add_behind(a, b) hlist_add_after(b, a)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) && !defined(ISRHEL8)
+/*
+ * This branch backported the 5.0-style total RAM accounting: the value
+ * sits behind the _totalram_pages atomic and mm.h provides the
+ * totalram_pages() accessor, with no bare variable for the redirect
+ * below to reach.  The epoch cannot be spelled as 4.4.302 (SUBLEVEL
+ * 302 overflows the version-code byte field and the build reports the
+ * clamped 4.4.255 fingerprint), so its window is excluded outright:
+ * the call stays the one upstream writes and lands on the accessor,
+ * exactly as upstream's in-tree driver does on 5.0+ kernels.  Seam
+ * rationale mirrors the blake2s/zinc rename for this epoch.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) && !(LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 255) && LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0)) && !defined(ISRHEL8)
 #define totalram_pages() totalram_pages
 #endif
 
