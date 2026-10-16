@@ -755,6 +755,9 @@ void do_set_pte(struct vm_area_struct *vma, unsigned long address,
 #define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
 #define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
 
+#define LRU_GEN_PGOFF		(LAST_CPUPID_PGOFF - LRU_GEN_WIDTH)
+#define LRU_REFS_PGOFF		(LRU_GEN_PGOFF - LRU_REFS_WIDTH)
+
 /*
  * Define the bit shifts to access each section.  For non-existent
  * sections we define the shift as 0; that plus a 0 mask ensures
@@ -1001,6 +1004,18 @@ static inline void set_page_memcg(struct page *page, struct mem_cgroup *memcg)
 {
 }
 #endif
+
+/*
+ * 4.4 MGLRU shims: the node is derived from the zone (single-node
+ * target), and RCU-protected callers use page_memcg() directly --
+ * 4.4 has no separate non-RCU/RCU pair.
+ */
+static inline struct pglist_data *page_pgdat(const struct page *page)
+{
+	return page_zone(page)->zone_pgdat;
+}
+
+#define page_memcg_rcu(page)	page_memcg(page)
 
 /*
  * Some inline functions in vmstat.h depend on page_zone()

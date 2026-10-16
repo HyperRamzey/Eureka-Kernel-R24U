@@ -274,8 +274,11 @@ static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)
  */
 #define MEM_CGROUP_ID_MAX	USHRT_MAX
 
-static inline unsigned short mem_cgroup_id(struct mem_cgroup *memcg)
+unsigned short mem_cgroup_id(struct mem_cgroup *memcg)
 {
+	/* 4.4 MGLRU: zone lruvecs carry no memcg when memcg is disabled */
+	if (!memcg)
+		return 0;
 	return memcg->id.id;
 }
 
@@ -1076,8 +1079,10 @@ out:
 	 * we have to be prepared to initialize lruvec->zone here;
 	 * and if offlined then reonlined, we need to reinitialize it.
 	 */
-	if (unlikely(lruvec->zone != zone))
+	if (unlikely(lruvec->zone != zone)) {
 		lruvec->zone = zone;
+		lruvec->memcg = memcg;	/* 4.4 MGLRU: owner backpointer */
+	}
 	return lruvec;
 }
 
@@ -1098,6 +1103,7 @@ struct lruvec *mem_cgroup_page_lruvec(struct page *page, struct zone *zone)
 
 	if (mem_cgroup_disabled()) {
 		lruvec = &zone->lruvec;
+		memcg = NULL;	/* 4.4 MGLRU: zone lruvec has no owner */
 		goto out;
 	}
 
@@ -1117,8 +1123,10 @@ out:
 	 * we have to be prepared to initialize lruvec->zone here;
 	 * and if offlined then reonlined, we need to reinitialize it.
 	 */
-	if (unlikely(lruvec->zone != zone))
+	if (unlikely(lruvec->zone != zone)) {
 		lruvec->zone = zone;
+		lruvec->memcg = memcg;	/* 4.4 MGLRU: owner backpointer */
+	}
 	return lruvec;
 }
 

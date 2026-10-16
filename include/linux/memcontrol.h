@@ -27,6 +27,7 @@
 #include <linux/vmpressure.h>
 #include <linux/eventfd.h>
 #include <linux/mmzone.h>
+#include <linux/mm_types.h>
 #include <linux/writeback.h>
 
 struct mem_cgroup;
@@ -280,6 +281,11 @@ struct mem_cgroup {
 	struct list_head event_list;
 	spinlock_t event_list_lock;
 
+#ifdef CONFIG_LRU_GEN
+	/* per-memcg mm_struct list (4.4 MGLRU backport) */
+	struct lru_gen_mm_list mm_list;
+#endif
+
 	struct mem_cgroup_per_node *nodeinfo[0];
 	/* WARNING: nodeinfo must be the last member here */
 };
@@ -317,6 +323,38 @@ struct lruvec *mem_cgroup_page_lruvec(struct page *, struct zone *);
 bool task_in_mem_cgroup(struct task_struct *task, struct mem_cgroup *memcg);
 struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p);
 struct mem_cgroup *parent_mem_cgroup(struct mem_cgroup *memcg);
+
+/*
+ * 4.4 MGLRU backport shims ----------------------------------------
+ * Map the 5.x per-memcg protection/state queries onto the 4.4 model:
+ * there is no memory.min, so below_min() is false by construction;
+ * below_low() reuses the existing low-limit check for this memcg
+ * (root = its parent); protection recalculation is a no-op.
+ */
+unsigned short mem_cgroup_id(struct mem_cgroup *memcg);
+
+static inline bool mem_cgroup_below_min(struct mem_cgroup *memcg)
+{
+	return false;
+}
+
+static inline bool mem_cgroup_below_low(struct mem_cgroup *memcg)
+{
+	return mem_cgroup_low(parent_mem_cgroup(memcg), memcg);
+}
+
+static inline void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+						   struct mem_cgroup *memcg)
+{
+}
+
+static inline bool mem_cgroup_online(struct mem_cgroup *memcg)
+{
+	/* 4.4: CSS_ONLINE marks the window set by css_online()/css_offline() */
+	if (!memcg)
+		return true;
+	return !!(memcg->css.flags & CSS_ONLINE);
+}
 
 static inline
 struct mem_cgroup *mem_cgroup_from_css(struct cgroup_subsys_state *css){
@@ -517,6 +555,31 @@ static inline bool mem_cgroup_low(struct mem_cgroup *root,
 				  struct mem_cgroup *memcg)
 {
 	return false;
+}
+
+static inline unsigned short mem_cgroup_id(struct mem_cgroup *memcg)
+{
+	return 0;
+}
+
+static inline bool mem_cgroup_below_min(struct mem_cgroup *memcg)
+{
+	return false;
+}
+
+static inline bool mem_cgroup_below_low(struct mem_cgroup *memcg)
+{
+	return false;
+}
+
+static inline void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+						   struct mem_cgroup *memcg)
+{
+}
+
+static inline bool mem_cgroup_online(struct mem_cgroup *memcg)
+{
+	return true;
 }
 
 static inline int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,

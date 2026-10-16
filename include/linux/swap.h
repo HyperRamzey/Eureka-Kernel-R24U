@@ -107,8 +107,13 @@ union swap_header {
  * current->reclaim_state points to one of these when a task is running
  * memory reclaim
  */
+struct lru_gen_mm_walk;
 struct reclaim_state {
 	unsigned long reclaimed_slab;
+#ifdef CONFIG_LRU_GEN
+	/* 4.4 MGLRU: per-task mm walker, reset at reclaim entry sites */
+	struct lru_gen_mm_walk *mm_walk;
+#endif
 };
 
 #ifdef __KERNEL__
