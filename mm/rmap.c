@@ -1473,7 +1473,32 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		 * Store the swap location in the pte.
 		 * See handle_pte_fault() ...
 		 */
-		VM_BUG_ON_PAGE(!PageSwapCache(page), page);
+		if (unlikely(PageSwapBacked(page) != PageSwapCache(page))) {
+			WARN_ON_ONCE(1);
+			ret = SWAP_FAIL;
+			goto out_unmap;
+		}
+
+		/* MADV_FREE page check */
+		if (!PageSwapBacked(page)) {
+			if (!PageDirty(page)) {
+				dec_mm_counter(mm, MM_ANONPAGES);
+				goto discard;
+			}
+
+			/*
+			 * If the page was redirtied, it cannot be
+			 * discarded. Remap the page to page table.
+			 */
+#ifdef CONFIG_RKP_DMAP_PROT
+			dmap_prot((u64)pteval,0,0);
+#endif
+			set_pte_at(mm, address, pte, pteval);
+			SetPageSwapBacked(page);
+			ret = SWAP_FAIL;
+			goto out_unmap;
+		}
+
 		if (swap_duplicate(entry) < 0) {
 #ifdef CONFIG_RKP_DMAP_PROT
 			dmap_prot((u64)pteval,0,0);
@@ -1500,6 +1525,7 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	} else
 		dec_mm_counter(mm, MM_FILEPAGES);
 
+discard:
 	page_remove_rmap(page);
 	page_cache_release(page);
 
