@@ -27,6 +27,7 @@ static inline p4d_t *p4d_offset(pgd_t *pgd, unsigned long address)
 }
 
 #define p4d_none_or_clear_bad(p4d)	pgd_none_or_clear_bad(p4d)
+#define p4d_present(p4d)	pgd_present(p4d)
 
 #define p4d_addr_end(addr, end)						\
 ({	unsigned long __boundary = ((addr) + P4D_SIZE) & P4D_MASK;	\
