@@ -669,10 +669,12 @@ static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
 	struct kiocb kiocb;
 	ssize_t ret;
 
-	if (flags)
+	if (flags & ~RWF_HIPRI)
 		return -EOPNOTSUPP;
 
 	init_sync_kiocb(&kiocb, filp);
+	if (flags & RWF_HIPRI)
+		kiocb.ki_flags |= IOCB_HIPRI;
 	kiocb.ki_pos = *ppos;
 
 	if (type == READ)
@@ -690,7 +692,7 @@ static ssize_t do_loop_readv_writev(struct file *filp, struct iov_iter *iter,
 {
 	ssize_t ret = 0;
 
-	if (flags)
+	if (flags & ~RWF_HIPRI)
 		return -EOPNOTSUPP;
 
 	while (iov_iter_count(iter)) {
