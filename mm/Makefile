@@ -26,7 +26,7 @@ KCOV_INSTRUMENT_vmstat.o := n
 
 mmu-y			:= nommu.o
 mmu-$(CONFIG_MMU)	:= gup.o memory.o mincore.o \
-			   mlock.o mmap.o mprotect.o mremap.o msync.o rmap.o \
+			   mlock.o mmap.o mprotect.o mremap.o msync.o page_vma_mapped.o rmap.o \
 			   vmalloc.o pagewalk.o pgtable-generic.o
 
 mmu-$(CONFIG_HIGHMEM)	+= highmem.o

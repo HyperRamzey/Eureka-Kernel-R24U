@@ -81,3 +81,4 @@ obj-$(CONFIG_TZDEV)	+= tzdev/
 endif
 obj-$(CONFIG_SAMSUNG_TUI)	+= tui/
 obj-$(CONFIG_USB_FAST_CHARGE) += fastchg.o
+obj-$(CONFIG_NTSYNC)		+= ntsync.o

@@ -273,6 +273,21 @@ struct static_key_false {
 #define DEFINE_STATIC_KEY_FALSE(name)	\
 	struct static_key_false name = STATIC_KEY_FALSE_INIT
 
+/*
+ * 4.4 MGLRU backport: array forms of the static-key definitions
+ * (upstream: "jump_label: add DEFINE_STATIC_KEY_ARRAY_*"); the MGLRU
+ * capability array uses them.
+ */
+#define DEFINE_STATIC_KEY_ARRAY_TRUE(name, size)		\
+	struct static_key_true name[size] = {			\
+		[0 ... (size) - 1] = STATIC_KEY_TRUE_INIT,	\
+	}
+
+#define DEFINE_STATIC_KEY_ARRAY_FALSE(name, size)		\
+	struct static_key_false name[size] = {			\
+		[0 ... (size) - 1] = STATIC_KEY_FALSE_INIT,	\
+	}
+
 #define DECLARE_STATIC_KEY_FALSE(name)	\
 	extern struct static_key_false name
 

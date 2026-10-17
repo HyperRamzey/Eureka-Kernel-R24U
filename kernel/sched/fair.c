@@ -3124,6 +3124,32 @@ __update_load_avg(u64 now, int cpu, struct sched_avg *sa,
 	return decayed;
 }
 
+/*
+ * When a task is dequeued, its estimated utilization should not be update if
+ * its util_avg has not been updated at least once.
+ * This flag is used to synchronize util_avg updates with util_est updates.
+ * We map this information into the LSB bit of the utilization saved at
+ * dequeue time (i.e. util_est.dequeued).
+ */
+#define UTIL_AVG_UNCHANGED 0x1
+
+static inline void cfs_se_util_change(struct sched_avg *avg)
+{
+	unsigned int enqueued;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Avoid store if the flag has been already set */
+	enqueued = avg->util_est.enqueued;
+	if (!(enqueued & UTIL_AVG_UNCHANGED))
+		return;
+
+	/* Reset flag to report util_avg has been updated */
+	enqueued &= ~UTIL_AVG_UNCHANGED;
+	WRITE_ONCE(avg->util_est.enqueued, enqueued);
+}
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 /*
  * Updating tg's load_avg is necessary before update_cfs_share (which is done)
@@ -3198,7 +3224,23 @@ static inline void cfs_rq_util_change(struct cfs_rq *cfs_rq)
 
 	if (cpu == smp_processor_id() && &rq->cfs == cfs_rq) {
 		unsigned long max = rq->cpu_capacity_orig;
-		unsigned long req_cap = boosted_cpu_util(cfs_rq->avg.util_avg, cpu);
+		unsigned long util = READ_ONCE(cfs_rq->avg.util_avg);
+		unsigned long req_cap;
+
+		/*
+		 * Integrate the estimated utilization, mirroring upstream
+		 * cpu_util_cfs(): a task waking up after a long sleep has
+		 * its PELT utilization decayed, while its util_est still
+		 * represents the utilization it is expected to generate.
+		 * This allows the governor to pick the right OPP as soon
+		 * as the task is enqueued.
+		 */
+		if (sched_feat(UTIL_EST)) {
+			util = max_t(unsigned long, util,
+				     READ_ONCE(cfs_rq->avg.util_est.enqueued));
+		}
+
+		req_cap = boosted_cpu_util(util, cpu);
 
 		/*
 		 * There are a few boundary cases this might miss but it should
@@ -3297,6 +3339,7 @@ static inline void update_load_avg(struct sched_entity *se, int update_tg)
 			  cfs_rq->curr == se, NULL);
 
 	if (decayed) {
+		cfs_se_util_change(&se->avg);
 #ifdef CONFIG_SCHED_HMP
 		trace_sched_rq_runnable_ratio(cpu_of(rq_of(cfs_rq)), cfs_rq->avg.hmp_load_avg);
 #endif
@@ -3536,6 +3579,107 @@ static inline unsigned long cfs_rq_load_avg(struct cfs_rq *cfs_rq)
 
 static int idle_balance(struct rq *this_rq);
 
+static inline unsigned long _task_util_est(struct task_struct *p)
+{
+	struct util_est ue = READ_ONCE(p->se.avg.util_est);
+
+	return max(ue.ewma, ue.enqueued);
+}
+
+static inline unsigned long task_util_est(struct task_struct *p)
+{
+	return max(task_util(p), _task_util_est(p));
+}
+
+static inline void util_est_enqueue(struct cfs_rq *cfs_rq,
+				    struct task_struct *p)
+{
+	unsigned int enqueued;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Update root cfs_rq's estimated utilization */
+	enqueued  = cfs_rq->avg.util_est.enqueued;
+	enqueued += (_task_util_est(p) | UTIL_AVG_UNCHANGED);
+	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, enqueued);
+}
+
+/*
+ * Check if a (signed) value is within a specified (unsigned) margin,
+ * based on the observation that:
+ *
+ *     abs(x) < y := (unsigned)(x + y - 1) < (2 * y - 1)
+ *
+ * NOTE: this only works when value + maring < INT_MAX.
+ */
+static inline bool within_margin(int value, int margin)
+{
+	return ((unsigned int)(value + margin - 1) < (2 * margin - 1));
+}
+
+static void
+util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p, bool task_sleep)
+{
+	long last_ewma_diff;
+	struct util_est ue;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Update root cfs_rq's estimated utilization */
+	ue.enqueued  = cfs_rq->avg.util_est.enqueued;
+	ue.enqueued -= min_t(unsigned int, ue.enqueued,
+			     (_task_util_est(p) | UTIL_AVG_UNCHANGED));
+	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, ue.enqueued);
+
+	/*
+	 * Skip update of task's estimated utilization when the task has not
+	 * yet completed an activation, e.g. being migrated.
+	 */
+	if (!task_sleep)
+		return;
+
+	/*
+	 * If the PELT values haven't changed since enqueue time,
+	 * skip the util_est update.
+	 */
+	ue = p->se.avg.util_est;
+	if (ue.enqueued & UTIL_AVG_UNCHANGED)
+		return;
+
+	/*
+	 * Skip update of task's estimated utilization when its EWMA is
+	 * already ~1% close to its last activation value.
+	 */
+	ue.enqueued = (task_util(p) | UTIL_AVG_UNCHANGED);
+	last_ewma_diff = ue.enqueued - ue.ewma;
+	if (within_margin(last_ewma_diff, (SCHED_CAPACITY_SCALE / 100)))
+		return;
+
+	/*
+	 * Update Task's estimated utilization
+	 *
+	 * When *p completes an activation we can consolidate another sample
+	 * of the task size. This is done by storing the current PELT value
+	 * as ue.enqueued and by using this value to update the Exponential
+	 * Weighted Moving Average (EWMA):
+	 *
+	 *  ewma(t) = w *  task_util(p) + (1-w) * ewma(t-1)
+	 *          = w *  task_util(p) +         ewma(t-1)  - w * ewma(t-1)
+	 *          = w * (task_util(p) -         ewma(t-1)) +     ewma(t-1)
+	 *          = w * (      last_ewma_diff            ) +     ewma(t-1)
+	 *          = w * (last_ewma_diff  +  ewma(t-1) / w)
+	 *
+	 * Where 'w' is the weight of new samples, which is configured to be
+	 * 0.25, thus making w=1/4 ( >>= UTIL_EST_WEIGHT_SHIFT)
+	 */
+	ue.ewma <<= UTIL_EST_WEIGHT_SHIFT;
+	ue.ewma  += last_ewma_diff;
+	ue.ewma >>= UTIL_EST_WEIGHT_SHIFT;
+	WRITE_ONCE(p->se.avg.util_est, ue);
+}
+
 #else /* CONFIG_SMP */
 
 static inline void update_load_avg(struct sched_entity *se, int update_tg) {}
@@ -3554,6 +3698,13 @@ static inline int idle_balance(struct rq *rq)
 {
 	return 0;
 }
+
+static inline void
+util_est_enqueue(struct cfs_rq *cfs_rq, struct task_struct *p) {}
+
+static inline void
+util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p,
+		 bool task_sleep) {}
 
 #endif /* CONFIG_SMP */
 
@@ -4867,6 +5018,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		}
 	}
 
+	util_est_enqueue(&rq->cfs, p);
 	hrtick_update(rq);
 }
 
@@ -4929,6 +5081,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		schedtune_dequeue_task(p, cpu_of(rq));
 	}
 
+	util_est_dequeue(&rq->cfs, p, task_sleep);
 	hrtick_update(rq);
 }
 
@@ -5444,7 +5597,7 @@ static int wake_affine(struct sched_domain *sd, struct task_struct *p, int sync)
 
 static inline unsigned long task_util(struct task_struct *p)
 {
-	return p->se.avg.util_avg;
+	return READ_ONCE(p->se.avg.util_avg);
 }
 
 /*
@@ -5487,7 +5640,7 @@ static inline bool task_fits_max(struct task_struct *p, int cpu)
 	return __task_fits(p, cpu, 0);
 }
 
-static int cpu_util(int cpu);
+static inline unsigned long cpu_util(int cpu);
 
 static inline bool task_fits_spare(struct task_struct *p, int cpu)
 {
@@ -6923,11 +7076,13 @@ int set_hmp_boost(int enable)
 #endif /* CONFIG_SCHED_HMP */
 
 #ifndef CONFIG_SCHED_USE_FLUID_RT
-/*
- * cpu_util returns the amount of capacity of a CPU that is used by CFS
- * tasks. The unit of the return value must be the one of capacity so we can
- * compare the utilization with the capacity of the CPU that is available for
- * CFS task (ie cpu_capacity).
+/**
+ * Amount of capacity of a CPU that is (estimated to be) used by CFS tasks
+ * @cpu: the CPU to get the utilization of
+ *
+ * The unit of the return value must be the one of capacity so we can compare
+ * the utilization with the capacity of the CPU that is available for CFS task
+ * (ie cpu_capacity).
  *
  * cfs_rq.avg.util_avg is the sum of running time of runnable tasks plus the
  * recent utilization of currently non-runnable tasks on a CPU. It represents
@@ -6937,6 +7092,14 @@ int set_hmp_boost(int enable)
  * The utilization of a CPU converges towards a sum equal to or less than the
  * current capacity (capacity_curr <= capacity_orig) of the CPU because it is
  * the running time on this CPU scaled by capacity_curr.
+ *
+ * The estimated utilization of a CPU is defined to be the maximum between its
+ * cfs_rq.avg.util_avg and the sum of the estimated utilization of the tasks
+ * currently RUNNABLE on that CPU.
+ * This allows to properly represent the expected utilization of a CPU which
+ * has just got a big task running since a long sleep period. At the same time
+ * however it preserves the benefits of the "blocked utilization" in
+ * describing the potential for other tasks waking up on the same CPU.
  *
  * Nevertheless, cfs_rq.avg.util_avg can be higher than capacity_curr or even
  * higher than capacity_orig because of unfortunate rounding in
@@ -6948,13 +7111,21 @@ int set_hmp_boost(int enable)
  * available capacity. We allow utilization to overshoot capacity_curr (but not
  * capacity_orig) as it useful for predicting the capacity required after task
  * migrations (scheduler-driven DVFS).
+ *
+ * Return: the (estimated) utilization for the specified CPU
  */
-static int cpu_util(int cpu)
+static inline unsigned long cpu_util(int cpu)
 {
-	unsigned long util = cpu_rq(cpu)->cfs.avg.util_avg;
-	unsigned long capacity = capacity_orig_of(cpu);
+	struct cfs_rq *cfs_rq;
+	unsigned int util;
 
-	return (util >= capacity) ? capacity : util;
+	cfs_rq = &cpu_rq(cpu)->cfs;
+	util = READ_ONCE(cfs_rq->avg.util_avg);
+
+	if (sched_feat(UTIL_EST))
+		util = max(util, READ_ONCE(cfs_rq->avg.util_est.enqueued));
+
+	return min_t(unsigned long, util, capacity_orig_of(cpu));
 }
 #endif
 
@@ -7368,21 +7539,93 @@ static bool cpu_overutilized(int cpu)
 }
 
 /*
- * cpu_util_wake(): CPU utilisation with any contribution from the waking
- * task @p removed.
+ * cpu_util_without: compute cpu utilization without any contributions from *p
+ * @cpu: the CPU which utilization is requested
+ * @p: the task which utilization should be discounted
+ *
+ * The utilization of a CPU is defined by the utilization of tasks currently
+ * enqueued on that CPU as well as tasks which are currently sleeping after an
+ * execution on that CPU.
+ *
+ * This method returns the utilization of the specified CPU by discounting the
+ * utilization of the specified task, whenever the task is currently
+ * contributing to the CPU utilization.
  */
-static unsigned long cpu_util_wake(int cpu, struct task_struct *p)
+static unsigned long cpu_util_without(int cpu, struct task_struct *p)
 {
-	unsigned long util, capacity;
+	struct cfs_rq *cfs_rq;
+	unsigned int util;
 
 	/* Task has no contribution, or is new */
-	if (cpu != task_cpu(p) || !p->se.avg.last_update_time)
+	if (cpu != task_cpu(p) || !READ_ONCE(p->se.avg.last_update_time))
 		return cpu_util(cpu);
 
-	capacity = capacity_orig_of(cpu);
-	util = max_t(long, cpu_util(cpu) - task_util(p), 0);
+	cfs_rq = &cpu_rq(cpu)->cfs;
+	util = READ_ONCE(cfs_rq->avg.util_avg);
 
-	return (util >= capacity) ? capacity : util;
+	/* Discount task's util from CPU's util */
+	util -= min_t(unsigned int, util, task_util(p));
+
+	/*
+	 * Covered cases:
+	 *
+	 * a) if *p is the only task sleeping on this CPU, then:
+	 *      cpu_util (== task_util) > util_est (== 0)
+	 *    and thus we return:
+	 *      cpu_util_without = (cpu_util - task_util) = 0
+	 *
+	 * b) if other tasks are SLEEPING on this CPU, which is now exiting
+	 *    IDLE, then:
+	 *      cpu_util >= task_util
+	 *      cpu_util > util_est (== 0)
+	 *    and thus we discount *p's blocked utilization to return:
+	 *      cpu_util_without = (cpu_util - task_util) >= 0
+	 *
+	 * c) if other tasks are RUNNABLE on that CPU and
+	 *      util_est > cpu_util
+	 *    then we use util_est since it returns a more restrictive
+	 *    estimation of the spare capacity on that CPU, by just
+	 *    considering the expected utilization of tasks already
+	 *    runnable on that CPU.
+	 *
+	 * Cases a) and b) are covered by the above code, while case c) is
+	 * covered by the following code when estimated utilization is
+	 * enabled.
+	 */
+	if (sched_feat(UTIL_EST)) {
+		unsigned int estimated =
+			READ_ONCE(cfs_rq->avg.util_est.enqueued);
+
+		/*
+		 * Despite the following checks we still have a small window
+		 * for a possible race, when an execl's select_task_rq_fair()
+		 * races with LB's detach_task():
+		 *
+		 *   detach_task()
+		 *     p->on_rq = TASK_ON_RQ_MIGRATING;
+		 *     ---------------------------------- A
+		 *     deactivate_task()                   \
+		 *       dequeue_task()                     + RaceTime
+		 *         util_est_dequeue()              /
+		 *     ---------------------------------- B
+		 *
+		 * The additional check on "current == p" it's required to
+		 * properly fix the execl regression and it helps in further
+		 * reducing the chances for the above race.
+		 */
+		if (unlikely(task_on_rq_queued(p) || current == p)) {
+			estimated -= min_t(unsigned int, estimated,
+					   (_task_util_est(p) | UTIL_AVG_UNCHANGED));
+		}
+		util = max(util, estimated);
+	}
+
+	/*
+	 * Utilization (estimated) can exceed the CPU capacity, thus let's
+	 * clamp to the maximum CPU capacity to ensure consistency with
+	 * the cpu_util call.
+	 */
+	return min_t(unsigned long, util, capacity_orig_of(cpu));
 }
 
 static int start_cpu(bool boosted)
@@ -7441,7 +7684,7 @@ static inline int find_best_target(struct task_struct *p, bool boosted, bool pre
 			 * so prev_cpu receives a negative bias due to double
 			 * accounting. The blocked utilisation may be zero.
 			 */
-			wake_util = cpu_util_wake(i, p);
+			wake_util = cpu_util_without(i, p);
 			new_util = wake_util + uclamp_task_util(p);
 
 			/*

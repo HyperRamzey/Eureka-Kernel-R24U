@@ -107,8 +107,13 @@ union swap_header {
  * current->reclaim_state points to one of these when a task is running
  * memory reclaim
  */
+struct lru_gen_mm_walk;
 struct reclaim_state {
 	unsigned long reclaimed_slab;
+#ifdef CONFIG_LRU_GEN
+	/* 4.4 MGLRU: per-task mm walker, reset at reclaim entry sites */
+	struct lru_gen_mm_walk *mm_walk;
+#endif
 };
 
 #ifdef __KERNEL__
@@ -252,7 +257,7 @@ struct swap_info_struct {
 
 /* linux/mm/workingset.c */
 void *workingset_eviction(struct address_space *mapping, struct page *page);
-bool workingset_refault(void *shadow);
+bool workingset_refault(struct page *page, void *shadow);
 void workingset_activation(struct page *page);
 extern struct list_lru __workingset_shadow_nodes;
 DECLARE_LOCAL_IRQ_LOCK(workingset_shadow_lock);
@@ -313,7 +318,7 @@ extern void lru_add_drain_cpu(int cpu);
 extern void lru_add_drain_all(void);
 extern void rotate_reclaimable_page(struct page *page);
 extern void deactivate_file_page(struct page *page);
-extern void deactivate_page(struct page *page);
+extern void mark_page_lazyfree(struct page *page);
 extern void swap_setup(void);
 
 extern void add_page_to_unevictable_list(struct page *page);

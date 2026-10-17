@@ -1377,6 +1377,34 @@ struct load_weight {
 	u32 inv_weight;
 };
 
+/**
+ * struct util_est - Estimation utilization of FAIR tasks
+ * @enqueued: instantaneous estimated utilization of a task/cpu
+ * @ewma:     the Exponential Weighted Moving Average (EWMA)
+ *            utilization of a task
+ *
+ * Support data structure to track an Exponential Weighted Moving Average
+ * (EWMA) of a FAIR task's utilization. New samples are added to the moving
+ * average each time a task completes an activation. Sample's weight is chosen
+ * so that the EWMA will be relatively insensitive to transient changes to the
+ * task's workload.
+ *
+ * The enqueued attribute has a slightly different meaning for tasks and cpus:
+ * - task:   the task's util_avg at last task dequeue time
+ * - cfs_rq: the sum of util_est.enqueued for each RUNNABLE task on that CPU
+ * Thus, the util_est.enqueued of a task represents the contribution on the
+ * estimated utilization of the CPU where that task is currently enqueued.
+ *
+ * Only for tasks we track a moving average of the past instantaneous
+ * estimated utilization. This allows to absorb sporadic drops in utilization
+ * of an otherwise almost periodic task.
+ */
+struct util_est {
+	unsigned int			enqueued;
+	unsigned int			ewma;
+#define UTIL_EST_WEIGHT_SHIFT		2
+};
+
 /*
  * The load_avg/util_avg accumulates an infinite geometric series.
  * 1) load_avg factors frequency scaling into the amount of time that a
@@ -1395,6 +1423,7 @@ struct sched_avg {
 	u64 last_update_time, load_sum;
 	u32 util_sum, period_contrib;
 	unsigned long load_avg, util_avg;
+	struct util_est			util_est;
 #ifdef CONFIG_SCHED_HMP
 	u64 hmp_load_sum, hmp_load_avg;
 	u64 hmp_last_up_migration;
@@ -1800,6 +1829,11 @@ struct task_struct {
 #ifdef CONFIG_MEMCG_KMEM
 	unsigned memcg_kmem_skip_account:1;
 #endif
+#ifdef CONFIG_LRU_GEN
+	/* whether the LRU algorithm may apply to this access */
+	unsigned			in_lru_fault:1;
+#endif
+
 #ifdef CONFIG_COMPAT_BRK
 	unsigned brk_randomized:1;
 #endif
@@ -2555,6 +2589,20 @@ static inline unsigned int memalloc_noio_save(void)
 static inline void memalloc_noio_restore(unsigned int flags)
 {
 	current->flags = (current->flags & ~PF_MEMALLOC_NOIO) | flags;
+}
+
+static inline unsigned int memalloc_noreclaim_save(void)
+{
+	unsigned int flags = current->flags & PF_MEMALLOC;
+
+	current->flags |= PF_MEMALLOC;
+
+	return flags;
+}
+
+static inline void memalloc_noreclaim_restore(unsigned int flags)
+{
+	current->flags = (current->flags & ~PF_MEMALLOC) | flags;
 }
 
 /* Per-process atomic flags. */

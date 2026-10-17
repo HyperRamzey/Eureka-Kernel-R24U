@@ -16,9 +16,6 @@
 #define ISRHEL7
 #elif RHEL_MAJOR == 8
 #define ISRHEL8
-#if RHEL_MINOR >= 6
-#define ISCENTOS8S
-#endif
 #endif
 #endif
 #ifdef UTS_UBUNTU_RELEASE_ABI
@@ -724,22 +721,6 @@ static inline void *skb_put_data(struct sk_buff *skb, const void *data, unsigned
 #endif
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0) || LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 285)) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0) || LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 320))
-static inline void le32_to_cpu_array(u32 *buf, unsigned int words)
-{
-	while (words--) {
-		__le32_to_cpus(buf);
-		buf++;
-	}
-}
-static inline void cpu_to_le32_array(u32 *buf, unsigned int words)
-{
-	while (words--) {
-		__cpu_to_le32s(buf);
-		buf++;
-	}
-}
-#endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 #include <crypto/algapi.h>
@@ -777,7 +758,18 @@ static inline void crypto_xor_cpy(u8 *dst, const u8 *src1, const u8 *src2,
 #define hlist_add_behind(a, b) hlist_add_after(b, a)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) && !defined(ISRHEL8)
+/*
+ * This branch backported the 5.0-style total RAM accounting: the value
+ * sits behind the _totalram_pages atomic and mm.h provides the
+ * totalram_pages() accessor, with no bare variable for the redirect
+ * below to reach.  The epoch cannot be spelled as 4.4.302 (SUBLEVEL
+ * 302 overflows the version-code byte field and the build reports the
+ * clamped 4.4.255 fingerprint), so its window is excluded outright:
+ * the call stays the one upstream writes and lands on the accessor,
+ * exactly as upstream's in-tree driver does on 5.0+ kernels.  Seam
+ * rationale mirrors the blake2s/zinc rename for this epoch.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) && !(LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 255) && LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0)) && !defined(ISRHEL8)
 #define totalram_pages() totalram_pages
 #endif
 
@@ -895,7 +887,7 @@ static inline void skb_mark_not_on_list(struct sk_buff *skb)
 #endif
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 200) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 249)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 285)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 320))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 200) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 249)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 285)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 320)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 303))
 #define blake2s_init zinc_blake2s_init
 #define blake2s_init_key zinc_blake2s_init_key
 #define blake2s_update zinc_blake2s_update

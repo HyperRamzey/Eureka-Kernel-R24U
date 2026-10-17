@@ -9,6 +9,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/pagewalk.h>
 #include <linux/hugetlb.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
@@ -276,19 +277,19 @@ static int prot_none_test(unsigned long addr, unsigned long next,
 	return 0;
 }
 
+static const struct mm_walk_ops prot_none_walk_ops = {
+	.pte_entry = prot_none_pte_entry,
+	.hugetlb_entry = prot_none_hugetlb_entry,
+	.test_walk = prot_none_test,
+};
+
 static int prot_none_walk(struct vm_area_struct *vma, unsigned long start,
 			   unsigned long end, unsigned long newflags)
 {
 	pgprot_t new_pgprot = vm_get_page_prot(newflags);
-	struct mm_walk prot_none_walk = {
-		.pte_entry = prot_none_pte_entry,
-		.hugetlb_entry = prot_none_hugetlb_entry,
-		.test_walk = prot_none_test,
-		.mm = current->mm,
-		.private = &new_pgprot,
-	};
 
-	return walk_page_range(start, end, &prot_none_walk);
+	return walk_page_range(vma->vm_mm, start, end,
+			       &prot_none_walk_ops, &new_pgprot);
 }
 
 int

@@ -35,6 +35,7 @@
 #include <linux/memcontrol.h>
 #include <linux/cgroup.h>
 #include <linux/mm.h>
+#include <linux/pagewalk.h>
 #include <linux/hugetlb.h>
 #include <linux/pagemap.h>
 #include <linux/smp.h>
@@ -273,8 +274,11 @@ static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)
  */
 #define MEM_CGROUP_ID_MAX	USHRT_MAX
 
-static inline unsigned short mem_cgroup_id(struct mem_cgroup *memcg)
+unsigned short mem_cgroup_id(struct mem_cgroup *memcg)
 {
+	/* 4.4 MGLRU: zone lruvecs carry no memcg when memcg is disabled */
+	if (!memcg)
+		return 0;
 	return memcg->id.id;
 }
 
@@ -818,7 +822,13 @@ struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p)
 }
 EXPORT_SYMBOL(mem_cgroup_from_task);
 
-static struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm)
+void mem_cgroup_put(struct mem_cgroup *memcg)
+{
+	if (memcg)
+		css_put(&memcg->css);
+}
+
+struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm)
 {
 	struct mem_cgroup *memcg = NULL;
 
@@ -1075,8 +1085,10 @@ out:
 	 * we have to be prepared to initialize lruvec->zone here;
 	 * and if offlined then reonlined, we need to reinitialize it.
 	 */
-	if (unlikely(lruvec->zone != zone))
+	if (unlikely(lruvec->zone != zone)) {
 		lruvec->zone = zone;
+		lruvec->memcg = memcg;	/* 4.4 MGLRU: owner backpointer */
+	}
 	return lruvec;
 }
 
@@ -1097,6 +1109,7 @@ struct lruvec *mem_cgroup_page_lruvec(struct page *page, struct zone *zone)
 
 	if (mem_cgroup_disabled()) {
 		lruvec = &zone->lruvec;
+		memcg = NULL;	/* 4.4 MGLRU: zone lruvec has no owner */
 		goto out;
 	}
 
@@ -1116,8 +1129,10 @@ out:
 	 * we have to be prepared to initialize lruvec->zone here;
 	 * and if offlined then reonlined, we need to reinitialize it.
 	 */
-	if (unlikely(lruvec->zone != zone))
+	if (unlikely(lruvec->zone != zone)) {
 		lruvec->zone = zone;
+		lruvec->memcg = memcg;	/* 4.4 MGLRU: owner backpointer */
+	}
 	return lruvec;
 }
 
@@ -4285,6 +4300,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	if (memcg->id.id < 0)
 		goto out_free_stat;
 
+	lru_gen_init_memcg(memcg);
 	return memcg;
 
 out_free_stat:
@@ -4477,6 +4493,7 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 
+	lru_gen_exit_memcg(memcg);
 	memcg_destroy_kmem(memcg);
 	__mem_cgroup_free(memcg);
 }
@@ -4845,16 +4862,16 @@ static int mem_cgroup_count_precharge_pte_range(pmd_t *pmd,
 	return 0;
 }
 
+static const struct mm_walk_ops precharge_walk_ops = {
+	.pmd_entry = mem_cgroup_count_precharge_pte_range,
+};
+
 static unsigned long mem_cgroup_count_precharge(struct mm_struct *mm)
 {
 	unsigned long precharge;
 
-	struct mm_walk mem_cgroup_count_precharge_walk = {
-		.pmd_entry = mem_cgroup_count_precharge_pte_range,
-		.mm = mm,
-	};
 	down_read(&mm->mmap_sem);
-	walk_page_range(0, ~0UL, &mem_cgroup_count_precharge_walk);
+	walk_page_range(mm, 0, ~0UL, &precharge_walk_ops, NULL);
 	up_read(&mm->mmap_sem);
 
 	precharge = mc.precharge;
@@ -5110,12 +5127,12 @@ put:			/* get_mctgt_type() gets the page */
 	return ret;
 }
 
+static const struct mm_walk_ops charge_walk_ops = {
+	.pmd_entry = mem_cgroup_move_charge_pte_range,
+};
+
 static void mem_cgroup_move_charge(void)
 {
-	struct mm_walk mem_cgroup_move_charge_walk = {
-		.pmd_entry = mem_cgroup_move_charge_pte_range,
-		.mm = mc.mm,
-	};
 
 	lru_add_drain_all();
 	/*
@@ -5142,7 +5159,7 @@ retry:
 	 * When we have consumed all precharges and failed in doing
 	 * additional charge, the page walk just aborts.
 	 */
-	walk_page_range(0, ~0UL, &mem_cgroup_move_charge_walk);
+	walk_page_range(mc.mm, 0, ~0UL, &charge_walk_ops, NULL);
 	up_read(&mc.mm->mmap_sem);
 	atomic_dec(&mc.from->moving_account);
 }
@@ -5367,6 +5384,30 @@ static struct cftype memory_files[] = {
 	{ }	/* terminate */
 };
 
+#ifdef CONFIG_LRU_GEN
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	/* find the first leader if there is any */
+	cgroup_taskset_for_each_leader(task, css, tset)
+		break;
+
+	if (!task)
+		return;
+
+	task_lock(task);
+	if (task->mm && READ_ONCE(task->mm->owner) == task)
+		lru_gen_migrate_mm(task->mm);
+	task_unlock(task);
+}
+#else
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+}
+#endif /* CONFIG_LRU_GEN */
+
 struct cgroup_subsys memory_cgrp_subsys = {
 	.css_alloc = mem_cgroup_css_alloc,
 	.css_online = mem_cgroup_css_online,
@@ -5375,6 +5416,7 @@ struct cgroup_subsys memory_cgrp_subsys = {
 	.css_free = mem_cgroup_css_free,
 	.css_reset = mem_cgroup_css_reset,
 	.can_attach = mem_cgroup_can_attach,
+	.attach = mem_cgroup_attach,
 	.cancel_attach = mem_cgroup_cancel_attach,
 	.post_attach = mem_cgroup_move_task,
 	.bind = mem_cgroup_bind,

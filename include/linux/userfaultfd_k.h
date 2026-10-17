@@ -53,6 +53,19 @@ static inline bool userfaultfd_armed(struct vm_area_struct *vma)
 	return vma->vm_flags & (VM_UFFD_MISSING | VM_UFFD_WP);
 }
 
+/*
+ * This tree predates the non-cooperative userfaultfd rework that
+ * introduced userfaultfd_remove(); provide the same "no revalidation
+ * needed" stub as the !CONFIG_USERFAULTFD branch so mm/madvise.c
+ * compiles in both configurations.
+ */
+static inline bool userfaultfd_remove(struct vm_area_struct *vma,
+				      unsigned long start,
+				      unsigned long end)
+{
+	return true;
+}
+
 #else /* CONFIG_USERFAULTFD */
 
 /* mm helpers */
@@ -78,6 +91,13 @@ static inline bool userfaultfd_missing(struct vm_area_struct *vma)
 static inline bool userfaultfd_armed(struct vm_area_struct *vma)
 {
 	return false;
+}
+
+static inline bool userfaultfd_remove(struct vm_area_struct *vma,
+				      unsigned long start,
+				      unsigned long end)
+{
+	return true;
 }
 
 #endif /* CONFIG_USERFAULTFD */
