@@ -455,6 +455,7 @@ static irqreturn_t exynos4_mct_tick_isr(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+#ifdef CONFIG_HARDLOCKUP_DETECTOR_OTHER_CPU
 static void exynos4_mct_tick_dump(unsigned int cpu)
 {
 	unsigned int icntb, icnto, tcon, intenb, intcstat;
@@ -485,6 +486,7 @@ static int exynos4_mct_hardlockup_handler(struct notifier_block *nb,
 	exynos4_mct_tick_dump(*cpu);
 	return 0;
 }
+#endif
 
 
 
@@ -576,9 +578,11 @@ static struct notifier_block exynos4_mct_cpu_nb = {
 	.notifier_call = exynos4_mct_cpu_notify,
 };
 
+#ifdef CONFIG_HARDLOCKUP_DETECTOR_OTHER_CPU
 static struct notifier_block nb_hardlockup_block = {
 	.notifier_call = exynos4_mct_hardlockup_handler,
 };
+#endif
 
 static void __init exynos4_timer_resources(struct device_node *np, void __iomem *base)
 {
