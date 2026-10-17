@@ -2397,6 +2397,14 @@ static int ist40xx_probe(struct i2c_client *client,
 	if (ret == 0)
 		goto err_irq;
 
+	/*
+	 * request_threaded_irq() leaves the IRQ line enabled, but
+	 * irq_enabled was initialized to false.  Sync the flag before
+	 * ist40xx_get_info(), whose guarded disable/enable pair is only
+	 * balanced when the flag reflects the hardware state.
+	 */
+	data->irq_enabled = true;
+
 	ret = ist40xx_get_info(data);
 	input_info(true, &client->dev, "Get info: %s\n", (ret == 0 ? "success" : "fail"));
 	if (ret)
