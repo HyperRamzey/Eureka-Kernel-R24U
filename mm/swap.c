@@ -69,6 +69,15 @@ static void __page_cache_release(struct page *page)
 		del_page_from_lru_list(page, lruvec, page_off_lru(page));
 		spin_unlock_irqrestore(&zone->lru_lock, flags);
 	}
+	/*
+	 * Clear Active bit in case of parallel mark_page_accessed -- and the
+	 * PG_active marker that lru_gen_del_page() sets when a page is
+	 * released from an active generation for migrate_page_states() to
+	 * consume; a page that is freed instead of migrated must not carry
+	 * it into free_pages_prepare() (see the comment on MIN_NR_GENS
+	 * about PG_active). release_pages() clears it here the same way.
+	 */
+	__ClearPageActive(page);
 	mem_cgroup_uncharge(page);
 }
 
