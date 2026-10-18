@@ -205,7 +205,7 @@ static inline unsigned long __ffs64(u64 word)
 		new = (old & ~mask) | bits;			\
 	} while (cmpxchg(ptr, old, new) != old);		\
 								\
-	new;							\
+	old;							\
 })
 #endif
 
