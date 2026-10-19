@@ -1,209 +1,294 @@
-# Building Eureka-Kernel-R24U from scratch — complete WSL2 Debian guide
+# Building Eureka-Kernel-R24U — modern guide
 
-This guide takes a **clean Windows machine** to a **flashable kernel zip** with
-zero prior setup. Everything below is the exact process that produced the
-device-verified v1.1 release.
+Applies to the crDroid 16 (Android 16) Samsung A30s kernel
+`4.4.302-p6-Eureka_rom-crdroid16`, branch `rom-crdroid16`.
 
-> Total time: ~1h (30 min of it is kernel compilation).
-> Disk needed: ~15 GB (toolchain 4 GB + source 6 GB + build 4 GB).
+Last updated 2026-10-19 with kernel **#249** (release tag `kernel-20261019`).
 
-## 0. Prerequisites
+There are two build paths. Use the first one for anything that ships to a
+device:
 
-- Windows 10 1903+ / Windows 11, virtualization enabled in BIOS
-- ~15 GB free on the WSL drive
-- A device in the table below (and a brain: flashing kernels can need
-  recovery + a backup)
+| Path | Use it for | Produces |
+| --- | --- | --- |
+| **ROM tree (modern, recommended)** | release kernels and full ROMs | `boot.img`, `dtb.img`, `dtbo.img` exactly as the ROM ships them |
+| Standalone `R24U` branch (legacy) | the old v1.x line / non-ROM builds | an AnyKernel3 zip from `tools_eureka/build_device.sh` |
 
-| Device | Codename |
-| --- | --- |
-| Galaxy A10 | a10 |
-| Galaxy A20 | a20 |
-| Galaxy A20e | a20e |
-| Galaxy A30 | a30 |
-| Galaxy A30s (SM-A307FN) | a30s |
-| Galaxy A40 | a40 |
-| Galaxy M20 | m20 |
-| Galaxy M30s | jackpotlte |
+Every kernel published since `kernel-20261007` was built with the ROM-tree
+path. The legacy path is kept at the end of this guide for reference.
 
-## 1. Install WSL2 + Debian (one-time)
+---
 
-```powershell
-# in an Administrator PowerShell
-wsl --install -d Debian
-# reboot when prompted, set a UNIX user+password on first launch
-```
+## 1. Prerequisites
 
-All later commands run **inside Debian** — launch it with `wsl -d Debian`
-(from any terminal). **Never** use the default distro if it's docker-desktop;
-always pass `-d Debian`.
-
-## 2. Debian packages
+- WSL2 Debian with ~32 GB RAM and ~200 GB free (the full `m bacon` is heavy;
+  a kernel-only `m bootimage` needs far less).
+- Neutron clang 24 at `/root/toolchains` (`/root/toolchains/bin/clang
+  --version` must print 24.x).
+- Debian packages:
 
 ```bash
 sudo apt update
 sudo apt install -y git ccache bc bison flex libssl-dev python3 python3-pip \
   zip unzip curl wget cpio rsync build-essential gcc-aarch64-linux-gnu \
-  crossbuild-essential-armhf
+  crossbuild-essential-armhf zstd lz4
 ```
 
-## 3. Get the toolchain — Neutron Clang 24
+Tree layout used below:
 
-The kernel must be built with Clang 24 (Neutron) or Clang 20 (WeebX); GCC-only
-builds are NOT supported for the release recipe.
+```
+/root/rom/crdroid16                              # crDroid 16 ROM tree
+/root/rom/crdroid16/kernel/samsung/exynos7885    # this kernel (remote: fork)
+/root/rom/crdroid16/device/samsung/a30s          # device tree
+/root/rom/crdroid16/device/samsung/exynos7885-common
+/root/toolchains                                 # Neutron clang 24
+```
+
+The kernel fork is wired into the ROM's `local_manifest`; check it with:
 
 ```bash
-sudo mkdir -p /root/toolchains && sudo chown -R $USER /root/toolchains 2>/dev/null || true
-cd /tmp
-
-# Neutron clang r24 (release) — grab the latest linux-x86_64 tarball from
-# https://github.com/Neutron-Toolchains/Neutron-Clang/releases
-# example file name pattern: neon-clang-v24.x-YYYYMMDD-linux.tar.zst
-wget -O neutron.tar.zst <URL-from-releases-page>
-sudo mkdir -p /root/toolchains/bin
-sudo tar -I zstd -xf neutron.tar.zst -C /root/toolchains --strip-components=1
-/root/toolchains/bin/clang --version   # must print 24.x
+cd /root/rom/crdroid16/kernel/samsung/exynos7885
+git remote -v          # fork -> HyperRamzey/Eureka-Kernel-R24U
+git branch --show-current   # rom-crdroid16
+git status --short
 ```
 
-If zstd is missing: `sudo apt install -y zstd`.
+---
 
-Verify: `/root/toolchains/bin/clang` must exist and report version 24.x.
-This exact path is what `tools_eureka/build_device.sh` expects.
+## 2. Build in the ROM tree
 
-## 4. Get the source
+### 2.1 Enter the build environment
 
 ```bash
-sudo mkdir -p /root/kbuild
-cd /root/kbuild
-
-git clone https://github.com/HyperRamzey/Eureka-Kernel-R24U.git eureka_r24
-cd eureka_r24
-git submodule update --init   # KernelSU (rsuntk) — see note below
+cd /root/rom/crdroid16
+export PATH=/root/rom/crdroid16/build/soong:/root/rom/crdroid16/out/host/linux-x86/bin:$PATH
+source build/envsetup.sh
+breakfast lineage_a30s-bp4a-userdebug
 ```
 
-**KernelSU submodule note:** the gitlink pins the rsuntk fork at the commit
-this kernel integrates (v32473 hooks). If `git submodule update --init` fails
-(the fork tar-copied during integration), use the released branch state — the
-`drivers/kernelsu/` content is committed in the R24U branch history of this
-repo; verify with:
+**Never pipe `breakfast`.** It is a shell function; a pipe runs it in a
+subshell, so `TARGET_RELEASE` never reaches the parent and the build dies in
+`release_config.mk` with "No release config set". A trailing `2>&1` is fine.
+
+### 2.2 Kernel only (fast iteration)
 
 ```bash
-grep 'KSU_VERSION=3' drivers/kernelsu/Makefile   # rsuntk scheme (32473)
-# tiann fork instead prints 'expr 10000+' — wrong fork if you see that
+m bootimage -j8
 ```
 
-## 5. Build one device
+Incremental builds take 4–8 minutes. This rebuilds the kernel image and
+re-packs `boot.img`; it does **not** touch system/vendor.
+
+Outputs:
+
+```
+out/target/product/a30s/boot.img
+out/target/product/a30s/dtb.img
+out/target/product/a30s/dtbo.img
+out/target/product/a30s/obj/KERNEL_OBJ/arch/arm64/boot/Image
+out/target/product/a30s/kernel                  # a copy of Image
+out/target/product/a30s/obj/KERNEL_OBJ/System.map
+```
+
+### 2.3 Full ROM
+
+```bash
+m bacon -j8
+```
+
+This rebuilds the kernel, system, vendor, and the flashable
+`crDroidAndroid-16.0-YYYYMMDD-a30s-v12.12.zip`. It is the only way to guarantee
+that the kernel in the zip matches the kernel you tested.
+
+For an unattended build with logging, use the host helper
+`hm_mod/rebuild2.sh` (WSL path `/mnt/g/projects/Derp/hm_mod/rebuild2.sh`); it
+sources `envsetup.sh`, runs `breakfast`, then `m bacon -j8`, and logs to
+`/root/port49/logs/rebuild_oct3.log`.
+
+---
+
+## 3. Toolchain wiring (why it is pinned)
+
+`device/samsung/exynos7885-common/BoardConfigCommon.mk` pins the kernel
+toolchain and the LLVM binutils:
+
+```make
+TARGET_KERNEL_SOURCE := kernel/samsung/exynos7885
+TARGET_KERNEL_CONFIG := full/exynos7885-a30s_defconfig
+TARGET_KERNEL_NO_GCC := true
+TARGET_KERNEL_CLANG_PATH := /root/toolchains
+TARGET_KERNEL_ADDITIONAL_FLAGS := CLANG_TRIPLE=aarch64-linux-gnu-
+TARGET_KERNEL_ADDITIONAL_FLAGS += CROSS_COMPILE=aarch64-linux-gnu-
+TARGET_KERNEL_ADDITIONAL_FLAGS += OBJCOPY=$(TARGET_KERNEL_CLANG_PATH)/bin/llvm-objcopy
+TARGET_KERNEL_ADDITIONAL_FLAGS += OBJDUMP=$(TARGET_KERNEL_CLANG_PATH)/bin/llvm-objdump
+TARGET_KERNEL_ADDITIONAL_FLAGS += NM=$(TARGET_KERNEL_CLANG_PATH)/bin/llvm-nm
+TARGET_KERNEL_ADDITIONAL_FLAGS += AR=$(TARGET_KERNEL_CLANG_PATH)/bin/llvm-ar
+TARGET_KERNEL_ADDITIONAL_FLAGS += STRIP=$(TARGET_KERNEL_CLANG_PATH)/bin/llvm-strip
+```
+
+Two traps this solves:
+
+1. `TARGET_KERNEL_NO_GCC=true` makes crDroid's `kernel.mk` skip its LLVM
+   branch, so the kernel Makefile falls back to `$(CROSS_COMPILE)objcopy`.
+   `arch/arm64/boot/Makefile` really runs it now; without the explicit
+   `OBJCOPY=` the build dies with `OBJCOPY: No such file or directory`
+   (Error 127).
+2. `CLANG_TRIPLE`/`CROSS_COMPILE` must be passed explicitly or the kernel
+   builds **host x86 objects for arm64 output**.
+
+Host tools (`fixdep`) are pinned to the ROM's stock clang in
+`vendor/lineage/config/BoardConfigKernel.mk` — Neutron-built host binaries
+segfault against the glibc-2.17 sysroot (`Error 139`).
+
+---
+
+## 4. Verify a build before publishing
+
+```bash
+K=/root/rom/crdroid16
+P=$K/out/target/product/a30s
+
+# 1. the ROM's copy and the kernel build output must be identical
+md5sum $P/obj/KERNEL_OBJ/arch/arm64/boot/Image $P/kernel
+
+# 2. banner (version, #build, compiler, date)
+strings $P/obj/KERNEL_OBJ/arch/arm64/boot/Image | grep -m1 'Linux version'
+
+# 3. the symbol you changed is really in the image
+grep -c ist40xx_report_gesture_key $P/obj/KERNEL_OBJ/System.map
+
+# 4. boot.img exists and has the expected partition size limit
+ls -l $P/boot.img      # must be <= 37,748,736 B (mmcblk0p15)
+```
+
+`#N` is a build counter and increments on every rebuild, even with identical
+sources. Match a running device to a build by **build date**, not by `#N`.
+
+Kernel `.o` files are LLVM bitcode; `strings` on them shows metadata, not
+string literals. Use `Image`, `vmlinux`, or the running device.
+
+---
+
+## 5. Package and publish a kernel release
+
+`tools_eureka/publish_release.py` does the whole staging + upload step. It
+needs a GitHub token at `/root/.github_token` (or `GITHUB_TOKEN` in the
+environment) with `repo` scope on the fork.
+
+### 5.1 Run it
+
+From the kernel tree, after a successful build:
+
+```bash
+python3 tools_eureka/publish_release.py \
+  --tag kernel-20261019 --version 249 --date 2026-10-19 \
+  --boot   /root/rom/crdroid16/out/target/product/a30s/boot.img \
+  --image  /root/rom/crdroid16/out/target/product/a30s/obj/KERNEL_OBJ/arch/arm64/boot/Image \
+  --dtb    /root/rom/crdroid16/out/target/product/a30s/dtb.img \
+  --dtbo   /root/rom/crdroid16/out/target/product/a30s/dtbo.img \
+  --ak-dir kernel_zip/anykernel \
+  --notes-file krel_20261019/NOTES_FINAL.md
+```
+
+It writes a staging directory `krel_YYYYMMDD/` (next to the script unless
+`--stage-dir` is given) containing:
+
+```
+boot.img  boot.img.sha256
+dtb.img   dtb.img.sha256
+dtbo.img  dtbo.img.sha256
+Eureka-Kernel-a30s-YYYYMMDD.zip
+Eureka-Kernel-a30s-YYYYMMDD.zip.sha256
+NOTES_FINAL.md
+```
+
+and then creates (or reuses) the GitHub release, uploading every asset.
+`--replace` re-uploads an existing asset; `--update-body` replaces the release
+body on an existing tag; `--no-upload` stages only.
+
+### 5.2 Release contract
+
+- Tag: `kernel-YYYYMMDD`.
+- Title: `Eureka Kernel #N (YYYY-MM-DD)`.
+- Assets (all with `.sha256` sidecars): `boot.img`, `dtb.img`, `dtbo.img`,
+  `Eureka-Kernel-a30s-YYYYMMDD.zip`.
+- The AK3 zip is built from `kernel_zip/anykernel` with the built `Image`
+  dropped in; it flashes `boot` on `mmcblk0p15`
+  (`/dev/block/platform/13500000.dwmmc0/by-name/boot`).
+- The release body is the notes file; include the full banner, source commit,
+  toolchain, boot image size, the change list, verification, an asset md5
+  table, install steps, and provenance.
+
+### 5.3 Verify the published release
+
+```bash
+gh release view kernel-20261019 -R HyperRamzey/Eureka-Kernel-R24U
+gh release download kernel-20261019 -R HyperRamzey/Eureka-Kernel-R24U -p '*.sha256' -D /tmp/krel
+cd /tmp/krel && sha256sum -c *.sha256
+```
+
+`sha256sum -c` must pass for all four assets. The release URL must answer 200
+and the zip must pass `unzip -t`.
+
+### 5.4 Full-ROM releases (ROM side)
+
+The kernel release is separate from the full-ROM release. The ROM/OTA chain
+uses the host-side tools in the Derp repo (`/mnt/g/projects/Derp/hm_mod/`):
+
+- `mk_release.py` — creates/refreshes the ROM release and uploads assets;
+- `make_ota_json.py` — regenerates and pushes the OTA feed
+  (`a30s.json` on the `ota` branch of `HyperRamzey/device_samsung_a30s`);
+- `rebuild2.sh` — the supported full-build entry point.
+
+---
+
+## 6. Legacy standalone build (R24U branch)
+
+This is the v1.x recipe. It is **not** used for crDroid ROM kernels, because it
+produces a kernel-only uname and a kernel-tree `dtb.img` that can hang this
+device at the boot logo if flashed as a full package.
 
 ```bash
 cd /root/kbuild/eureka_r24
+git checkout R24U
 bash tools_eureka/build_device.sh a30s
 ```
 
-What it does (the proven H2/v1.1 recipe):
+Key differences from the modern path:
 
-- defconfig: `arch/arm64/configs/full/exynos7885-<dev>_defconfig`
-  (vendor O3 + ThinLTO + `CONFIG_KSU=y`)
-- flags: `CC=clang HOSTCC=clang LD=ld.lld ...` — vendor flag style,
-  **never `LLVM=1`** (LLVM=1 link path hangs this SoC — proven by bisect)
-- `LOCALVERSION=-R24U-KSU`, branch `R24U` appends `_R24U` via setlocalversion
-  → uniform `uname -r` = `4.4.302-p6-Eureka-R24U-KSU_R24U`
-- build on branch **R24U** (the release string depends on it)
-- `.scmversion` is emptied automatically
-- output: `out_<codename>/arch/arm64/boot/{Image,dtb.img}` and a
-  flashable AK3 zip `Eureka-R24U-KSU_<codename>.zip` in `kernel_zip/anykernel/`
+- defconfig `arch/arm64/configs/full/exynos7885-a30s_defconfig`;
+- vendor flag style, **never `LLVM=1`** (lld-native ThinLTO hangs this SoC);
+- `LOCALVERSION=-R24U-KSU`, uname `4.4.302-p6-Eureka-R24U-KSU_R24U`;
+- output `out_a30s/arch/arm64/boot/{Image,dtb.img}` and an AK3 zip under
+  `kernel_zip/anykernel/`.
 
-Expect the build to take 10–25 min depending on CPU. On success you see
-`=== <codename> DONE ===` and the zip's sha256.
+If you need a flashable multi-device package, use the AROMA packager
+(`package_aroma_v1.1.sh`) from the old `eureka-build-tools` repo; the plain AK3
+zip is a build artifact, not a release.
 
-### Build all 8 devices
+---
 
-```bash
-# parallel waves (2×4) — same recipe, per-device out dirs
-bash /mnt/g/projects/eureka-build-tools/build_all_nocip.sh   # if you cloned the tools repo
-```
-
-Or just loop:
-
-```bash
-for d in a10 a20 a20e a30 a30s a40 m20 jackpotlte; do \
-  bash tools_eureka/build_device.sh $d; done
-```
-
-## 6. Package for release — AROMA (REQUIRED for flashing!)
-
-**The plain AK3 zip is only a build artifact.** The flashable release uses the
-original AROMA two-layer structure (outer AROMA menu + inner AK3 kernel zip +
-original Eureka DTBs + DM-verity-patched DTBO). This is the packaging that
-boots on devices; a zip that flashes the kernel-tree-built `dtb.img` hangs at
-the boot logo (this is exactly what broke the first v1 release).
-
-Per device:
-
-```bash
-# in the eureka-build-tools repo (host side) — paths assume /mnt/g = G:
-bash package_aroma_v1.1.sh a30s [out_cifs_a30s/arch/arm64/boot/Image] [out.zip]
-```
-
-The packager:
-
-1. builds the inner AK3 zip from the H2-proven template + your new `Image`
-2. copies the original AROMA assets + all 40 original Eureka DTBs
-3. regenerates the device's DM-verity-patched DTBO via
-   `tools_eureka/dtbo_gen.py` (byte-identical to the original release dtbo —
-   verify any edits with `--verify`)
-4. verifies the inner Image sha256 equals your build's Image (IMAGE_MATCH_OK)
-
-## 7. Verify before shipping
-
-```bash
-# golden uname (uniform across devices):
-cat out_<dev>/include/config/kernel.release
-# -> 4.4.302-p6-Eureka-R24U-KSU_R24U
-
-# KSU fork check (rsuntk, not tiann):
-strings out_<dev>/arch/arm64/boot/Image | grep -c 'KPROBES is disabled'
-# -> 0  (a nonzero = tiann fork = wrong build)
-
-# zip integrity:
-unzip -t Eureka-R24U-KSU_<dev>.zip
-sha256sum -c Eureka-R24U-KSU_<dev>.zip.sha256
-```
-
-Device smoke test (after flashing, over adb with root):
-
-```
-uname -r                                         # golden string
-cat /proc/fs/cifs/DebugData | head -3            # CIFS version line (v1.1+)
-su -c '/data/local/tmp/ipset create t hash:ip'   # IPset works (v1.1+)
-```
-
-## 8. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `No rule to make target full/...defconfig` | wrong cwd or old commit | `git pull`; build from repo root |
-| Link hangs forever | `LLVM=1` crept in | use `build_device.sh` as-is (vendor flags) |
-| uname has suffix `_dirty` or extra text | built off-branch / dirty tree | checkout `R24U`, commit or stash local changes |
-| `lz4: command not found` etc. | missing package | `sudo apt install lz4 zstd` |
-| Image > 30 MB | defconfig drift | compare with the release defconfigs (`git diff v1.1`) |
-| Boot logo hang after flash | zip flashed tree-built dtb | only flash AROMA-packaged zips (§6) |
-| m20/jackpotlte dtbo note | no device dtbo in tree | packaging keeps original dtbo (menu option is no-op) |
+| `No release config set for target` | `breakfast` was piped/subshelled | run `breakfast` bare, then build |
+| `OBJCOPY: No such file or directory` | `TARGET_KERNEL_NO_GCC` path | keep the explicit `OBJCOPY=`/`OBJDUMP=`/`NM=`/`AR=`/`STRIP=` flags |
+| `fixdep` `Error 139` | Neutron host tools | keep HOSTCC/HOSTCXX pinned to stock clang |
+| arm64 build produces x86 objects | missing `CLANG_TRIPLE`/`CROSS_COMPILE` | pass both in `TARGET_KERNEL_ADDITIONAL_FLAGS` |
+| Link hangs forever | `LLVM=1` crept in | remove it; use the pinned flags |
+| `uname` has `_dirty` or extra text | built off-branch / dirty tree | checkout `rom-crdroid16`, commit or stash |
+| `Image` md5 differs from `out/.../kernel` | stale/shadowed output | `m bootimage` again; check the KERNEL_OBJ path |
+| boot.img > 37,748,736 B | config drift | shrink the image before flashing; the boot partition is fixed |
+| OTA/Updater does not offer a build | feed timestamp <= running build date | regenerate the feed with a newer `--timestamp` |
 
-## 9. Repo layout (what lives where)
+---
 
-```
-tools_eureka/build_device.sh   # per-device build (the recipe above)
-tools_eureka/dtbo_gen.py       # DM-verity dtbo patcher (+--verify)
-kernel_zip/anykernel/          # AK3 template (inner zip source)
-kernel_zip/dtbo/<dev>/dtbo.img # stock dtbo per device (patch source)
-arch/arm64/configs/full/       # per-device vendor full/ defconfigs
-```
+## 8. Golden rules
 
-## 10. Golden rules (from session-verified bisects)
-
-1. Vendor flag style, **no LLVM=1** — lld-native ThinLTO hangs this SoC.
-2. Build on branch `R24U` for the uniform release uname.
-3. Never bulk-merge CIP: any security backport is cherry-picked + device-tested.
-4. Single-variable changes: one feature per test zip, exactly like the
-   H2/H3 bisect ladder that proved this recipe.
-5. The user is the flash/boot authority: agent builds + packages, human
-   flashes + reports.
+1. The ROM-tree build is the release path; the standalone build is legacy.
+2. Vendor flag style, no `LLVM=1`.
+3. One feature per test build, device-verified before it becomes a release.
+4. The boot image is capped by the partition (`37,748,736 B`); derive every
+   `dd` count from the staged file, never hardcode it.
+5. The user is the flash/boot authority: build and package here, flash and
+   report on the device.
