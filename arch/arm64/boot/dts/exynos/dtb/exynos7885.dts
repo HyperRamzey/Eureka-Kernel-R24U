@@ -2473,7 +2473,6 @@
 		id = <0>;
 		sensors = <1>;
 		sensing_mode = "max";
-		hotplug_enable = <1>;
 		hotplug_in_threshold = <91>;
 		hotplug_out_threshold = <96>;
 		#include "exynos7872-tmu-sensor-conf.dtsi"
