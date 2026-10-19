@@ -77,7 +77,9 @@ def api(url, token, data=None, method="GET", stream=None, content_type=None):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=1800) as resp:
-            return json.loads(resp.read().decode())
+            data = resp.read().decode()
+            # DELETE (and some PATCH) return 204 with an empty body
+            return json.loads(data) if data.strip() else None
     except urllib.error.HTTPError as exc:
         raise ApiError(method, url, exc.code, exc.read().decode(errors="replace")) from None
 
