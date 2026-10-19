@@ -1635,18 +1635,19 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
 		lruvec = mem_cgroup_page_lruvec(page, zone);
 
 		SetPageLRU(page);
-		lru = page_lru(page);
-		add_page_to_lru_list(page, lruvec, lru);
 
-		if (is_active_lru(lru)) {
-			int file = is_file_lru(lru);
-			int numpages = hpage_nr_pages(page);
-			reclaim_stat->recent_rotated[file] += numpages;
-		}
-		if (put_page_testzero(page)) {
+		/*
+		 * The page may have lost its last reference while isolated (e.g.,
+		 * a parallel release_pages()). It must be freed without going back
+		 * on an LRU list: lru_gen_del_page() re-stamps the PG_active marker
+		 * when a page is deleted from an active generation, and a page that
+		 * is freed instead of migrated must not carry it into
+		 * free_pages_prepare() (see the comment on MIN_NR_GENS about
+		 * PG_active). Same shape as the 5.15 reference move_pages_to_lru().
+		 */
+		if (unlikely(put_page_testzero(page))) {
 			__ClearPageLRU(page);
 			__ClearPageActive(page);
-			del_page_from_lru_list(page, lruvec, lru);
 
 			if (unlikely(PageCompound(page))) {
 				spin_unlock_irq(&zone->lru_lock);
@@ -1655,6 +1656,16 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
 				spin_lock_irq(&zone->lru_lock);
 			} else
 				list_add(&page->lru, &pages_to_free);
+			continue;
+		}
+
+		lru = page_lru(page);
+		add_page_to_lru_list(page, lruvec, lru);
+
+		if (is_active_lru(lru)) {
+			int file = is_file_lru(lru);
+			int numpages = hpage_nr_pages(page);
+			reclaim_stat->recent_rotated[file] += numpages;
 		}
 	}
 
