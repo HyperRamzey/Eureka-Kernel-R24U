@@ -362,6 +362,29 @@ err_get_info:
 						(n & SPECIAL_MESSAGE_MASK) : -EINVAL)
 #define SPECIAL_START_MASK		(0x80)
 #define SPECIAL_SUCCESS_MASK		(0x0F)
+
+/*
+ * The "black UI" gesture key is an AOD/dozing input: SystemUI's
+ * SysUIKeyEventHandler only acts on it while the status bar is dozing, i.e.
+ * while the screen is off. The controller also reports FOD presses while the
+ * panel is on, and the key is then delivered to whichever app has focus -
+ * apps that treat it as a hardware button act on it. The KernelSU manager,
+ * for one, moves focus to its power button on the first press, opens the
+ * power menu on the second and activates "Reboot" on the third, so a finger
+ * on the FOD area reboots the device. Confine the key to LPM, where its only
+ * consumer lives.
+ */
+static void ist40xx_report_gesture_key(struct ist40xx_data *data)
+{
+	if (data->status.sys_mode != STATE_LPM)
+		return;
+
+	input_report_key(data->input_dev, KEY_BLACK_UI_GESTURE, true);
+	input_sync(data->input_dev);
+	input_report_key(data->input_dev, KEY_BLACK_UI_GESTURE, false);
+	input_sync(data->input_dev);
+}
+
 void ist40xx_special_cmd(struct ist40xx_data *data, int cmd)
 {
 	gesture_msg g_msg;
@@ -384,14 +407,7 @@ void ist40xx_special_cmd(struct ist40xx_data *data, int cmd)
 
 					input_info(true, &data->client->dev, "Swipe Up Trigger\n");
 
-					input_report_key(data->input_dev,
-							 KEY_BLACK_UI_GESTURE,
-							 true);
-					input_sync(data->input_dev);
-					input_report_key(data->input_dev,
-							 KEY_BLACK_UI_GESTURE,
-							 false);
-					input_sync(data->input_dev);
+					ist40xx_report_gesture_key(data);
 				}
 				break;
 			case G_TYPE_DOUBLETAP:
@@ -407,14 +423,7 @@ void ist40xx_special_cmd(struct ist40xx_data *data, int cmd)
 						   "Double Tap Trigger (%d, %d)\n",
 						   data->scrub_x, data->scrub_y);
 
-					input_report_key(data->input_dev,
-							 KEY_BLACK_UI_GESTURE,
-							 true);
-					input_sync(data->input_dev);
-					input_report_key(data->input_dev,
-							 KEY_BLACK_UI_GESTURE,
-							 false);
-					input_sync(data->input_dev);
+					ist40xx_report_gesture_key(data);
 				} else if (g_msg.b.gid == G_ID_DOUBLETAP_WAKEUP) {
 					input_info(true, &data->client->dev,
 							"AOT Double Tap Trigger\n");
@@ -463,14 +472,7 @@ void ist40xx_special_cmd(struct ist40xx_data *data, int cmd)
 						   "Single Tap Trigger (%d, %d)\n",
 						   data->scrub_x, data->scrub_y);
 
-					input_report_key(data->input_dev,
-							 KEY_BLACK_UI_GESTURE,
-							 true);
-					input_sync(data->input_dev);
-					input_report_key(data->input_dev,
-							 KEY_BLACK_UI_GESTURE,
-							 false);
-					input_sync(data->input_dev);
+					ist40xx_report_gesture_key(data);
 				}
 				break;
 			case G_TYPE_PRESSURE:
@@ -489,14 +491,7 @@ void ist40xx_special_cmd(struct ist40xx_data *data, int cmd)
 					input_info(true, &data->client->dev,
 						"FOD out\n");
 				}
-				input_report_key(data->input_dev,
-						 KEY_BLACK_UI_GESTURE,
-						 true);
-				input_sync(data->input_dev);
-				input_report_key(data->input_dev,
-						 KEY_BLACK_UI_GESTURE,
-						 false);
-				input_sync(data->input_dev);
+				ist40xx_report_gesture_key(data);
 				break;
 			default:
 				input_err(true, &data->client->dev,
