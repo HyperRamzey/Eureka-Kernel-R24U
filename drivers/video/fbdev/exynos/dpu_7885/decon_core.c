@@ -1775,6 +1775,7 @@ static int decon_get_active_win_count(struct decon_device *decon,
 
 		case DECON_WIN_STATE_COLOR:
 		case DECON_WIN_STATE_BUFFER:
+		case DECON_WIN_STATE_CURSOR:
 			win_cnt++;
 			break;
 
@@ -1830,6 +1831,7 @@ static int decon_prepare_win_config(struct decon_device *decon,
 			ret = 0;
 			break;
 		case DECON_WIN_STATE_BUFFER:
+		case DECON_WIN_STATE_CURSOR:
 			if (decon_set_win_blocking_mode(decon, i, win_config, regs))
 				break;
 
@@ -1837,6 +1839,16 @@ static int decon_prepare_win_config(struct decon_device *decon,
 			ret = decon_set_win_buffer(decon, config, regs, i);
 			if (!ret)
 				color_map = false;
+
+			/*
+			 * A CURSOR window carries the input pointer sprite.
+			 * This display has no dedicated cursor plane, so
+			 * composite it as an ordinary buffer window and
+			 * normalise the state so every later consumer (BTS
+			 * accounting, event log, window-update bookkeeping)
+			 * sees one buffer semantics.
+			 */
+			config->state = DECON_WIN_STATE_BUFFER;
 			break;
 		default:
 			win_regs->wincon &= ~WIN_EN_F(i);
@@ -2092,8 +2104,16 @@ static int decon_set_win_config(struct decon_device *decon,
 err_prepare:
 	if (win_data->fence >= 0) {
 		/* video mode should keep previous buffer object */
+		decon_err("%s: win config failed, ret=%d, tl=%d/%d, mode=%d\n",
+				__func__, ret, decon->timeline->value,
+				decon->timeline_max, decon->lcd_info->mode);
 		if (decon->lcd_info->mode == DECON_MIPI_COMMAND_MODE)
 			decon_signal_fence(decon);
+		else
+			/* config dropped: give back the value reserved by
+			 * decon_create_fence() so create/inc stay 1:1
+			 */
+			decon->timeline_max--;
 		sync_fence_put(fence);
 		put_unused_fd(win_data->fence);
 	}
