@@ -1098,8 +1098,6 @@ out_err:
 int tcp_sendpage_locked(struct sock *sk, struct page *page, int offset,
 			size_t size, int flags)
 {
-	ssize_t res;
-
 	/* If MPTCP is enabled, we check it later after establishment */
 #ifdef CONFIG_MPTCP
 	if (!mptcp(tcp_sk(sk)) && (!(sk->sk_route_caps & NETIF_F_SG) ||

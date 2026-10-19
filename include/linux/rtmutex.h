@@ -41,6 +41,9 @@ struct rt_mutex {
 	int			line;
 	void			*magic;
 #endif
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lockdep_map	dep_map;
+#endif
 };
 
 struct rt_mutex_waiter;
@@ -59,26 +62,36 @@ struct hrtimer_sleeper;
 # define rt_mutex_debug_check_no_locks_held(task)	do { } while (0)
 #endif
 
-# define rt_mutex_init(mutex)					\
-	do {							\
-		raw_spin_lock_init(&(mutex)->wait_lock);	\
-		__rt_mutex_init(mutex, #mutex);			\
-	} while (0)
-
 #ifdef CONFIG_DEBUG_RT_MUTEXES
 # define __DEBUG_RT_MUTEX_INITIALIZER(mutexname) \
 	, .name = #mutexname, .file = __FILE__, .line = __LINE__
+
+# define rt_mutex_init(mutex) \
+do { \
+	static struct lock_class_key __key; \
+	__rt_mutex_init(mutex, __func__, &__key); \
+} while (0)
+
  extern void rt_mutex_debug_task_free(struct task_struct *tsk);
 #else
 # define __DEBUG_RT_MUTEX_INITIALIZER(mutexname)
+# define rt_mutex_init(mutex)			__rt_mutex_init(mutex, NULL, NULL)
 # define rt_mutex_debug_task_free(t)			do { } while (0)
+#endif
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+#define __DEP_MAP_RT_MUTEX_INITIALIZER(mutexname) \
+	, .dep_map = { .name = #mutexname }
+#else
+#define __DEP_MAP_RT_MUTEX_INITIALIZER(mutexname)
 #endif
 
 #define __RT_MUTEX_INITIALIZER_PLAIN(mutexname) \
 	 .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(mutexname.wait_lock) \
 	, .waiters = RB_ROOT \
 	, .owner = NULL \
-	__DEBUG_RT_MUTEX_INITIALIZER(mutexname)
+	__DEBUG_RT_MUTEX_INITIALIZER(mutexname) \
+	__DEP_MAP_RT_MUTEX_INITIALIZER(mutexname)
 
 #define __RT_MUTEX_INITIALIZER(mutexname) \
 	{ __RT_MUTEX_INITIALIZER_PLAIN(mutexname) }
@@ -101,7 +114,7 @@ static inline int rt_mutex_is_locked(struct rt_mutex *lock)
 	return lock->owner != NULL;
 }
 
-extern void __rt_mutex_init(struct rt_mutex *lock, const char *name);
+extern void __rt_mutex_init(struct rt_mutex *lock, const char *name, struct lock_class_key *key);
 extern void rt_mutex_destroy(struct rt_mutex *lock);
 
 extern void rt_mutex_lock(struct rt_mutex *lock);
