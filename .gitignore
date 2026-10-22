@@ -3,3 +3,7 @@ out/*
 kernel_zip/*
 patches/*
 arch/arm64/configs/merge.config
+
+# local per-device kernel build trees (multi-GB)
+out_*/
+.scmversion
