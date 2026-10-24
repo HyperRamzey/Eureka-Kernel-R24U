@@ -526,14 +526,14 @@ struct drm_mode_crtc_page_flip {
 
 /* create a dumb scanout buffer */
 struct drm_mode_create_dumb {
-	uint32_t height;
-	uint32_t width;
-	uint32_t bpp;
-	uint32_t flags;
+	__u32 height;
+	__u32 width;
+	__u32 bpp;
+	__u32 flags;
 	/* handle, pitch, size will be returned */
-	uint32_t handle;
-	uint32_t pitch;
-	uint64_t size;
+	__u32 handle;
+	__u32 pitch;
+	__u64 size;
 };
 
 /* set up for mmap of a dumb scanout buffer */
@@ -550,7 +550,7 @@ struct drm_mode_map_dumb {
 };
 
 struct drm_mode_destroy_dumb {
-	uint32_t handle;
+	__u32 handle;
 };
 
 /* page-flip flags are valid, plus: */
@@ -594,6 +594,51 @@ struct drm_mode_create_blob {
  */
 struct drm_mode_destroy_blob {
 	__u32 blob_id;
+};
+
+/*
+ * Format-modifier blob, as returned by the kernel for the IN_FORMATS plane
+ * property.  Backported declaration: this kernel revision has no DRM driver
+ * that advertises modifiers, but the Samsung userspace HWC parses the blob
+ * layout at compile time.  Layout is identical to mainline
+ * (drm_mode.h, FORMAT_BLOB_CURRENT).
+ */
+struct drm_format_modifier_blob {
+#define FORMAT_BLOB_CURRENT 1
+	/* Version of this blob format */
+	__u32 version;
+
+	/* Flags */
+	__u32 flags;
+
+	/* Number of fourcc formats supported */
+	__u32 count_formats;
+
+	/* Where in this blob the formats exist (in bytes) */
+	__u32 formats_offset;
+
+	/* Number of drm_format_modifiers */
+	__u32 count_modifiers;
+
+	/* Where in this blob the modifiers exist (in bytes) */
+	__u32 modifiers_offset;
+
+	/* __u32 formats[] */
+	/* struct drm_format_modifier modifiers[] */
+};
+
+struct drm_format_modifier {
+	/* Bitmask of formats in get_plane() 'format_types' array which apply to this modifier */
+	__u64 formats;
+
+	/* Starting offset in the formats array for the modifier */
+	__u32 offset;
+
+	/* Currently always zero */
+	__u32 pad;
+
+	/* DRM_FORMAT_MOD_* value for this modifier */
+	__u64 modifier;
 };
 
 #endif
