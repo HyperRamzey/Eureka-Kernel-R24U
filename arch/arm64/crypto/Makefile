@@ -42,6 +42,9 @@ CFLAGS_aes-glue-ce.o	:= -DUSE_V8_CRYPTO_EXTENSIONS
 
 obj-$(CONFIG_CRYPTO_CRC32_ARM64) += crc32-arm64.o
 
+obj-$(CONFIG_CRYPTO_CHACHA20_NEON) += chacha20-neon.o
+chacha20-neon-y := chacha-neon-core.o chacha20-neon-glue.o
+
 CFLAGS_crc32-arm64.o	:= -mcpu=generic+crc $(filter -mcpu=%, $(KBUILD_CFLAGS))
 
 ccflags-y := -O3

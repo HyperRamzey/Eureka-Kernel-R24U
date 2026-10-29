@@ -123,6 +123,22 @@
 	END(name)
 #endif
 
+/*
+ * Backported from Linux 5.15 include/linux/linkage.h (SYM_FUNC_* family).
+ * Needed by assembly ported from newer kernels, e.g. arch/arm64/crypto/
+ * chacha-neon-core.S. Kept to the subset those files actually use.
+ */
+#ifndef SYM_FUNC_START
+#define SYM_FUNC_START(name)		ENTRY(name)
+#define SYM_FUNC_START_NOALIGN(name)				\
+	.globl name ASM_NL					\
+	name:
+#define SYM_FUNC_START_LOCAL(name)				\
+	.type name, @function ASM_NL				\
+	name:
+#define SYM_FUNC_END(name)		ENDPROC(name)
+#endif
+
 #endif
 
 #endif

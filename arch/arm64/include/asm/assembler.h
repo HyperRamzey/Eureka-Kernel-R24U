@@ -494,4 +494,61 @@ alternative_endif
 .Ldone\@:
 	.endm
 
+/*
+ * Backported from Linux 5.15 arch/arm64/include/asm/assembler.h.
+ * frame_push/frame_pop: save/restore up to 10 callee-saved registers
+ * (x19..x28) plus x29/x30, with optional @extra bytes of locals.
+ * Needed by assembly ported from newer kernels (chacha-neon-core.S).
+ */
+	.macro		frame_push, regcount:req, extra
+	__frame		st, \regcount, \extra
+	.endm
+
+	.macro		frame_pop
+	__frame		ld
+	.endm
+
+	.macro		__frame_regs, reg1, reg2, op, num
+	.if		.Lframe_regcount == \num
+	\op\()r		\reg1, [sp, #(\num + 1) * 8]
+	.elseif		.Lframe_regcount > \num
+	\op\()p		\reg1, \reg2, [sp, #(\num + 1) * 8]
+	.endif
+	.endm
+
+	.macro		__frame, op, regcount, extra=0
+	.ifc		\op, st
+	.if		(\regcount) < 0 || (\regcount) > 10
+	.error		"regcount should be in the range [0 ... 10]"
+	.endif
+	.if		((\extra) % 16) != 0
+	.error		"extra should be a multiple of 16 bytes"
+	.endif
+	.ifdef		.Lframe_regcount
+	.if		.Lframe_regcount != -1
+	.error		"frame_push/frame_pop may not be nested"
+	.endif
+	.endif
+	.set		.Lframe_regcount, \regcount
+	.set		.Lframe_extra, \extra
+	.set		.Lframe_local_offset, ((\regcount + 3) / 2) * 16
+	stp		x29, x30, [sp, #-.Lframe_local_offset - .Lframe_extra]!
+	mov		x29, sp
+	.endif
+
+	__frame_regs	x19, x20, \op, 1
+	__frame_regs	x21, x22, \op, 3
+	__frame_regs	x23, x24, \op, 5
+	__frame_regs	x25, x26, \op, 7
+	__frame_regs	x27, x28, \op, 9
+
+	.ifc		\op, ld
+	.if		.Lframe_regcount == -1
+	.error		"frame_push/frame_pop may not be nested"
+	.endif
+	ldp		x29, x30, [sp], #.Lframe_local_offset + .Lframe_extra
+	.set		.Lframe_regcount, -1
+	.endif
+	.endm
+
 #endif	/* __ASM_ASSEMBLER_H */
