@@ -1675,16 +1675,29 @@ void kbase_sync_single(struct kbase_context *kctx,
 		struct tagged_addr t_cpu_pa, struct tagged_addr t_gpu_pa,
 		off_t offset, size_t size, enum kbase_sync_type sync_fn)
 {
-	struct page *cpu_page;
+	struct page *cpu_page = NULL;
 	phys_addr_t cpu_pa = as_phys_addr_t(t_cpu_pa);
 	phys_addr_t gpu_pa = as_phys_addr_t(t_gpu_pa);
 
-	cpu_page = pfn_to_page(PFN_DOWN(cpu_pa));
+	/*
+	 * Defensive: the caller's page array can hold a value that is not a
+	 * backed RAM page (corruption, or a stale/garbage slot). pfn_to_page()
+	 * on such a pfn faults in the vmemmap hole. Validate the pfn first and
+	 * report instead of oopsing.
+	 */
+	if (likely(pfn_valid(PFN_DOWN(cpu_pa))))
+		cpu_page = pfn_to_page(PFN_DOWN(cpu_pa));
 
 	if (likely(cpu_pa == gpu_pa)) {
 		dma_addr_t dma_addr;
 
-		BUG_ON(!cpu_page);
+		if (unlikely(!cpu_page)) {
+			dev_warn_ratelimited(kctx->kbdev->dev,
+				"%s: skip sync, CPU PA 0x%llx (tagged 0x%llx) not page-backed (kctx %p, %s)",
+				__func__, (u64)cpu_pa, (u64)t_cpu_pa.tagged_addr,
+				kctx, current->comm);
+			return;
+		}
 		BUG_ON(offset + size > PAGE_SIZE);
 
 		dma_addr = kbase_dma_addr(cpu_page) + offset;
@@ -1702,7 +1715,18 @@ void kbase_sync_single(struct kbase_context *kctx,
 		if (WARN(!gpu_pa, "No GPU PA found for infinite cache op"))
 			return;
 
-		gpu_page = pfn_to_page(PFN_DOWN(gpu_pa));
+		gpu_page = NULL;
+		if (likely(pfn_valid(PFN_DOWN(gpu_pa))))
+			gpu_page = pfn_to_page(PFN_DOWN(gpu_pa));
+
+		if (unlikely(!cpu_page || !gpu_page)) {
+			dev_warn_ratelimited(kctx->kbdev->dev,
+				"%s: skip sync, bad PA cpu 0x%llx (tagged 0x%llx) gpu 0x%llx (tagged 0x%llx) (kctx %p, %s)",
+				__func__, (u64)cpu_pa, (u64)t_cpu_pa.tagged_addr,
+				(u64)gpu_pa, (u64)t_gpu_pa.tagged_addr,
+				kctx, current->comm);
+			return;
+		}
 
 		if (sync_fn == KBASE_SYNC_TO_DEVICE) {
 			src = ((unsigned char *)kmap(cpu_page)) + offset;
@@ -1786,6 +1810,27 @@ static int kbase_do_syncset(struct kbase_context *kctx,
 			page_off + page_count > reg->nr_pages) {
 		/* Sync overflows the region */
 		err = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (kbase_reg_current_backed_size(reg) == 0) {
+		/*
+		 * The region has no backing pages: its alloc was created with
+		 * a zero-sized page array and alloc->pages points one past the
+		 * end of the alloc object (MMU-dump/raw and alias regions are
+		 * created with nr_pages = 0 for the alloc). reg->nr_pages
+		 * describes the VA range, not the array, so the check above
+		 * cannot make the reads below safe: cpu_pa[page_off] would
+		 * return heap memory past the end of the object and it would
+		 * be treated as a physical address. The CPU page-fault path is
+		 * bounded by the backed size (kmvp_cpu_vm_fault), as is
+		 * kbase_vmap_phy_pages(); make the sync path agree with them.
+		 * There is nothing to sync on an unbacked region, so skip.
+		 */
+		dev_warn_ratelimited(kctx->kbdev->dev,
+			"%s: skip msync on unbacked region (type %d, VA 0x%016llX, nr_pages %zu)",
+			__func__, (int)reg->gpu_alloc->type,
+			sset->mem_handle.basep.handle, reg->nr_pages);
 		goto out_unlock;
 	}
 
