@@ -343,8 +343,24 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
 	return error;
 }
 
+#ifdef CONFIG_KSU_SUSFS
+extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,
+			 int *__unused_flags);
+/*
+ * filename_lookup() is global in this tree (fs/namei.c:2325) but 4.4 declares it
+ * in no header, so the SUSFS call sites below have to name the prototype or
+ * clang fails them as an implicit declaration (-Werror,-Wimplicit-function-
+ * declaration). It must match fs/namei.c exactly: the fifth argument is
+ * `struct path *root`, not a nameidata, and the function putname()s the
+ * filename it is given -- which is why every use of it is followed by a
+ * re-acquire on the -ESTALE retry instead of a reuse.
+ */
+int filename_lookup(int dfd, struct filename *name, unsigned flags,
+		    struct path *path, struct path *root);
+#else
 extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 			 int *flags);
+#endif
 
 /*
  * access() needs to use the real uid/gid, not the effective uid/gid.
@@ -380,10 +396,13 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int
  *                        accepted-but-ignored is not a regression. Rejecting
  *                        it with -EINVAL would be, because Bionic passes it.
  *
- * NOTE: ksu_handle_faccessat() must stay the first thing done here. It is
- * KernelSU's sucompat hook (KernelSU/kernel/feature/sucompat.c:108) and it
- * rewrites dfd/filename for sucompat-eligible callers. A faccessat2 that
- * skipped it would give 32-bit callers a path around sucompat.
+ * NOTE: ksu_handle_faccessat() must stay the first thing done on a real
+ * lookup path. It is KernelSU's sucompat hook
+ * (KernelSU/kernel/feature/sucompat.c) and it rewrites dfd/filename for
+ * sucompat-eligible callers. Under CONFIG_KSU_SUSFS it rewrites the name in
+ * place inside a struct filename, which is why the name is getname()d first
+ * and resolved with filename_lookup(). A faccessat2 that skipped it would
+ * give 32-bit callers a path around sucompat.
  */
 static int do_faccessat(int dfd, const char __user *filename, int mode,
 			unsigned int flags)
@@ -395,11 +414,30 @@ static int do_faccessat(int dfd, const char __user *filename, int mode,
 	struct vfsmount *mnt;
 	int res;
 	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+#ifdef CONFIG_KSU_SUSFS
+	struct filename *fname;
+#endif
 
 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
 		return -EINVAL;
+
+#ifdef CONFIG_KSU_SUSFS
+	/*
+	 * SuSFS sucompat (sucompat.c: ksu_handle_faccessat) rewrites
+	 * (*filename)->name in place, so the name has to be a struct filename
+	 * that survives into the lookup - a raw user pointer cannot carry the
+	 * rewrite. filename_lookup() putname()s it, hence the -ESTALE retry
+	 * below re-acquires and re-hooks. This must still run before the
+	 * credential override: is_ksud_exists() has to see /data/adb/ksud as
+	 * root, or sucompat silently stops redirecting.
+	 */
+	fname = getname(filename);
+	if (IS_ERR(fname))
+		return PTR_ERR(fname);
+	ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
+#else
+	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+#endif
 
 	if (flags & AT_SYMLINK_NOFOLLOW)
 		lookup_flags = 0;
@@ -445,7 +483,11 @@ static int do_faccessat(int dfd, const char __user *filename, int mode,
 	}
 
 retry:
+#ifdef CONFIG_KSU_SUSFS
+	res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+#else
 	res = user_path_at(dfd, filename, lookup_flags, &path);
+#endif
 	if (res)
 		goto out;
 
@@ -483,6 +525,15 @@ out_path_release:
 	path_put(&path);
 	if (retry_estale(res, lookup_flags)) {
 		lookup_flags |= LOOKUP_REVAL;
+#ifdef CONFIG_KSU_SUSFS
+		/* filename_lookup() consumed fname; re-acquire and re-hook. */
+		fname = getname(filename);
+		if (IS_ERR(fname)) {
+			res = PTR_ERR(fname);
+			goto out;
+		}
+		ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
+#endif
 		goto retry;
 	}
 out:

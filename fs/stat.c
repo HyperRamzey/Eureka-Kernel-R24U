@@ -191,7 +191,15 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
 EXPORT_SYMBOL(vfs_statx_fd);
 
 #ifdef CONFIG_KSU
+#ifdef CONFIG_KSU_SUSFS
+extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+/* Declared in fs/namei.c (fs/namei.c:2325), declared in no header; see the same
+ * block in fs/open.c for why the call sites need it spelled out. */
+int filename_lookup(int dfd, struct filename *name, unsigned flags,
+		    struct path *path, struct path *root);
+#else
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+#endif
 #endif
 
 /**
@@ -215,11 +223,9 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
 	struct path path;
 	int error = -EINVAL;
 	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
-
-#ifdef CONFIG_KSU
-        ksu_handle_stat(&dfd, &filename, &flags);
+#ifdef CONFIG_KSU_SUSFS
+	struct filename *fname;
 #endif
-
 
 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
 		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
@@ -232,8 +238,28 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
 	if (flags & AT_EMPTY_PATH)
 		lookup_flags |= LOOKUP_EMPTY;
 
+#ifdef CONFIG_KSU_SUSFS
+	/*
+	 * SuSFS sucompat (sucompat.c: ksu_handle_stat) rewrites
+	 * (*filename)->name in place, so the name has to come from a struct
+	 * filename that survives into the lookup. lookup_flags is passed to
+	 * getname_flags() so AT_EMPTY_PATH still yields an empty name instead
+	 * of -ENOENT, exactly as user_path_at() did before.
+	 */
+	fname = getname_flags(filename, lookup_flags, NULL);
+	if (IS_ERR(fname))
+		return PTR_ERR(fname);
+	ksu_handle_stat(&dfd, &fname, &flags);
+#else
+	ksu_handle_stat(&dfd, &filename, &flags);
+#endif
+
 retry:
+#ifdef CONFIG_KSU_SUSFS
+	error = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+#else
 	error = user_path_at(dfd, filename, lookup_flags, &path);
+#endif
 	if (error)
 		goto out;
 
@@ -241,6 +267,13 @@ retry:
 	path_put(&path);
 	if (retry_estale(error, lookup_flags)) {
 		lookup_flags |= LOOKUP_REVAL;
+#ifdef CONFIG_KSU_SUSFS
+		/* filename_lookup() consumed fname; re-acquire and re-hook. */
+		fname = getname_flags(filename, lookup_flags, NULL);
+		if (IS_ERR(fname))
+			return PTR_ERR(fname);
+		ksu_handle_stat(&dfd, &fname, &flags);
+#endif
 		goto retry;
 	}
 out:

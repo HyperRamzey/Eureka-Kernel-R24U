@@ -35,20 +35,21 @@
 
 extern bool susfs_is_current_ksu_domain(void);
 
-/* rsuntk KernelSU compat: official KSU ships this; rsuntk doesn't.
- * Manager-aware exemption so sus_path/sus_mount hide from apps but not
- * from the KSU manager itself (see UID_ROOT_PROC_EXCEPT_SU_PROC users). */
-bool susfs_is_current_ksu_domain(void)
-{
-	/* mirrors rsuntk's is_manager(): ksu_manager_appid is an exported
-	 * global (KSU_INVALID_APPID = -1 when no manager bound yet). */
-	extern uid_t ksu_manager_appid;
-	const uid_t KSU_PER_USER_RANGE_ = 100000;
-
-	if ((uid_t)-1 == ksu_manager_appid)
-		return false;
-	return ksu_manager_appid == (current_uid().val % KSU_PER_USER_RANGE_);
-}
+/*
+ * This file used to define susfs_is_current_ksu_domain() itself: the old rsuntk
+ * fork did not ship it, so it was a manager-uid compat shim here (git log
+ * 64177b3 "port susfs into main tree"). BakaSU does ship it --
+ * KernelSU/kernel/selinux/selinux.c:297 defines it as is_ksu_domain(), backed by
+ * the hidden KernelSU SELinux domain this port enables. Two definitions of one
+ * global symbol survive assembling into built-in.o but fail at the LTO link:
+ *   ld.lld: error: duplicate symbol: susfs_is_current_ksu_domain
+ *   >>> defined in built-in.o(fs/susfs.o)
+ *   >>> defined in built-in.o(drivers/kernelsu/selinux/selinux.o)
+ * So the main tree keeps only the extern declaration above and uses BakaSU's.
+ * The old shim's manager-uid exemption is not lost: BakaSU's is_ksu_domain()
+ * answers for the manager's own domain, and ksu_is_manager_uid() is still what
+ * hides paths from apps but not from the manager (selinux.c:268).
+ */
 extern void setup_selinux(const char *domain, struct cred *cred);
 extern struct cred *ksu_cred;
 extern int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt);

@@ -669,6 +669,10 @@ error:
  * This function implements a generic ability to update ruid, euid,
  * and suid.  This allows you to implement the 4.4 compatible seteuid().
  */
+#ifdef CONFIG_KSU
+extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#endif
+
 SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 {
 	struct user_namespace *ns = current_user_ns();
@@ -689,6 +693,16 @@ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 
 	if ((suid != (uid_t) -1) && !uid_valid(ksuid))
 		return -EINVAL;
+
+#ifdef CONFIG_KSU
+	/*
+	 * KernelSU sucompat hook (hook/setuid_hook.c). Zygote always calls
+	 * setresuid(3) with three identical uids, and the hook reads
+	 * current_cred() to decide whether this is a zygote spawn, so it must
+	 * run before prepare_creds() swaps the credentials below.
+	 */
+	ksu_handle_setresuid(ruid, euid, suid);
+#endif
 
 #if defined CONFIG_SEC_RESTRICT_SETUID
 	if (kruid.val == 0 || keuid.val == 0 || ksuid.val == 0)
