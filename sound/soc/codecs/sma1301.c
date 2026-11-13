@@ -2621,7 +2621,8 @@ static void sma1301_check_fault_worker(struct work_struct *work)
 	if ((over_temp != sma1301->last_over_temp) ||
 		(ocp_val != sma1301->last_ocp_val)) {
 
-		dev_crit(sma1301->dev, "Please check AMP status");
+		/* Status change only; real faults are reported at crit above. */
+		dev_info(sma1301->dev, "AMP status changed\n");
 		dev_info(sma1301->dev, "STATUS1=0x%02X : STATUS2=0x%02X\n",
 				over_temp, ocp_val);
 		sma1301->last_over_temp = over_temp;

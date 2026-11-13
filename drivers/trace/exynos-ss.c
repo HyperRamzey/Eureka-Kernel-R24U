@@ -3899,8 +3899,16 @@ static int __init ess_pstore_init(void)
 	if (exynos_ss_get_enable("log_pstore", true)) {
 		ess_ramoops_data.mem_size = exynos_ss_get_item_size("log_pstore");
 		ess_ramoops_data.mem_address = exynos_ss_get_item_paddr("log_pstore");
-		ess_ramoops_data.pmsg_size = ess_ramoops_data.mem_size / 2;
+		/*
+		 * Same 32K slot (the layout under ess_setup= is unchanged), but
+		 * carve out a console zone so a hang that never oopses still
+		 * leaves a log, and add ECC: records read back from this region
+		 * after a reset have shown corrupted bytes. Record keeps 1/2.
+		 */
+		ess_ramoops_data.console_size = ess_ramoops_data.mem_size / 4;
+		ess_ramoops_data.pmsg_size = ess_ramoops_data.mem_size / 4;
 		ess_ramoops_data.record_size = ess_ramoops_data.mem_size / 2;
+		ess_ramoops_data.ecc_info.ecc_size = 16;
 	}
 	return platform_device_register(&ess_ramoops);
 }
