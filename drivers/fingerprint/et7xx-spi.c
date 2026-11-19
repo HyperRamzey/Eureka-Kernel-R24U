@@ -52,6 +52,20 @@ static unsigned int bufsiz = 1024;
 module_param(bufsiz, uint, 0444);
 MODULE_PARM_DESC(bufsiz, "data bytes in biggest supported SPI message");
 
+/*
+ * Upstream issue #14 (item 5): the debug timer queues a work item every
+ * FPSENSOR_DEBUG_TIMER_SEC (10 s, fingerprint.h:33) and the work prints one
+ * pr_info line per tick while the sensor is powered -- 82 lines in the
+ * reporter's v0.8.0 dmesg, and etspi_wake_lock on the wake-source list.
+ * The timer is now armed only on demand:
+ *   echo 1 > /sys/module/et7xx_spi/parameters/debug_verbose
+ * takes effect at the next etspi_enable_debug_timer() (probe, and every
+ * fingerprint resume).
+ */
+static bool debug_verbose;
+module_param(debug_verbose, bool, 0644);
+MODULE_PARM_DESC(debug_verbose, "arm the 10 s etspi state-print timer (default off)");
+
 #if defined(ENABLE_SENSORS_FPRINT_SECURE) && !defined(DISABLED_GPIO_PROTECTION)
 int fps_resume_set(void) {
 	int ret = 0;
@@ -1530,6 +1544,8 @@ static void etspi_work_func_debug(struct work_struct *work)
 
 static void etspi_enable_debug_timer(void)
 {
+	if (!debug_verbose)
+		return;
 	mod_timer(&g_data->dbg_timer,
 		round_jiffies_up(jiffies + FPSENSOR_DEBUG_TIMER_SEC));
 }

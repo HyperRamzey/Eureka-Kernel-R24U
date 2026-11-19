@@ -562,7 +562,17 @@ static unsigned long long uksm_sleep_times;
 
 #define UKSM_RUN_STOP	0
 #define UKSM_RUN_MERGE	1
-static unsigned int uksm_run = 1;
+/*
+ * Stopped by default (upstream issue #6, 4 GB a30s).  d3bb8333 moved the CPU
+ * governor to "quiet" (1% cap) and the thread still cost ~5% of a core while
+ * the phone sat on the home screen (reporter, v0.8.0: 3 s of CPU in a 63 s
+ * idle sample) for 31 shared pages after 31 minutes -- the governor only
+ * lengthens the sleep between rounds, it never stops the scanner.  With
+ * UKSM_RUN_STOP the thread parks in wait_event_freezable(uksm_thread_wait)
+ * (see uksm_scan_thread()) and costs nothing; `echo 1 > /sys/kernel/mm/uksm/run`
+ * wakes it again (run_store() wakes uksm_thread_wait), which is the tester flow.
+ */
+static unsigned int uksm_run = UKSM_RUN_STOP;
 
 static DECLARE_WAIT_QUEUE_HEAD(uksm_thread_wait);
 static DEFINE_MUTEX(uksm_thread_mutex);
